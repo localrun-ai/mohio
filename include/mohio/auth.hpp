@@ -2,8 +2,14 @@
 #include <string>
 #include <optional>
 #include <drogon/HttpFilter.h>
+#include "mohio/config.hpp"
 
 namespace mohio {
+
+// Load OIDC JWKS from cfg.oidc_issuer and seed the in-memory key cache.
+// Call once in main() before drogon::app().run().
+// No-op (warns) if cfg.oidc_issuer is empty.
+void auth_init(const Config& cfg);
 
 // Claims extracted from a validated JWT or API key.
 struct Identity {

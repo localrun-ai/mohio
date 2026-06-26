@@ -21,8 +21,7 @@ std::optional<Role> role_from_string(std::string_view s);
 // Invalidated on any membership or grant change affecting the user.
 class AccessService {
 public:
-    AccessService(drogon::orm::DbClientPtr db,
-                  nosql::RedisClientPtr    redis);
+    explicit AccessService(drogon::orm::DbClientPtr db);
 
     // Returns org IDs the user can READ when scoped to org_id.
     // These become the Qdrant collection filter for RAG queries.
@@ -63,8 +62,7 @@ public:
                   std::string_view target_org_id);
 
 private:
-    drogon::orm::DbClientPtr  _db;
-    nosql::RedisClientPtr     _redis;
+    drogon::orm::DbClientPtr _db;
 
     drogon::Task<void> invalidate_cache(std::string_view user_id,
                                         std::string_view org_id);

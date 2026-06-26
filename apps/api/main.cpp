@@ -1,5 +1,7 @@
 #include "mohio/config.hpp"
 #include "mohio/auth.hpp"
+#include "mohio/db.hpp"
+#include "mohio/redis.hpp"
 #include "mohio/org_tree.hpp"
 #include "mohio/access.hpp"
 
@@ -39,6 +41,13 @@ int main() {
     spdlog::info("[mohio] db:      {}", cfg.database_url);
     spdlog::info("[mohio] qdrant:  {}", cfg.qdrant_url);
     spdlog::info("[mohio] llm:     {}", cfg.llm_base_url);
+
+    // Register Drogon DB client before run() so getDbClient() works in filters.
+    mohio::Db::init(cfg);
+    mohio::Redis::init(cfg);
+    // Fetch OIDC JWKS synchronously - Drogon event loop not yet started here,
+    // so we use a direct SSL BIO call inside auth_init.
+    mohio::auth_init(cfg);
 
     // -----------------------------------------------------------------------
     // Health (public)
