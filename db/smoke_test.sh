@@ -143,7 +143,7 @@ echo "$ERR" | grep -qi "foreign key\|violates" \
 # 8. Membership granted_by from wrong company is rejected
 # --------------------------------------------------------------------------
 ERR=$(sql "INSERT INTO memberships (company_id, user_id, org_unit_id, role, granted_by)
-           VALUES ('$CO_ACME', '$U_ALICE', '$ACME_ROOT', 'member', '$U_BOB');" 2>&1 || true)
+           VALUES ('$CO_ACME', '$U_ALICE', '$ACME_ROOT', 'viewer', '$U_BOB');" 2>&1 || true)
 echo "$ERR" | grep -q "does not belong to company" \
   && pass 8 "membership with cross-company granted_by rejected" \
   || fail 8 "cross-company granted_by was not blocked (got: $ERR)"
