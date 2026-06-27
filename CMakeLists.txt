@@ -131,6 +131,18 @@ add_library(wikore_rag STATIC
 target_link_libraries(wikore_rag PUBLIC wikore_core)
 
 # ---------------------------------------------------------------------------
+# wikore_ingest: parser, chunker, document repo, ingest types
+# ---------------------------------------------------------------------------
+add_library(wikore_ingest_lib STATIC
+    src/ingest/types.cpp
+    src/ingest/chunker.cpp
+    src/ingest/parser.cpp
+    src/ingest/document_repo.cpp
+    src/application/ingest_document_version.cpp
+)
+target_link_libraries(wikore_ingest_lib PUBLIC wikore_rag)
+
+# ---------------------------------------------------------------------------
 # wikore_wiki: wiki store + ops (DB-backed, org-scoped)
 # ---------------------------------------------------------------------------
 add_library(wikore_wiki STATIC

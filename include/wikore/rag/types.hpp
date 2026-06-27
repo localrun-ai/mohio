@@ -1,0 +1,131 @@
+#pragma once
+#include "wikore/domain/types.hpp"
+#include <openssl/evp.h>
+#include <cstdint>
+#include <cstdio>
+#include <cstring>
+#include <optional>
+#include <string>
+#include <string_view>
+#include <vector>
+
+namespace wikore::rag {
+
+using Embedding = std::vector<float>;
+
+// ---------------------------------------------------------------------------
+// UUID v5 for deterministic Qdrant point IDs.
+//
+// Point ID = uuid_v5(url_namespace, chunk_id + ":" + embed_model_id)
+// This means: same chunk + same model = same point ID across re-ingests,
+// which makes upsert naturally idempotent.
+// ---------------------------------------------------------------------------
+
+inline std::string uuid_v5(std::string_view name) {
+    // RFC 4122 URL namespace: 6ba7b811-9dad-11d1-80b4-00c04fd430c8
+    static constexpr uint8_t kNs[16] = {
+        0x6b, 0xa7, 0xb8, 0x11, 0x9d, 0xad, 0x11, 0xd1,
+        0x80, 0xb4, 0x00, 0xc0, 0x4f, 0xd4, 0x30, 0xc8,
+    };
+    uint8_t hash[20];
+    unsigned int hash_len = sizeof(hash);
+    // Use EVP API (OpenSSL 3.0+; SHA-1 low-level API is deprecated).
+    EVP_MD_CTX* ctx = EVP_MD_CTX_new();
+    EVP_DigestInit_ex(ctx, EVP_sha1(), nullptr);
+    EVP_DigestUpdate(ctx, kNs, 16);
+    EVP_DigestUpdate(ctx, name.data(), name.size());
+    EVP_DigestFinal_ex(ctx, hash, &hash_len);
+    EVP_MD_CTX_free(ctx);
+    // Set version=5 and RFC 4122 variant bits.
+    hash[6] = (hash[6] & 0x0f) | 0x50;
+    hash[8] = (hash[8] & 0x3f) | 0x80;
+    char buf[37];
+    std::snprintf(buf, sizeof(buf),
+        "%02x%02x%02x%02x-%02x%02x-%02x%02x-%02x%02x-%02x%02x%02x%02x%02x%02x",
+        hash[0], hash[1], hash[2], hash[3],
+        hash[4], hash[5], hash[6], hash[7],
+        hash[8], hash[9],
+        hash[10], hash[11], hash[12], hash[13], hash[14], hash[15]);
+    return std::string(buf);
+}
+
+// ---------------------------------------------------------------------------
+// ChunkPayload: every field stored as a Qdrant payload attribute.
+//
+// All fields are queryable as Qdrant filters without touching Postgres.
+// Bump kSchemaVersion when adding/removing fields; the resync worker uses
+// this to identify stale points that need payload refresh.
+// ---------------------------------------------------------------------------
+
+struct ChunkPayload {
+    static constexpr int kSchemaVersion = 1;
+
+    std::string              company_id;
+    std::string              document_id;
+    std::string              document_version_id;
+    std::string              chunk_id;
+    int                      chunk_index         = 0;
+    // All org_unit_ids whose members may retrieve this chunk:
+    //   owner_org_unit_id + org_units with a resource_grant giving read access.
+    // Used as the MatchAny filter in Qdrant queries.
+    std::vector<std::string> access_scope_ids;
+    std::string              sensitivity_label   = "internal";
+    std::string              lifecycle_status    = "draft";
+    std::optional<std::string> activated_at;     // ISO 8601
+    std::optional<std::string> superseded_at;    // ISO 8601
+    std::optional<std::string> section_id;
+    std::optional<std::string> section_heading;
+    int                      payload_schema_version = kSchemaVersion;
+};
+
+// ---------------------------------------------------------------------------
+// ChunkCandidate: result of a Qdrant search before the EvidenceGate check.
+// ---------------------------------------------------------------------------
+
+struct ChunkCandidate {
+    std::string  chunk_id;
+    std::string  document_version_id;
+    float        score   = 0.0f;
+    ChunkPayload payload;
+};
+
+// ---------------------------------------------------------------------------
+// AllowedCandidate: a candidate that has passed EvidenceGate.
+//
+// The type distinction enforces the gate at compile time: the Reranker
+// accepts only AllowedCandidate, so a raw ChunkCandidate can never be
+// forwarded to reranking without going through the gate.
+// ---------------------------------------------------------------------------
+
+struct AllowedCandidate {
+    std::string  chunk_id;
+    std::string  document_version_id;
+    float        score   = 0.0f;
+    std::string  text;              // hydrated from Postgres
+    std::optional<std::string> section_heading;
+};
+
+// ---------------------------------------------------------------------------
+// QdrantFilter: access-controlled search filter for a Qdrant query.
+//
+// QdrantFilterBuilder (Iteration 2) translates AccessScope + Principal
+// into this struct. Used directly by VectorStorePort::search().
+// ---------------------------------------------------------------------------
+
+struct QdrantFilter {
+    std::string              company_id;
+    std::vector<std::string> access_scope_ids;   // MatchAny on payload field
+    std::string              lifecycle_status = "active";
+};
+
+// ---------------------------------------------------------------------------
+// UpsertPoint: one point to write to the vector index.
+// ---------------------------------------------------------------------------
+
+struct UpsertPoint {
+    std::string  id;       // uuid_v5(chunk_id + ":" + embed_model_id)
+    Embedding    vector;
+    ChunkPayload payload;
+};
+
+} // namespace wikore::rag

@@ -4,8 +4,13 @@ add_executable(wikore_tests
     test_auth.cpp
     test_error_mapper.cpp
     test_promote_version.cpp
+    test_embedder.cpp
+    test_vector_store.cpp
+    test_chunker.cpp
+    test_parser.cpp
 )
 target_link_libraries(wikore_tests PRIVATE
+    wikore_ingest_lib
     wikore_core
     wikore_app
     wikore_infra
