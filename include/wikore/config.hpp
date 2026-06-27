@@ -2,11 +2,11 @@
 #include <string>
 #include <cstdlib>
 
-namespace mohio {
+namespace wikore {
 
 struct Config {
     // PostgreSQL
-    std::string database_url   = "postgresql://mohio:mohio@localhost:5432/mohio";
+    std::string database_url   = "postgresql://wikore:wikore@localhost:5432/wikore";
 
     // Redis
     std::string redis_url      = "redis://127.0.0.1:6379/0";
@@ -27,8 +27,8 @@ struct Config {
     int         embed_dims     = 768;
 
     // OIDC / SSO
-    std::string oidc_issuer;               // e.g. https://auth.example.com/realms/mohio
-    std::string oidc_audience  = "mohio";  // expected 'aud' claim
+    std::string oidc_issuer;               // e.g. https://auth.example.com/realms/wikore
+    std::string oidc_audience  = "wikore";  // expected 'aud' claim
 
     // AES-256-GCM key for encrypting integration credentials (hex, 64 chars)
     std::string credentials_key;
@@ -70,4 +70,4 @@ struct Config {
     }
 };
 
-} // namespace mohio
+} // namespace wikore

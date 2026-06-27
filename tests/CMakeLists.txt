@@ -1,12 +1,12 @@
-add_executable(mohio_tests
+add_executable(wikore_tests
     test_org_tree.cpp
     test_access.cpp
     test_auth.cpp
 )
-target_link_libraries(mohio_tests PRIVATE
-    mohio_core
+target_link_libraries(wikore_tests PRIVATE
+    wikore_core
     Catch2::Catch2WithMain
-    mohio_warnings
+    wikore_warnings
 )
 include(Catch)
-catch_discover_tests(mohio_tests)
+catch_discover_tests(wikore_tests)

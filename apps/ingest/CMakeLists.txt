@@ -1,14 +1,11 @@
-add_executable(wikore_api main.cpp)
+add_executable(wikore_ingest main.cpp)
 
-target_link_libraries(wikore_api PRIVATE
+target_link_libraries(wikore_ingest PRIVATE
     wikore_core
-    wikore_rag
-    wikore_wiki
-    wikore_mcp
+    wikore_app
     wikore_warnings
 )
 
-# Git hash baked in at link time
 execute_process(
     COMMAND git rev-parse --short HEAD
     WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
@@ -16,6 +13,6 @@ execute_process(
     OUTPUT_STRIP_TRAILING_WHITESPACE
     ERROR_QUIET
 )
-target_compile_definitions(wikore_api PRIVATE
+target_compile_definitions(wikore_ingest PRIVATE
     WIKORE_GIT_HASH="${WIKORE_GIT_HASH}"
 )

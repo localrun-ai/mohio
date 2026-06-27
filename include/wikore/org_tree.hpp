@@ -4,7 +4,7 @@
 #include <optional>
 #include <drogon/drogon.h>
 
-namespace mohio {
+namespace wikore {
 
 // Matches the CHECK constraint in V001: org_units.type
 enum class OrgUnitType {
@@ -75,4 +75,4 @@ private:
     drogon::orm::DbClientPtr _db;
 };
 
-} // namespace mohio
+} // namespace wikore

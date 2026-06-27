@@ -2,9 +2,9 @@
 #include <string>
 #include <optional>
 #include <drogon/HttpFilter.h>
-#include "mohio/config.hpp"
+#include "wikore/config.hpp"
 
-namespace mohio {
+namespace wikore {
 
 // Load OIDC JWKS from cfg.oidc_issuer and seed the in-memory key cache.
 // Call once in main() before drogon::app().run().
@@ -48,4 +48,4 @@ public:
                   drogon::FilterChainCallback&&  next) override;
 };
 
-} // namespace mohio
+} // namespace wikore

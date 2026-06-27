@@ -1,11 +1,11 @@
-#include "mohio/db.hpp"
+#include "wikore/db.hpp"
 #include <drogon/drogon.h>
 #include <drogon/orm/DbConfig.h>
 #include <spdlog/spdlog.h>
 #include <regex>
 #include <stdexcept>
 
-namespace mohio {
+namespace wikore {
 
 namespace {
 
@@ -60,4 +60,4 @@ drogon::orm::DbClientPtr Db::get() {
     return drogon::app().getDbClient();
 }
 
-} // namespace mohio
+} // namespace wikore
