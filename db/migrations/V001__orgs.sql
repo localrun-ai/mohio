@@ -159,6 +159,9 @@ BEGIN
     -- company_id filter is redundant given the composite FK, but it lets the
     -- planner use org_unit_closure_company_descendant_idx instead of scanning
     -- by descendant_id alone.
+    --
+    -- Bulk inserts must be parent-before-child so the parent's closure rows
+    -- exist before the child trigger fires. Order by depth when importing.
     IF NEW.parent_id IS NOT NULL THEN
         INSERT INTO org_unit_closure (company_id, ancestor_id, descendant_id, depth)
         SELECT NEW.company_id, c.ancestor_id, NEW.id, c.depth + 1

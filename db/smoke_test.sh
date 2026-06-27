@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # db/smoke_test.sh - Schema smoke test suite
 #
-# Spins up a throwaway Postgres 17 container, loads all migrations, runs 15
+# Spins up a throwaway Postgres 17 container, loads all migrations, runs 17
 # behavioral checks, then tears down.  Exit code 0 = all passed.
 #
 # Usage: ./db/smoke_test.sh
@@ -34,6 +34,7 @@ CHK1='c0100001-0000-0000-0000-000000000000'     # chunk in VER3
 WIKI='b100a001-0000-0000-0000-000000000000'     # wiki page
 WVER='b100a002-0000-0000-0000-000000000000'     # wiki page version 1
 VER4='7e100004-0000-0000-0000-000000000000'     # version 4 (for promotion tests)
+OU_ENG='0a100002-0000-0000-0000-000000000000'   # Engineering department (Acme child, for move test)
 
 # --------------------------------------------------------------------------
 # Start container and load schema
@@ -55,6 +56,8 @@ cat db/migrations/V001__orgs.sql \
     db/migrations/V007__audit.sql \
     db/migrations/V009__grant_validation.sql \
     db/migrations/V010__promotion_functions.sql \
+    db/migrations/V011__deactivation_expiry_audit.sql \
+    db/migrations/V012__move_org_unit.sql \
   | docker exec -i "$CONTAINER" psql -U postgres -v ON_ERROR_STOP=1 -q
 echo "-- Migrations loaded."
 echo ""
@@ -265,6 +268,31 @@ COUNT=$(sql "SELECT COUNT(*) FROM document_versions
 [ "$COUNT" -eq 1 ] \
   && pass 15 "new active version has activated_at set and superseded_at NULL" \
   || fail 15 "new active version state incorrect (got $COUNT)"
+
+# --------------------------------------------------------------------------
+# 16-17. move_org_unit() tests
+# --------------------------------------------------------------------------
+# Create OU_ENG as a sibling of OU_HR (both directly under ACME_ROOT).
+# Then move OU_HR under OU_ENG and verify closure is correct.
+sql "INSERT INTO org_units (id, company_id, parent_id, type, slug, name)
+     VALUES ('$OU_ENG', '$CO_ACME', '$ACME_ROOT', 'department', 'eng', 'Engineering');" > /dev/null
+
+# --------------------------------------------------------------------------
+# 16. move_org_unit() completes without error
+# --------------------------------------------------------------------------
+ERR=$(sql "SELECT move_org_unit('$CO_ACME', '$OU_HR', '$OU_ENG');" 2>&1 || true)
+echo "$ERR" | grep -qi "error\|exception" \
+  && fail 16 "move_org_unit() raised an error: $ERR" \
+  || pass 16 "move_org_unit() completed without error"
+
+# --------------------------------------------------------------------------
+# 17. Moved org_unit has correct closure rows (self + OU_ENG + ACME_ROOT)
+# --------------------------------------------------------------------------
+ROWS=$(sql "SELECT COUNT(*) FROM org_unit_closure
+            WHERE company_id='$CO_ACME' AND descendant_id='$OU_HR';")
+[ "$ROWS" -eq 3 ] \
+  && pass 17 "moved org_unit closure correct: 3 ancestor rows (self + OU_ENG + root)" \
+  || fail 17 "expected 3 ancestor rows after move, got $ROWS"
 
 # --------------------------------------------------------------------------
 # Summary

@@ -304,6 +304,13 @@ CREATE TRIGGER resource_grants_validate_actors
 --
 -- key_hash: SHA-256 hex of the raw key. Never store the plaintext.
 -- key_prefix: first 8 chars of the raw key, shown in UI for identification.
+--
+-- key_hash is globally UNIQUE (no company_id prefix) by design. API key
+-- validation is a cross-tenant lookup: hash -> row -> company_id. Adding
+-- company_id to the lookup would require the caller to know the company
+-- before the key is validated, which is circular. The composite FK on
+-- (company_id, user_id) enforces tenancy at write time; the global uniqueness
+-- is intentional, not a copy-paste miss.
 -- role: permission CEILING for the key, regardless of the user's memberships.
 --   A key with role='viewer' cannot perform write operations even if the
 --   underlying user is an editor or admin.

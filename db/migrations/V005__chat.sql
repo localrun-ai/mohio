@@ -3,6 +3,12 @@
 -- Sessions are scoped to an org_unit. Composite FKs enforce that both the
 -- org_unit and the user belong to the same company as the session.
 --
+-- chat_sessions.org_unit_id is NOT FK-checked against user memberships by
+-- design. Whether user_id is a member of org_unit_id is enforced at session
+-- creation and query time by the access resolver, not as a static FK
+-- constraint. A static check would prevent legitimate cases where access
+-- is granted via resource_grants rather than direct membership.
+--
 -- access_scope_ids on each turn is an immutable snapshot of the org_unit IDs
 -- that were searched, forming an audit record of what evidence was eligible
 -- regardless of permission changes after the fact.

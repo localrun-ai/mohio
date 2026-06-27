@@ -61,22 +61,28 @@ After the DEL loop, also remove the per-user reverse-index keys for affected use
 is cached with a fixed 5-minute TTL but a contributing grant expires within that window,
 the user retains access after the grant has lapsed.
 
-**Resolution: Option B - clamp TTL to the earliest grant expiry.**
+**Resolution: Option B - clamp TTL to the earliest contributing expiry.**
 
-When building and caching an `lr:eff` entry, the access resolver must:
+As of V011, both `resource_grants` and `memberships` carry `expires_at`. The
+access resolver must consider both when computing the cache TTL.
 
-1. Collect `MIN(g.expires_at) FILTER (WHERE g.expires_at IS NOT NULL)` from all
-   `resource_grants` rows that contribute to this user's effective scope.
-2. If `min_expiry IS NULL` (no time-limited grants in scope): use default TTL = 5 min.
-3. If `min_expiry - now() < 0`: the grant has already lapsed; do not cache (or set TTL = 1s).
+C++ resolver rule:
+```
+effective cache TTL = min(default 5 min,
+                          MIN(resource_grants.expires_at) for contributing grants,
+                          MIN(memberships.expires_at) for contributing memberships)
+```
+
+Steps:
+1. Collect `MIN(expires_at)` across all `resource_grants` AND `memberships` rows
+   that contribute to this user's effective scope (both may be NULL per row).
+2. If `min_expiry IS NULL` (no time-limited entries): use default TTL = 5 min.
+3. If `min_expiry - now() < 0`: already lapsed; do not cache (or set TTL = 1s).
 4. If `min_expiry - now() < 5 min`: set TTL = `CEIL(min_expiry - now())`.
 5. Otherwise: use default TTL = 5 min.
 
-`memberships` rows have no `expires_at` - indefinite memberships always contribute
-the full 5-minute window. Only `resource_grants` time-limits are involved here.
-
-Worst-case stale window with this policy: 1 clock-tick between the resolver reading
-`MIN(expires_at)` and writing the Redis TTL. Acceptable for enterprise use.
+Worst-case stale window: 1 clock-tick between the resolver reading `MIN(expires_at)`
+and writing the Redis TTL. Acceptable for enterprise use.
 
 ## Rate limiting
 
