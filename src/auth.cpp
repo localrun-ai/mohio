@@ -458,8 +458,11 @@ static void validate_api_key_async(
 
     static const std::string sql =
         "SELECT u.id, u.email, u.display_name, k.is_admin "
-        "FROM api_keys k JOIN users u ON k.user_id = u.id "
-        "WHERE k.key_hash = $1 AND k.revoked_at IS NULL "
+        "FROM api_keys k "
+        "JOIN users u ON k.user_id = u.id "
+        "WHERE k.key_hash = $1 "
+        "  AND k.revoked_at IS NULL "
+        "  AND (k.expires_at IS NULL OR k.expires_at > now()) "
         "LIMIT 1";
 
     // Capture stop/next as shared_ptr so they survive the async callback.
