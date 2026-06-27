@@ -8,8 +8,8 @@ on:
 
 jobs:
   # --------------------------------------------------------------------------
-  # Schema smoke tests: load V001-V015 into a real Postgres 17 container
-  # and verify all 28 behavioral checks pass.
+  # Schema smoke tests: load all migrations into a real Postgres 17 container
+  # and verify all behavioral checks pass.
   # Fast (<2 min). No C++ compilation required.
   # --------------------------------------------------------------------------
   schema:
@@ -46,21 +46,28 @@ jobs:
             uuid-dev \
             git
 
-      - name: Cache ccache objects
+      # Cache the entire build directory keyed on dependencies.cmake.
+      # This preserves CMakeCache.txt + Ninja files + compiled dep artifacts
+      # (.a files for Drogon, glaze, Catch2, jwt-cpp), so CMake configure
+      # sees deps as already populated and Ninja skips them entirely.
+      # On a cache hit, only our source files need compiling (handled by
+      # ccache below). Cold cache (deps change) triggers a full rebuild.
+      - name: Restore build cache
+        uses: actions/cache@v4
+        with:
+          path: build-ci
+          key: build-${{ runner.os }}-${{ hashFiles('cmake/dependencies.cmake', 'cmake/CPM.cmake') }}
+          restore-keys: build-${{ runner.os }}-
+
+      # ccache caches our own compiled .o files across builds. Separate from
+      # the build cache so a dep change (cold build cache) still gets ccache
+      # hits for unchanged source files on the next run.
+      - name: Restore ccache
         uses: actions/cache@v4
         with:
           path: ~/.cache/ccache
           key: ccache-${{ runner.os }}-${{ hashFiles('CMakeLists.txt', 'cmake/**') }}
           restore-keys: ccache-${{ runner.os }}-
-
-      - name: Cache CPM packages
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cache/CPM
-            build-ci/_deps
-          key: cpm-${{ runner.os }}-${{ hashFiles('cmake/dependencies.cmake', 'cmake/CPM.cmake') }}
-          restore-keys: cpm-${{ runner.os }}-
 
       - name: Configure
         env:
@@ -156,20 +163,7 @@ jobs:
         env:
           PGPASSWORD: wikore
         run: |
-          cat db/migrations/V001__orgs.sql \
-              db/migrations/V002__users_and_auth.sql \
-              db/migrations/V003__documents.sql \
-              db/migrations/V004__wiki.sql \
-              db/migrations/V005__chat.sql \
-              db/migrations/V006__integrations.sql \
-              db/migrations/V007__audit.sql \
-              db/migrations/V009__grant_validation.sql \
-              db/migrations/V010__promotion_functions.sql \
-              db/migrations/V011__deactivation_expiry_audit.sql \
-              db/migrations/V012__move_org_unit.sql \
-              db/migrations/V013__reactivate_user.sql \
-              db/migrations/V014__sensitivity_sections_tombstones.sql \
-              db/migrations/V015__outbox.sql \
+          ls db/migrations/V*.sql | sort | xargs cat \
             | psql -h localhost -U wikore -d wikore -v ON_ERROR_STOP=1 -q
 
       - name: Integration tests
