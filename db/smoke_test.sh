@@ -65,6 +65,7 @@ cat db/migrations/V001__orgs.sql \
     db/migrations/V015__outbox.sql \
     db/migrations/V016__usage_events.sql \
     db/migrations/V017__prompt_templates.sql \
+    db/migrations/V018__feedback_signals.sql \
   | docker exec -i "$CONTAINER" psql -U postgres -v ON_ERROR_STOP=1 -q
 echo "-- Migrations loaded."
 echo ""
@@ -522,6 +523,53 @@ ERR=$(sql "INSERT INTO chat_turns
 echo "$ERR" | grep -qi "foreign key\|violates" \
   && pass 33 "cross-company prompt_template_id rejected by composite FK" \
   || fail 33 "cross-company prompt_template_id was not rejected: $ERR"
+
+# --------------------------------------------------------------------------
+# 34. V018: chat_turn_feedback insert; re-vote UPDATEs the existing row
+# --------------------------------------------------------------------------
+# TRN1/SES1 already exist from test 31; reuse them for feedback tests.
+
+# First vote: +1
+sql "INSERT INTO chat_turn_feedback (company_id, chat_turn_id, user_id, signal)
+     VALUES ('$CO_ACME', '$TRN1', '$U_ALICE', 1);" > /dev/null
+
+# Re-vote: same user same turn -> must UPSERT, not raise a unique violation.
+sql "INSERT INTO chat_turn_feedback (company_id, chat_turn_id, user_id, signal, reason)
+     VALUES ('$CO_ACME', '$TRN1', '$U_ALICE', -1, 'cited wrong section')
+     ON CONFLICT (chat_turn_id, user_id) DO UPDATE
+       SET signal = EXCLUDED.signal,
+           reason = EXCLUDED.reason,
+           updated_at = now();" > /dev/null
+
+ROW=$(sql "SELECT signal::text || '|' || COALESCE(reason,'') FROM chat_turn_feedback
+           WHERE chat_turn_id='$TRN1' AND user_id='$U_ALICE';")
+COUNT=$(sql "SELECT COUNT(*) FROM chat_turn_feedback WHERE chat_turn_id='$TRN1';")
+[ "$COUNT" -eq 1 ] && [ "$ROW" = "-1|cited wrong section" ] \
+  && pass 34 "chat_turn_feedback UPSERT replaces vote (count=$COUNT, row=$ROW)" \
+  || fail 34 "feedback UPSERT wrong (count=$COUNT, row='$ROW')"
+
+# --------------------------------------------------------------------------
+# 35. V018: cross-company feedback rejected by composite FK
+# --------------------------------------------------------------------------
+ERR=$(sql "INSERT INTO chat_turn_feedback (company_id, chat_turn_id, user_id, signal)
+           VALUES ('$CO_BETA', '$TRN1', '$U_BOB', 1);" 2>&1 || true)
+echo "$ERR" | grep -qi "foreign key\|violates" \
+  && pass 35 "cross-company chat_turn_feedback rejected by composite FK" \
+  || fail 35 "cross-company feedback was not rejected: $ERR"
+
+# --------------------------------------------------------------------------
+# 36. V018: chunk_quality_signals insert; cascades on chunk delete
+# --------------------------------------------------------------------------
+sql "INSERT INTO chunk_quality_signals
+       (company_id, chunk_id, positive_count, negative_count, last_signal_at)
+     VALUES ('$CO_ACME', '$CHK1', 3, 1, now());" > /dev/null
+
+# Delete the underlying chunk via version cascade and confirm signals follow.
+sql "DELETE FROM document_versions WHERE id='$VER3';" > /dev/null
+COUNT=$(sql "SELECT COUNT(*) FROM chunk_quality_signals WHERE chunk_id='$CHK1';")
+[ "$COUNT" -eq 0 ] \
+  && pass 36 "chunk_quality_signals cascades on chunk delete (rows=0)" \
+  || fail 36 "chunk_quality_signals did not cascade (rows=$COUNT)"
 
 # --------------------------------------------------------------------------
 # Summary
