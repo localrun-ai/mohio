@@ -16,7 +16,7 @@
 --   'archived' = excluded from all retrieval including historical queries.
 --
 -- Qdrant collection strategy:
---   ONE collection per embedding model (e.g. "mohio_docs_bge_m3").
+--   ONE collection per embedding model (e.g. "wikore_docs_bge_m3").
 --   Access control is enforced via payload filters, not collection separation.
 --
 -- Qdrant chunk payload (stored in each collection under embedding_models):
@@ -219,7 +219,7 @@ CREATE TRIGGER document_versions_updated_at
 CREATE TABLE embedding_models (
     id                UUID    PRIMARY KEY DEFAULT gen_random_uuid(),
     name              TEXT    NOT NULL UNIQUE,      -- e.g. 'bge-m3', 'e5-large'
-    qdrant_collection TEXT    NOT NULL UNIQUE,      -- e.g. 'mohio_docs_bge_m3'
+    qdrant_collection TEXT    NOT NULL UNIQUE,      -- e.g. 'wikore_docs_bge_m3'
     dimension         INT     NOT NULL,
     enabled           BOOLEAN NOT NULL DEFAULT true
 );

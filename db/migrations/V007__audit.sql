@@ -74,9 +74,9 @@ CREATE INDEX audit_log_action_idx  ON audit_log (action,      created_at DESC);
 -- Defence-in-depth: also create a dedicated DB role for the application
 -- that has INSERT but not UPDATE or DELETE on audit_log and its partitions.
 -- This is a deployment step (not a migration) - do it at provisioning time:
---   CREATE ROLE mohio_app;
---   GRANT INSERT ON audit_log TO mohio_app;
---   REVOKE UPDATE, DELETE ON audit_log FROM mohio_app;
+--   CREATE ROLE wikore_app;
+--   GRANT INSERT ON audit_log TO wikore_app;
+--   REVOKE UPDATE, DELETE ON audit_log FROM wikore_app;
 -- ---------------------------------------------------------------------------
 
 CREATE OR REPLACE FUNCTION prevent_audit_mutation()
