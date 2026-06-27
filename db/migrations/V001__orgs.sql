@@ -108,8 +108,7 @@ CREATE UNIQUE INDEX org_units_one_root_per_company_uidx
     ON org_units (company_id)
     WHERE type = 'root';
 
-CREATE INDEX org_units_company_id_idx ON org_units (company_id);
-CREATE INDEX org_units_parent_id_idx  ON org_units (parent_id);
+CREATE INDEX org_units_company_parent_idx ON org_units (company_id, parent_id);
 
 CREATE TRIGGER org_units_updated_at
     BEFORE UPDATE ON org_units

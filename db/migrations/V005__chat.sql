@@ -25,9 +25,8 @@ CREATE TABLE chat_sessions (
         REFERENCES users(company_id, id) ON DELETE CASCADE
 );
 
-CREATE INDEX chat_sessions_org_user_idx ON chat_sessions (org_unit_id, user_id);
-CREATE INDEX chat_sessions_company_idx  ON chat_sessions (company_id);
-CREATE INDEX chat_sessions_updated_idx  ON chat_sessions (updated_at DESC);
+CREATE INDEX chat_sessions_company_org_user_idx ON chat_sessions (company_id, org_unit_id, user_id);
+CREATE INDEX chat_sessions_updated_idx          ON chat_sessions (updated_at DESC);
 
 CREATE TRIGGER chat_sessions_updated_at
     BEFORE UPDATE ON chat_sessions
@@ -55,5 +54,4 @@ CREATE TABLE chat_turns (
         REFERENCES chat_sessions(company_id, id) ON DELETE CASCADE
 );
 
-CREATE INDEX chat_turns_session_idx ON chat_turns (session_id, created_at);
-CREATE INDEX chat_turns_company_idx ON chat_turns (company_id);
+CREATE INDEX chat_turns_company_session_created_idx ON chat_turns (company_id, session_id, created_at);
