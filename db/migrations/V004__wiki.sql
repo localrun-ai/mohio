@@ -121,11 +121,20 @@ CREATE INDEX wiki_page_sources_version_idx  ON wiki_page_sources (company_id, do
 -- Used by the lint tool to detect orphaned pages and broken internal links.
 -- Slugs are stored rather than IDs so the graph reflects the actual Markdown
 -- link text; the lint tool resolves staleness explicitly.
+-- company_id is included to keep repository methods consistent with the
+-- rest of the schema (company_id always first in queries and indexes).
 CREATE TABLE wiki_links (
-    org_unit_id UUID NOT NULL REFERENCES org_units(id) ON DELETE CASCADE,
+    company_id  UUID NOT NULL,
+    org_unit_id UUID NOT NULL,
     from_slug   TEXT NOT NULL,
     to_slug     TEXT NOT NULL,
-    PRIMARY KEY (org_unit_id, from_slug, to_slug)
+
+    PRIMARY KEY (company_id, org_unit_id, from_slug, to_slug),
+
+    CONSTRAINT wiki_links_org_unit_same_company_fk
+        FOREIGN KEY (company_id, org_unit_id)
+        REFERENCES org_units(company_id, id)
+        ON DELETE CASCADE
 );
 
-CREATE INDEX wiki_links_to_idx ON wiki_links (org_unit_id, to_slug);
+CREATE INDEX wiki_links_to_idx ON wiki_links (company_id, org_unit_id, to_slug);
