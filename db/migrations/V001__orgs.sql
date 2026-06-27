@@ -138,3 +138,22 @@ $$;
 CREATE TRIGGER org_units_closure_insert
     AFTER INSERT ON org_units
     FOR EACH ROW EXECUTE FUNCTION org_unit_closure_on_insert();
+
+-- ---------------------------------------------------------------------------
+-- Block direct parent_id updates (closure table would become stale).
+-- Use move_org_unit() once implemented. Option A per design decision.
+-- ---------------------------------------------------------------------------
+
+CREATE OR REPLACE FUNCTION prevent_org_unit_parent_update()
+RETURNS TRIGGER LANGUAGE plpgsql AS $$
+BEGIN
+    IF OLD.parent_id IS DISTINCT FROM NEW.parent_id THEN
+        RAISE EXCEPTION 'org_unit parent_id cannot be updated directly; use move_org_unit()';
+    END IF;
+    RETURN NEW;
+END;
+$$;
+
+CREATE TRIGGER org_units_prevent_parent_update
+    BEFORE UPDATE ON org_units
+    FOR EACH ROW EXECUTE FUNCTION prevent_org_unit_parent_update();
