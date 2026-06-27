@@ -139,6 +139,8 @@ jobs:
             libhiredis-dev \
             libjsoncpp-dev \
             libpq-dev \
+            libspdlog-dev \
+            uuid-dev \
             postgresql-client
 
       - name: Download test binary
