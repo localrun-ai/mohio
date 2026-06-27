@@ -54,16 +54,23 @@ $$;
 -- ---------------------------------------------------------------------------
 
 CREATE TABLE users (
-    id            UUID        PRIMARY KEY DEFAULT gen_random_uuid(),
-    company_id    UUID        NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
-    external_sub  TEXT        NOT NULL,           -- SSO subject (sub claim)
-    email         TEXT        NOT NULL,
-    display_name  TEXT,
-    avatar_url    TEXT,
-    is_admin      BOOLEAN     NOT NULL DEFAULT false,
-    created_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
-    last_seen     TIMESTAMPTZ,
-    UNIQUE (company_id, external_sub),
+    id               UUID        PRIMARY KEY DEFAULT gen_random_uuid(),
+    company_id       UUID        NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
+    -- external_issuer + external_sub together identify the SSO principal.
+    -- external_issuer: OIDC issuer URL (e.g. 'https://keycloak.acme.com/realms/mohio')
+    --                  or 'local' for password/API-key-only accounts.
+    -- external_sub:    OIDC sub claim; unique only within an issuer.
+    -- Provisioning must always set external_issuer explicitly for OIDC users.
+    external_issuer  TEXT        NOT NULL DEFAULT 'local',
+    external_sub     TEXT        NOT NULL,
+    email            TEXT        NOT NULL,
+    display_name     TEXT,
+    avatar_url       TEXT,
+    is_admin         BOOLEAN     NOT NULL DEFAULT false,
+    created_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
+    last_seen        TIMESTAMPTZ,
+    -- Sub is unique within an issuer, not globally across issuers.
+    UNIQUE (company_id, external_issuer, external_sub),
     UNIQUE (company_id, email),
     -- Required target for composite FKs from other tables.
     UNIQUE (company_id, id)
