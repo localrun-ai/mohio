@@ -21,6 +21,35 @@
 --   Default is CLOSED: no membership = no access.
 
 -- ---------------------------------------------------------------------------
+-- Actor same-company validation helper
+--
+-- Called from per-table BEFORE INSERT OR UPDATE triggers to validate that
+-- actor fields (granted_by, created_by, updated_by, etc.) belong to the
+-- same company as the row being written.
+--
+-- Composite FKs cannot be used for these columns because ON DELETE SET NULL
+-- on a composite FK would null out company_id, violating its NOT NULL
+-- constraint. Simple FKs only check existence, not company membership.
+-- This function fills that gap without storing duplicate company context.
+-- ---------------------------------------------------------------------------
+
+CREATE OR REPLACE FUNCTION validate_actor_same_company(
+    p_actor_id   UUID,
+    p_company_id UUID,
+    p_field_name TEXT
+)
+RETURNS VOID LANGUAGE plpgsql AS $$
+BEGIN
+    IF p_actor_id IS NOT NULL AND NOT EXISTS (
+        SELECT 1 FROM users WHERE id = p_actor_id AND company_id = p_company_id
+    ) THEN
+        RAISE EXCEPTION 'actor field "%" user % does not belong to company %',
+            p_field_name, p_actor_id, p_company_id;
+    END IF;
+END;
+$$;
+
+-- ---------------------------------------------------------------------------
 -- Users
 -- ---------------------------------------------------------------------------
 
@@ -165,6 +194,18 @@ CREATE TRIGGER memberships_updated_at
     BEFORE UPDATE ON memberships
     FOR EACH ROW EXECUTE FUNCTION set_updated_at();
 
+CREATE OR REPLACE FUNCTION validate_memberships_actors()
+RETURNS TRIGGER LANGUAGE plpgsql AS $$
+BEGIN
+    PERFORM validate_actor_same_company(NEW.granted_by, NEW.company_id, 'granted_by');
+    RETURN NEW;
+END;
+$$;
+
+CREATE TRIGGER memberships_validate_actors
+    BEFORE INSERT OR UPDATE ON memberships
+    FOR EACH ROW EXECUTE FUNCTION validate_memberships_actors();
+
 -- ---------------------------------------------------------------------------
 -- Resource grants: explicit permission override on a specific resource
 --
@@ -198,6 +239,18 @@ CREATE TABLE resource_grants (
 CREATE INDEX resource_grants_resource_idx  ON resource_grants (company_id, resource_type, resource_id);
 CREATE INDEX resource_grants_principal_idx ON resource_grants (company_id, principal_type, principal_id);
 CREATE INDEX resource_grants_company_idx   ON resource_grants (company_id);
+
+CREATE OR REPLACE FUNCTION validate_resource_grants_actors()
+RETURNS TRIGGER LANGUAGE plpgsql AS $$
+BEGIN
+    PERFORM validate_actor_same_company(NEW.granted_by, NEW.company_id, 'granted_by');
+    RETURN NEW;
+END;
+$$;
+
+CREATE TRIGGER resource_grants_validate_actors
+    BEFORE INSERT OR UPDATE ON resource_grants
+    FOR EACH ROW EXECUTE FUNCTION validate_resource_grants_actors();
 
 -- ---------------------------------------------------------------------------
 -- API keys (service accounts: CI bots, ingestion scripts, Slack bots, etc.)

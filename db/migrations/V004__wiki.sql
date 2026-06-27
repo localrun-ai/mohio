@@ -41,6 +41,19 @@ CREATE TRIGGER wiki_pages_updated_at
     BEFORE UPDATE ON wiki_pages
     FOR EACH ROW EXECUTE FUNCTION set_updated_at();
 
+CREATE OR REPLACE FUNCTION validate_wiki_pages_actors()
+RETURNS TRIGGER LANGUAGE plpgsql AS $$
+BEGIN
+    PERFORM validate_actor_same_company(NEW.created_by,  NEW.company_id, 'created_by');
+    PERFORM validate_actor_same_company(NEW.updated_by,  NEW.company_id, 'updated_by');
+    RETURN NEW;
+END;
+$$;
+
+CREATE TRIGGER wiki_pages_validate_actors
+    BEFORE INSERT OR UPDATE ON wiki_pages
+    FOR EACH ROW EXECUTE FUNCTION validate_wiki_pages_actors();
+
 -- Link graph: page A references page B within the same org_unit.
 -- Used by the lint tool to detect orphaned pages and broken internal links.
 -- Slugs are stored rather than IDs so the graph reflects the actual Markdown

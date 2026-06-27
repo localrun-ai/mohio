@@ -40,6 +40,18 @@ CREATE TRIGGER integrations_updated_at
     BEFORE UPDATE ON integrations
     FOR EACH ROW EXECUTE FUNCTION set_updated_at();
 
+CREATE OR REPLACE FUNCTION validate_integrations_actors()
+RETURNS TRIGGER LANGUAGE plpgsql AS $$
+BEGIN
+    PERFORM validate_actor_same_company(NEW.created_by, NEW.company_id, 'created_by');
+    RETURN NEW;
+END;
+$$;
+
+CREATE TRIGGER integrations_validate_actors
+    BEFORE INSERT OR UPDATE ON integrations
+    FOR EACH ROW EXECUTE FUNCTION validate_integrations_actors();
+
 CREATE TABLE mcp_tools (
     id             UUID    PRIMARY KEY DEFAULT gen_random_uuid(),
     integration_id UUID    NOT NULL REFERENCES integrations(id) ON DELETE CASCADE,

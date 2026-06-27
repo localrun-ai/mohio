@@ -142,6 +142,18 @@ CREATE UNIQUE INDEX document_versions_one_active_per_doc_uidx
     ON document_versions (company_id, document_id)
     WHERE lifecycle_status = 'active';
 
+CREATE OR REPLACE FUNCTION validate_document_versions_actors()
+RETURNS TRIGGER LANGUAGE plpgsql AS $$
+BEGIN
+    PERFORM validate_actor_same_company(NEW.created_by, NEW.company_id, 'created_by');
+    RETURN NEW;
+END;
+$$;
+
+CREATE TRIGGER document_versions_validate_actors
+    BEFORE INSERT OR UPDATE ON document_versions
+    FOR EACH ROW EXECUTE FUNCTION validate_document_versions_actors();
+
 -- ---------------------------------------------------------------------------
 -- Embedding models (global server configuration; not company-scoped)
 --
