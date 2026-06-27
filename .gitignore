@@ -6,6 +6,11 @@ dist/
 *.a
 *.so
 
+# Python bytecode
+__pycache__/
+*.py[cod]
+*.egg-info/
+
 # CMake
 CMakeCache.txt
 CMakeFiles/
