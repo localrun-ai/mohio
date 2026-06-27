@@ -1,6 +1,7 @@
 add_executable(wikore_ingest main.cpp)
 
 target_link_libraries(wikore_ingest PRIVATE
+    wikore_ingest_lib
     wikore_core
     wikore_app
     wikore_warnings
