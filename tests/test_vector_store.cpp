@@ -203,3 +203,28 @@ TEST_CASE("NullVectorStore: search returns results sorted by score", "[vector_st
     for (size_t i = 1; i < r->size(); ++i)
         CHECK((*r)[i].score <= (*r)[i - 1].score);
 }
+
+TEST_CASE("NullVectorStore: empty access_scope_ids returns nothing", "[vector_store]")
+{
+    // Mirrors Qdrant's MatchAny semantics: an empty `any` array matches NO
+    // points. A caller without a resolved scope MUST NOT see any evidence.
+    // This matches the production QdrantVectorStore behaviour and prevents
+    // tests passing only because Null was more permissive than Qdrant.
+    NullVectorStore vs;
+    drogon::sync_wait(vs.upsert({
+        make_point("p1", "co1", "v1", "c1", "active", {"org-A"}),
+        make_point("p2", "co1", "v2", "c2", "active", {"org-B"}),
+    }));
+
+    NullEmbedder emb(4);
+    auto q = drogon::sync_wait(emb.embed("query"));
+
+    QdrantFilter f;
+    f.company_id       = "co1";
+    f.access_scope_ids = {};   // empty -> match nothing
+    f.lifecycle_status = "active";
+
+    auto r = drogon::sync_wait(vs.search(*q, f, 10));
+    REQUIRE(r.has_value());
+    CHECK(r->empty());
+}

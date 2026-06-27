@@ -8,6 +8,7 @@ add_executable(wikore_tests
     test_vector_store.cpp
     test_chunker.cpp
     test_parser.cpp
+    test_ingest_use_case.cpp
 )
 target_link_libraries(wikore_tests PRIVATE
     wikore_ingest_lib

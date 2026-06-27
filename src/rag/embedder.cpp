@@ -94,8 +94,29 @@ LlamaEmbedder::do_embed(std::vector<std::string> texts)
             Error::unavailable("embed response parse failed"));
     }
 
+    if (parsed.data.size() != texts.size()) {
+        co_return std::unexpected(Error::unavailable(std::format(
+            "embed response cardinality: expected {} embeddings, got {}",
+            texts.size(), parsed.data.size())));
+    }
+
     std::sort(parsed.data.begin(), parsed.data.end(),
               [](const EmbedData& a, const EmbedData& b) { return a.index < b.index; });
+
+    // Indices must form the contiguous range [0..N-1] -- otherwise we'd
+    // align embeddings to the wrong texts via positional access.
+    for (std::size_t i = 0; i < parsed.data.size(); ++i) {
+        if (parsed.data[i].index != static_cast<int>(i)) {
+            co_return std::unexpected(Error::unavailable(std::format(
+                "embed response indices not [0..{}]: position {} has index {}",
+                parsed.data.size() - 1, i, parsed.data[i].index)));
+        }
+        if (static_cast<int>(parsed.data[i].embedding.size()) != _dims) {
+            co_return std::unexpected(Error::unavailable(std::format(
+                "embed response dim mismatch at index {}: expected {}, got {}",
+                i, _dims, parsed.data[i].embedding.size())));
+        }
+    }
 
     std::vector<Embedding> out;
     out.reserve(parsed.data.size());

@@ -119,3 +119,51 @@ TEST_CASE("Chunker: whitespace-only text produces no chunks", "[chunker]")
     auto chunks = c.chunk(flat_doc("   \n\n   "), "v1", "co1");
     REQUIRE(chunks.empty());
 }
+
+TEST_CASE("Chunker: chunks never span section boundaries (K5)", "[chunker]")
+{
+    // Build two sections each long enough to produce multiple chunks. Then
+    // assert: (a) every chunk's section_id is exactly one of the two known
+    // section ids, (b) the chunk text appears as a substring of that
+    // section's text -- i.e., no chunk mixes content from two sections.
+    ParsedDocument doc;
+    doc.filename = "two-sections.md";
+    doc.mime_type = "text/markdown";
+
+    ParsedSection s1;
+    s1.heading = "First";
+    s1.depth   = 1;
+    s1.db_id   = "sec-A";
+    s1.text    = std::string(1200, 'A') + " end-of-A";
+
+    ParsedSection s2;
+    s2.heading = "Second";
+    s2.depth   = 1;
+    s2.db_id   = "sec-B";
+    s2.text    = std::string(1200, 'B') + " end-of-B";
+
+    doc.sections = {s1, s2};
+
+    Chunker c;
+    auto chunks = c.chunk(doc, "v1", "co1");
+    REQUIRE(chunks.size() >= 4);   // each section produces >1 chunk
+
+    int from_a = 0, from_b = 0;
+    for (const auto& ch : chunks) {
+        REQUIRE(ch.section_id.has_value());
+        if (*ch.section_id == "sec-A") {
+            ++from_a;
+            // A chunk under section A must be a substring of section A's text
+            // (so it cannot contain any 'B' characters).
+            CHECK(ch.text.find('B') == std::string::npos);
+        } else if (*ch.section_id == "sec-B") {
+            ++from_b;
+            CHECK(ch.text.find('A') == std::string::npos);
+        } else {
+            FAIL("unexpected section_id: " << *ch.section_id);
+        }
+    }
+    // Both sections must contribute at least one chunk.
+    CHECK(from_a >= 1);
+    CHECK(from_b >= 1);
+}

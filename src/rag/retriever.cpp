@@ -61,6 +61,41 @@ struct QdrantSearchResponse {
     std::vector<QdrantSearchResult> result;
 };
 
+namespace {
+
+// Minimal JSON string escaper for values that are interpolated into the
+// hand-built search/delete bodies below. The inputs are validated UUIDs and
+// a fixed enum today, so this is mostly defence-in-depth; if a future
+// schema change broadens the field type, this prevents the JSON from
+// breaking or becoming injectable.
+std::string json_escape(std::string_view in)
+{
+    std::string out;
+    out.reserve(in.size() + 2);
+    for (char c : in) {
+        switch (c) {
+        case '"':  out += "\\\""; break;
+        case '\\': out += "\\\\"; break;
+        case '\b': out += "\\b";  break;
+        case '\f': out += "\\f";  break;
+        case '\n': out += "\\n";  break;
+        case '\r': out += "\\r";  break;
+        case '\t': out += "\\t";  break;
+        default:
+            if (static_cast<unsigned char>(c) < 0x20) {
+                char buf[8];
+                std::snprintf(buf, sizeof(buf), "\\u%04x", c);
+                out += buf;
+            } else {
+                out += c;
+            }
+        }
+    }
+    return out;
+}
+
+} // namespace
+
 // ---------------------------------------------------------------------------
 // QdrantVectorStore helpers
 // ---------------------------------------------------------------------------
@@ -73,7 +108,7 @@ static std::string build_delete_body(std::string_view company_id,
         R"({{"key":"company_id","match":{{"value":"{}"}}}},)"
         R"({{"key":"document_version_id","match":{{"value":"{}"}}}})"
         R"(]}}}})",
-        company_id, version_id);
+        json_escape(company_id), json_escape(version_id));
 }
 
 static std::string build_search_body(const Embedding&    query,
@@ -92,7 +127,7 @@ static std::string build_search_body(const Embedding&    query,
     std::string scope_json = "[";
     for (size_t i = 0; i < filter.access_scope_ids.size(); ++i) {
         if (i) scope_json += ',';
-        scope_json += std::format(R"("{}")", filter.access_scope_ids[i]);
+        scope_json += std::format(R"("{}")", json_escape(filter.access_scope_ids[i]));
     }
     scope_json += ']';
 
@@ -104,7 +139,8 @@ static std::string build_search_body(const Embedding&    query,
         R"({{"key":"lifecycle_status","match":{{"value":"{}"}}}})"
         R"(]}}}})",
         vec_json, limit,
-        filter.company_id, scope_json, filter.lifecycle_status);
+        json_escape(filter.company_id), scope_json,
+        json_escape(filter.lifecycle_status));
 }
 
 // ---------------------------------------------------------------------------
@@ -305,13 +341,20 @@ NullVectorStore::search(const Embedding&    query,
                          const QdrantFilter& filter,
                          int                 limit)
 {
+    // Match Qdrant payload-filter semantics:
+    //   * an empty access_scope_ids MatchAny matches NOTHING (not "everything"),
+    //     so an empty filter returns zero candidates. This is the same
+    //     behaviour the production QdrantVectorStore produces, and it is the
+    //     safe default: a caller with no scope must not see any evidence.
+    if (filter.access_scope_ids.empty())
+        co_return std::vector<ChunkCandidate>{};
+
     std::vector<std::pair<float, const UpsertPoint*>> scored;
     scored.reserve(_points.size());
 
     for (const auto& p : _points) {
-        // Apply filter
-        if (p.payload.company_id != filter.company_id)   continue;
-        if (p.payload.lifecycle_status != filter.lifecycle_status) continue;
+        if (p.payload.company_id       != filter.company_id)        continue;
+        if (p.payload.lifecycle_status != filter.lifecycle_status)  continue;
         bool in_scope = false;
         for (const auto& sid : filter.access_scope_ids) {
             if (std::ranges::find(p.payload.access_scope_ids, sid)
@@ -320,7 +363,7 @@ NullVectorStore::search(const Embedding&    query,
                 break;
             }
         }
-        if (!in_scope && !filter.access_scope_ids.empty()) continue;
+        if (!in_scope) continue;
 
         // Dot product similarity (both vectors already unit-normalized for NullEmbedder)
         float dot = 0.0f;
