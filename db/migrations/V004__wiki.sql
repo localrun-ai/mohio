@@ -4,17 +4,19 @@
 -- documents. Every page records its source documents (provenance) and
 -- inherits access control from its owner org_unit.
 --
--- source_doc_ids (UUID[]) cannot carry FK constraints; same-company integrity
--- and existence are enforced by the application when generating pages.
+-- source_version_ids (UUID[]) pins wiki generation to specific document_versions,
+-- not just documents. This keeps provenance reproducible even after documents are
+-- superseded. Cannot carry FK constraints (PostgreSQL does not support FKs on
+-- array columns); same-company integrity is enforced by the application.
 
 CREATE TABLE wiki_pages (
-    id               UUID        PRIMARY KEY DEFAULT gen_random_uuid(),
-    company_id       UUID        NOT NULL,
-    org_unit_id      UUID        NOT NULL,
-    slug             TEXT        NOT NULL,
-    title            TEXT        NOT NULL,
-    content          TEXT        NOT NULL,        -- markdown
-    source_doc_ids   UUID[]      NOT NULL DEFAULT '{}',  -- provenance; no FK (array)
+    id                UUID        PRIMARY KEY DEFAULT gen_random_uuid(),
+    company_id        UUID        NOT NULL,
+    org_unit_id       UUID        NOT NULL,
+    slug              TEXT        NOT NULL,
+    title             TEXT        NOT NULL,
+    content           TEXT        NOT NULL,        -- markdown
+    source_version_ids UUID[]     NOT NULL DEFAULT '{}',  -- provenance: document_versions.id[]
     lifecycle_status TEXT        NOT NULL DEFAULT 'draft'
                                  CHECK (lifecycle_status IN (
                                      'draft','active','deprecated','archived'

@@ -39,7 +39,9 @@ CREATE TABLE chat_turns (
     session_id       UUID        NOT NULL,
     question         TEXT        NOT NULL,
     answer           TEXT,
-    -- [{doc_id, chunk_id, score, excerpt}] - chunks shown to the LLM
+    -- [{doc_id, version_id, chunk_id, score, excerpt}] - chunks shown to the LLM.
+    -- version_id pins the citation to the exact document_versions row so the
+    -- evidence is reproducible even after the document is superseded.
     rag_sources      JSONB       NOT NULL DEFAULT '[]',
     -- [{tool, args, result_summary}]
     tool_calls       JSONB       NOT NULL DEFAULT '[]',
