@@ -21,21 +21,35 @@ using Embedding = std::vector<float>;
 // which makes upsert naturally idempotent.
 // ---------------------------------------------------------------------------
 
+// Returns the canonical hyphenated string on success.
+// On any OpenSSL failure (allocation or digest), returns the all-zero UUID
+// "00000000-0000-0000-0000-000000000000". Callers that need to fail-fast on
+// this case can test against that sentinel; in practice the only realistic
+// failure mode is OOM during EVP_MD_CTX_new(), in which case the surrounding
+// allocator is already in trouble.
 inline std::string uuid_v5(std::string_view name) {
     // RFC 4122 URL namespace: 6ba7b811-9dad-11d1-80b4-00c04fd430c8
     static constexpr uint8_t kNs[16] = {
         0x6b, 0xa7, 0xb8, 0x11, 0x9d, 0xad, 0x11, 0xd1,
         0x80, 0xb4, 0x00, 0xc0, 0x4f, 0xd4, 0x30, 0xc8,
     };
-    uint8_t hash[20];
+    uint8_t      hash[20] = {0};
     unsigned int hash_len = sizeof(hash);
+
     // Use EVP API (OpenSSL 3.0+; SHA-1 low-level API is deprecated).
     EVP_MD_CTX* ctx = EVP_MD_CTX_new();
-    EVP_DigestInit_ex(ctx, EVP_sha1(), nullptr);
-    EVP_DigestUpdate(ctx, kNs, 16);
-    EVP_DigestUpdate(ctx, name.data(), name.size());
-    EVP_DigestFinal_ex(ctx, hash, &hash_len);
+    if (!ctx)
+        return "00000000-0000-0000-0000-000000000000";
+
+    bool ok =
+           EVP_DigestInit_ex(ctx, EVP_sha1(), nullptr) == 1
+        && EVP_DigestUpdate(ctx, kNs, 16)              == 1
+        && EVP_DigestUpdate(ctx, name.data(), name.size()) == 1
+        && EVP_DigestFinal_ex(ctx, hash, &hash_len)    == 1;
     EVP_MD_CTX_free(ctx);
+    if (!ok)
+        return "00000000-0000-0000-0000-000000000000";
+
     // Set version=5 and RFC 4122 variant bits.
     hash[6] = (hash[6] & 0x0f) | 0x50;
     hash[8] = (hash[8] & 0x3f) | 0x80;

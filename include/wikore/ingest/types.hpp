@@ -70,11 +70,14 @@ struct IngestJob {
 // IngestProgress: written back to document_versions during ingest.
 // ---------------------------------------------------------------------------
 
+// Mirrors V003's `document_versions.ingest_status` CHECK
+// (CHECK (ingest_status IN ('pending','processing','done','error'))).
+// Adding a new value here REQUIRES extending the CHECK first.
 enum class IngestStatus {
     pending,
-    running,
+    processing,
     done,
-    failed,
+    error,
 };
 
 std::string_view to_string(IngestStatus s);
