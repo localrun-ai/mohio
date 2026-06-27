@@ -1,4 +1,4 @@
--- V026: integrations credentials/key_id presence CHECK
+-- V027: integrations credentials/key_id presence CHECK
 --
 -- V006 declares integrations.credentials (encrypted blob) and
 -- integrations.credentials_key_id (which key version encrypted it) as
