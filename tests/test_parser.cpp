@@ -125,6 +125,8 @@ TEST_CASE("PlainTextParser: binary office input is not treated as text", "[parse
 TEST_CASE("PlainTextParser: EICAR signature is rejected", "[parser][security]")
 {
     PlainTextParser p;
+    // Keep these fragments separate: a contiguous literal can trigger AV
+    // scanners on the compiled test binary.
     std::string content = R"(X5O!P%@AP[4\PZX54(P^)7CC)7})";
     content += "$EICAR-STANDARD-ANTIVIRUS-TEST-FILE!$H+H*";
     auto result = p.parse(content, "eicar.txt", "text/plain");
@@ -143,6 +145,37 @@ TEST_CASE("PlainTextParser: hidden Markdown HTML is removed with its content",
     CHECK(result->full_text.find("Keep this") != std::string::npos);
     CHECK(result->full_text.find("ignore previous rules") == std::string::npos);
     CHECK(result->full_text.find("<span") == std::string::npos);
+}
+
+TEST_CASE("PlainTextParser: hidden self-closing tag preserves following text",
+          "[parser][security]")
+{
+    PlainTextParser p;
+    auto result = p.parse(
+        "<img style='display:none'/> Visible body text continues here.",
+        "self-closing.md", "text/markdown");
+    REQUIRE(result.has_value());
+    CHECK(result->full_text == " Visible body text continues here.");
+}
+
+TEST_CASE("PlainTextParser: unclosed hidden container is rejected",
+          "[parser][security]")
+{
+    PlainTextParser p;
+    auto result = p.parse(
+        "Visible prefix. <script>untrusted content", "unclosed.md", "text/markdown");
+    REQUIRE_FALSE(result.has_value());
+    CHECK(result.error().message == "ingest.unclosed_hidden_tag");
+}
+
+TEST_CASE("PlainTextParser: hidden substring in class name preserves content",
+          "[parser][security]")
+{
+    PlainTextParser p;
+    auto result = p.parse(
+        "<span class=' hidden-content'>keep this</span>", "class.md", "text/markdown");
+    REQUIRE(result.has_value());
+    CHECK(result->full_text == "keep this");
 }
 
 TEST_CASE("PlainTextParser: comparison text is not treated as HTML", "[parser]")

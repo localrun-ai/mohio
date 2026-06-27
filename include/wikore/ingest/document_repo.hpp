@@ -54,6 +54,8 @@ public:
     //
     // Runs on `db` (typically outside any UoW) so a failure flip survives
     // even when the main ingest transaction rolls back.
+    // Entering a non-error state clears error_msg so a retry does not retain
+    // a stale failure reason; callers needing history must use the audit log.
     virtual drogon::Task<Result<void>>
     set_ingest_status(std::string_view company_id,
                       std::string_view document_version_id,

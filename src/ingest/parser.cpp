@@ -134,7 +134,40 @@ Result<std::string> strip_unicode_tags(std::string_view input)
     return output;
 }
 
-std::string strip_markdown_html(std::string input)
+bool has_boolean_attribute(std::string_view tag, std::string_view attribute,
+                           std::size_t attributes_start)
+{
+    auto pos = tag.find(attribute, attributes_start);
+    while (pos != std::string_view::npos) {
+        const auto after = pos + attribute.size();
+        const bool starts_token = pos > 0
+            && std::isspace(static_cast<unsigned char>(tag[pos - 1]));
+        const bool ends_token = after == tag.size()
+            || std::isspace(static_cast<unsigned char>(tag[after]))
+            || tag[after] == '=' || tag[after] == '/';
+        if (starts_token && ends_token)
+            return true;
+        pos = tag.find(attribute, after);
+    }
+    return false;
+}
+
+bool is_void_html_element(std::string_view name)
+{
+    return name == "area" || name == "base" || name == "br"
+        || name == "col" || name == "embed" || name == "hr"
+        || name == "img" || name == "input" || name == "link"
+        || name == "meta" || name == "source" || name == "track"
+        || name == "wbr";
+}
+
+bool is_self_closing_tag(std::string_view tag)
+{
+    const auto end = tag.find_last_not_of(" \t\r\n");
+    return end != std::string_view::npos && tag[end] == '/';
+}
+
+Result<std::string> strip_markdown_html(std::string input)
 {
     const auto lower = lower_ascii(input);
     std::string output;
@@ -174,14 +207,23 @@ std::string strip_markdown_html(std::string input)
             || tag.find("display: none") != std::string::npos
             || tag.find("visibility:hidden") != std::string::npos
             || tag.find("visibility: hidden") != std::string::npos
-            || tag.find(" hidden") != std::string::npos;
+            || has_boolean_attribute(tag, "hidden", name_end);
         if (hidden && !name.empty() && tag.front() != '/') {
+            if (is_self_closing_tag(tag) || is_void_html_element(name)) {
+                pos = tag_end + 1;
+                continue;
+            }
+
             const auto close = "</" + name;
             const auto close_start = lower.find(close, tag_end + 1);
             if (close_start == std::string::npos)
-                break;
+                return std::unexpected(
+                    Error::invalid_input("ingest.unclosed_hidden_tag"));
             const auto close_end = input.find('>', close_start + close.size());
-            pos = close_end == std::string::npos ? input.size() : close_end + 1;
+            if (close_end == std::string::npos)
+                return std::unexpected(
+                    Error::invalid_input("ingest.unclosed_hidden_tag"));
+            pos = close_end + 1;
             continue;
         }
 
@@ -215,8 +257,12 @@ PlainTextParser::parse(const std::string& content,
     auto normalized = strip_unicode_tags(content);
     if (!normalized)
         return std::unexpected(normalized.error());
-    if (*resolved_mime == "text/markdown")
-        *normalized = strip_markdown_html(std::move(*normalized));
+    if (*resolved_mime == "text/markdown") {
+        auto sanitized = strip_markdown_html(std::move(*normalized));
+        if (!sanitized)
+            return std::unexpected(sanitized.error());
+        *normalized = std::move(*sanitized);
+    }
 
     ParsedDocument doc;
     doc.filename  = filename;
