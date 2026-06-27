@@ -49,23 +49,10 @@ psql() { docker exec "$CONTAINER" psql -U postgres -At "$@"; }
 sql()  { psql -c "$1"; }
 
 echo "-- Loading migrations..."
-cat db/migrations/V001__orgs.sql \
-    db/migrations/V002__users_and_auth.sql \
-    db/migrations/V003__documents.sql \
-    db/migrations/V004__wiki.sql \
-    db/migrations/V005__chat.sql \
-    db/migrations/V006__integrations.sql \
-    db/migrations/V007__audit.sql \
-    db/migrations/V009__grant_validation.sql \
-    db/migrations/V010__promotion_functions.sql \
-    db/migrations/V011__deactivation_expiry_audit.sql \
-    db/migrations/V012__move_org_unit.sql \
-    db/migrations/V013__reactivate_user.sql \
-    db/migrations/V014__sensitivity_sections_tombstones.sql \
-    db/migrations/V015__outbox.sql \
-    db/migrations/V016__usage_events.sql \
-    db/migrations/V017__prompt_templates.sql \
-    db/migrations/V018__feedback_signals.sql \
+# Migrations are auto-discovered (sorted lexicographically = sequential
+# numeric order) so adding a new V0NN__*.sql file is purely additive
+# from a PR-merge standpoint - no explicit cat-list edit needed.
+ls db/migrations/V*.sql | sort | xargs cat \
   | docker exec -i "$CONTAINER" psql -U postgres -v ON_ERROR_STOP=1 -q
 echo "-- Migrations loaded."
 echo ""
@@ -570,6 +557,20 @@ COUNT=$(sql "SELECT COUNT(*) FROM chunk_quality_signals WHERE chunk_id='$CHK1';"
 [ "$COUNT" -eq 0 ] \
   && pass 36 "chunk_quality_signals cascades on chunk delete (rows=0)" \
   || fail 36 "chunk_quality_signals did not cascade (rows=$COUNT)"
+
+# --------------------------------------------------------------------------
+# Per-migration tests (auto-discovered from db/smoke_tests/V*.sh)
+#
+# Each schema PR drops its test file under db/smoke_tests/V0NN__name.sh and
+# this loop sources them in lexicographic (numeric) order. Sourcing means
+# each file has access to the helpers (sql, psql, pass, fail) and fixtures
+# (CO_ACME, U_ALICE, ACME_ROOT, ...) defined above. Per-PR tests should use
+# distinct UUIDs and tag IDs by migration number (e.g., "V019.1") to avoid
+# cross-file collisions.
+# --------------------------------------------------------------------------
+for f in db/smoke_tests/V*.sh; do
+    [ -f "$f" ] && source "$f"
+done
 
 # --------------------------------------------------------------------------
 # Summary
