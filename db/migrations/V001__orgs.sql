@@ -1,7 +1,16 @@
 -- V001: Companies and org units
 --
--- Org units form a tree within a company:
---   [subsidiary] -> [division] -> department -> [team | project]
+-- Every company gets one automatic root org_unit (type='root', parent_id=NULL,
+-- slug='root', name=company.name). All other org units are children of root or
+-- deeper descendants. This keeps access scope resolution uniform: resolving
+-- "what can user X see?" is always a single closure-table lookup regardless of
+-- whether the resource is company-wide or scoped to a team.
+--
+-- Root does NOT imply "can read everything". It is the company-wide scope.
+-- Membership semantics:
+--   membership on root, applies_to=self_only         => company-wide docs only
+--   membership on root, applies_to=self_and_descendants => full company tree
+--   membership on HR,   applies_to=self_and_descendants => HR subtree only
 --
 -- Cross-company integrity strategy:
 --   Every table that belongs to a company carries an explicit company_id column.
@@ -44,14 +53,20 @@ CREATE TRIGGER companies_updated_at
 
 -- ---------------------------------------------------------------------------
 -- Org units
+--
+-- type='root': one per company, parent_id=NULL, slug='root', name=company name.
+-- All other types must have a non-NULL parent_id (enforced by CHECK).
+-- C++ should identify the root by: type='root' AND company_id=X
+-- (or cache the root_org_unit_id on startup).
 -- ---------------------------------------------------------------------------
 
 CREATE TABLE org_units (
     id          UUID        PRIMARY KEY DEFAULT gen_random_uuid(),
     company_id  UUID        NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
-    parent_id   UUID,                            -- NULL = top-level unit for this company
+    parent_id   UUID,                            -- NULL only for type='root'
     type        TEXT        NOT NULL
                             CHECK (type IN (
+                                'root',
                                 'subsidiary','division','department','team','project'
                             )),
     slug        TEXT        NOT NULL,
@@ -63,21 +78,35 @@ CREATE TABLE org_units (
     -- Required so composite FKs from other tables can reference (company_id, id).
     UNIQUE (company_id, id),
 
+    -- root <=> parent_id IS NULL. All other units must have a parent.
+    CONSTRAINT org_units_root_parent_shape_chk
+        CHECK (
+            (type = 'root' AND parent_id IS NULL)
+            OR
+            (type <> 'root' AND parent_id IS NOT NULL)
+        ),
+
     -- Composite self-reference: enforces parent belongs to the same company.
-    -- NULL parent_id is not checked by PostgreSQL FK (NULL = no reference), which
-    -- is correct: top-level units have no parent.
+    -- NULL parent_id (root units) is not checked by PostgreSQL FK, which is
+    -- correct: root has no parent.
     CONSTRAINT org_units_parent_same_company_fk
         FOREIGN KEY (company_id, parent_id)
         REFERENCES org_units(company_id, id)
         ON DELETE CASCADE
 );
 
+-- Unique slug within the same parent (NULL parent uses zero UUID as sentinel).
 CREATE UNIQUE INDEX org_units_parent_slug_uidx
     ON org_units (
         company_id,
         COALESCE(parent_id, '00000000-0000-0000-0000-000000000000'),
         slug
     );
+
+-- At most one root per company.
+CREATE UNIQUE INDEX org_units_one_root_per_company_uidx
+    ON org_units (company_id)
+    WHERE type = 'root';
 
 CREATE INDEX org_units_company_id_idx ON org_units (company_id);
 CREATE INDEX org_units_parent_id_idx  ON org_units (parent_id);
@@ -157,3 +186,68 @@ $$;
 CREATE TRIGGER org_units_prevent_parent_update
     BEFORE UPDATE ON org_units
     FOR EACH ROW EXECUTE FUNCTION prevent_org_unit_parent_update();
+
+-- ---------------------------------------------------------------------------
+-- Auto-create root org_unit when a company is inserted.
+-- The org_units_closure_insert trigger fires immediately after, giving root
+-- a self-entry at depth 0 in org_unit_closure.
+-- ---------------------------------------------------------------------------
+
+CREATE OR REPLACE FUNCTION create_root_org_unit_for_company()
+RETURNS TRIGGER LANGUAGE plpgsql AS $$
+BEGIN
+    INSERT INTO org_units (company_id, parent_id, type, name, slug)
+    VALUES (NEW.id, NULL, 'root', NEW.name, 'root');
+    RETURN NEW;
+END;
+$$;
+
+CREATE TRIGGER companies_create_root_org_unit
+    AFTER INSERT ON companies
+    FOR EACH ROW EXECUTE FUNCTION create_root_org_unit_for_company();
+
+-- ---------------------------------------------------------------------------
+-- Prevent manual deletion of the root org_unit.
+-- Company-cascade deletes are allowed: when the company row is already gone
+-- (i.e., this delete was triggered by ON DELETE CASCADE), EXISTS returns false
+-- and the delete proceeds. A direct DELETE on the root unit finds the company
+-- still present and raises.
+-- ---------------------------------------------------------------------------
+
+CREATE OR REPLACE FUNCTION prevent_root_org_unit_delete()
+RETURNS TRIGGER LANGUAGE plpgsql AS $$
+BEGIN
+    IF OLD.type = 'root' THEN
+        IF EXISTS (SELECT 1 FROM companies WHERE id = OLD.company_id) THEN
+            RAISE EXCEPTION 'Cannot delete root org_unit for company %', OLD.company_id;
+        END IF;
+    END IF;
+    RETURN OLD;
+END;
+$$;
+
+CREATE TRIGGER org_units_prevent_root_delete
+    BEFORE DELETE ON org_units
+    FOR EACH ROW EXECUTE FUNCTION prevent_root_org_unit_delete();
+
+-- ---------------------------------------------------------------------------
+-- Keep root org_unit name in sync with company name.
+-- updated_at is handled by the existing org_units_updated_at BEFORE UPDATE
+-- trigger; no need to set it explicitly here.
+-- ---------------------------------------------------------------------------
+
+CREATE OR REPLACE FUNCTION sync_root_org_unit_name()
+RETURNS TRIGGER LANGUAGE plpgsql AS $$
+BEGIN
+    IF OLD.name IS DISTINCT FROM NEW.name THEN
+        UPDATE org_units
+        SET name = NEW.name
+        WHERE company_id = NEW.id AND type = 'root';
+    END IF;
+    RETURN NEW;
+END;
+$$;
+
+CREATE TRIGGER companies_sync_root_org_unit_name
+    AFTER UPDATE OF name ON companies
+    FOR EACH ROW EXECUTE FUNCTION sync_root_org_unit_name();
