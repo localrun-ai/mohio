@@ -116,11 +116,25 @@ CREATE TABLE document_versions (
     created_by       UUID        REFERENCES users(id) ON DELETE SET NULL,
     created_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
     completed_at     TIMESTAMPTZ,
+    activated_at     TIMESTAMPTZ,   -- set when version transitions to 'active'
+    superseded_at    TIMESTAMPTZ,   -- set when a newer version becomes 'active'
     error_msg        TEXT,
     lifecycle_status TEXT        NOT NULL DEFAULT 'draft'
                                  CHECK (lifecycle_status IN (
                                      'draft','active','deprecated','archived'
                                  )),
+
+    -- An active version must be fully ingested, have a known activation time,
+    -- and must not yet be superseded.
+    CONSTRAINT document_versions_active_state_chk CHECK (
+        lifecycle_status <> 'active'
+        OR (
+            ingest_status   = 'done'
+            AND completed_at  IS NOT NULL
+            AND activated_at  IS NOT NULL
+            AND superseded_at IS NULL
+        )
+    ),
 
     UNIQUE (company_id, document_id, version_no),
     -- (company_id, id): target for composite FKs that only need version identity.
@@ -139,6 +153,11 @@ CREATE INDEX document_versions_company_idx   ON document_versions (company_id);
 CREATE INDEX document_versions_ingest_idx    ON document_versions (ingest_status)
     WHERE ingest_status <> 'done';
 CREATE INDEX document_versions_lifecycle_idx ON document_versions (lifecycle_status);
+-- Point-in-time lookup: "which version was active on date D for this document?"
+--   WHERE company_id=$c AND document_id=$d
+--     AND activated_at <= $d AND (superseded_at IS NULL OR superseded_at > $d)
+CREATE INDEX document_versions_asof_idx
+    ON document_versions (company_id, document_id, activated_at, superseded_at);
 
 -- Enforce: at most one active version per document per company.
 CREATE UNIQUE INDEX document_versions_one_active_per_doc_uidx
