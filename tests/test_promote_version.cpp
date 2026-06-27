@@ -22,7 +22,6 @@
 namespace {
 
 constexpr auto CO  = "cafecafe-0000-0000-0000-000000000001";
-constexpr auto OU  = "0a000000-0000-0000-0000-000000000001";
 constexpr auto USR = "cafecafe-0000-0000-0000-000000000002";
 constexpr auto DOC = "d0c00000-0000-0000-0000-000000000001";
 constexpr auto V1  = "7e100001-0000-0000-0000-0000000000a1";
@@ -86,12 +85,15 @@ static DrogonLoop s_loop;
 // ---------------------------------------------------------------------------
 void seed_fixtures() {
     auto db = wikore::Db::get();
+    // Cascade-delete resets the whole company subtree cleanly.
     exec_sync(db, "DELETE FROM companies WHERE id=$1", std::string(CO));
+    // V001 trigger auto-creates the root org_unit + closure on company insert.
     exec_sync(db, "INSERT INTO companies (id, name, slug) VALUES ($1,'TestCo','testco')", std::string(CO));
-    exec_sync(db, "INSERT INTO org_units (id, company_id, name, type, slug) VALUES ($1,$2,'Root','root','root')", std::string(OU), std::string(CO));
-    exec_sync(db, "INSERT INTO org_unit_closure (company_id, ancestor_id, descendant_id, depth) VALUES ($1,$2,$2,0)", std::string(CO), std::string(OU));
+    auto ou_rows = exec_sync(db,
+        "SELECT id FROM org_units WHERE company_id=$1 AND type='root'", std::string(CO));
+    const auto root_ou = std::string(ou_rows[0]["id"].c_str());
     exec_sync(db, "INSERT INTO users (id, company_id, external_issuer, external_sub, email, display_name) VALUES ($1,$2,'iss','sub','u@t.com','U')", std::string(USR), std::string(CO));
-    exec_sync(db, "INSERT INTO documents (id, company_id, owner_org_unit_id, filename) VALUES ($1,$2,$3,'t.pdf')", std::string(DOC), std::string(CO), std::string(OU));
+    exec_sync(db, "INSERT INTO documents (id, company_id, owner_org_unit_id, filename) VALUES ($1,$2,$3,'t.pdf')", std::string(DOC), std::string(CO), root_ou);
     exec_sync(db, "INSERT INTO document_versions (id,company_id,document_id,version_no,source_hash,ingest_status,chunk_count,completed_at,lifecycle_status) VALUES ($1,$2,$3,1,'h1','done',3,now(),'draft')", std::string(V1), std::string(CO), std::string(DOC));
     exec_sync(db, "INSERT INTO document_versions (id,company_id,document_id,version_no,source_hash,ingest_status,chunk_count,completed_at,lifecycle_status) VALUES ($1,$2,$3,2,'h2','done',5,now(),'draft')", std::string(V2), std::string(CO), std::string(DOC));
 }
