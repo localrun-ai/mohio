@@ -63,6 +63,7 @@ cat db/migrations/V001__orgs.sql \
     db/migrations/V013__reactivate_user.sql \
     db/migrations/V014__sensitivity_sections_tombstones.sql \
     db/migrations/V015__outbox.sql \
+    db/migrations/V016__usage_events.sql \
   | docker exec -i "$CONTAINER" psql -U postgres -v ON_ERROR_STOP=1 -q
 echo "-- Migrations loaded."
 echo ""
@@ -440,6 +441,31 @@ COUNT=$(sql "SELECT COUNT(*) FROM outbox_events
 [ "$COUNT" -eq 1 ] \
   && pass 28 "ON CONFLICT DO NOTHING: still exactly 1 row after duplicate insert" \
   || fail 28 "unexpected row count after ON CONFLICT DO NOTHING (got $COUNT)"
+
+# --------------------------------------------------------------------------
+# 29. V016: usage_events insert lands in the right monthly partition
+# --------------------------------------------------------------------------
+sql "INSERT INTO usage_events
+       (company_id, user_id, event_type, model_name, tokens_in, tokens_out,
+        latency_ms, cost_micros, detail)
+     VALUES ('$CO_ACME', '$U_ALICE', 'llm_chat', 'qwen3-8b',
+             1200, 340, 850, 47500,
+             '{\"chat_turn_id\":\"00000000-0000-0000-0000-000000000abc\"}'::jsonb);" > /dev/null
+
+COUNT=$(sql "SELECT COUNT(*) FROM usage_events
+             WHERE company_id='$CO_ACME' AND model_name='qwen3-8b';")
+[ "$COUNT" -eq 1 ] \
+  && pass 29 "usage_events insert accepted and queryable by tenant" \
+  || fail 29 "usage_events insert not found (count=$COUNT)"
+
+# --------------------------------------------------------------------------
+# 30. V016: usage_events is append-only (UPDATE and DELETE rejected)
+# --------------------------------------------------------------------------
+ERR_UPD=$(sql "UPDATE usage_events SET cost_micros=99999 WHERE company_id='$CO_ACME';" 2>&1 || true)
+ERR_DEL=$(sql "DELETE FROM usage_events WHERE company_id='$CO_ACME';" 2>&1 || true)
+echo "$ERR_UPD$ERR_DEL" | grep -qi "append-only" \
+  && pass 30 "usage_events UPDATE and DELETE rejected (append-only)" \
+  || fail 30 "append-only enforcement missing: upd='$ERR_UPD' del='$ERR_DEL'"
 
 # --------------------------------------------------------------------------
 # Summary
