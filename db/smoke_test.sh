@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # db/smoke_test.sh - Schema smoke test suite
 #
-# Spins up a throwaway Postgres 17 container, loads all migrations, runs 17
+# Spins up a throwaway Postgres 17 container, loads all migrations, runs 25
 # behavioral checks, then tears down.  Exit code 0 = all passed.
 #
 # Usage: ./db/smoke_test.sh
@@ -35,6 +35,7 @@ WIKI='b100a001-0000-0000-0000-000000000000'     # wiki page
 WVER='b100a002-0000-0000-0000-000000000000'     # wiki page version 1
 VER4='7e100004-0000-0000-0000-000000000000'     # version 4 (for promotion tests)
 OU_ENG='0a100002-0000-0000-0000-000000000000'   # Engineering department (Acme child, for move test)
+SEC1='5ec10001-0000-0000-0000-000000000000'     # document_section (for K5 test)
 
 # --------------------------------------------------------------------------
 # Start container and load schema
@@ -58,6 +59,8 @@ cat db/migrations/V001__orgs.sql \
     db/migrations/V010__promotion_functions.sql \
     db/migrations/V011__deactivation_expiry_audit.sql \
     db/migrations/V012__move_org_unit.sql \
+    db/migrations/V013__reactivate_user.sql \
+    db/migrations/V014__sensitivity_sections_tombstones.sql \
     db/migrations/V013__reactivate_user.sql \
   | docker exec -i "$CONTAINER" psql -U postgres -v ON_ERROR_STOP=1 -q
 echo "-- Migrations loaded."
@@ -360,6 +363,43 @@ COUNT=$(sql "SELECT COUNT(*) FROM users
 [ "$COUNT" -eq 1 ] \
   && pass 22 "reactivate_user() inserts new user when (issuer,sub) unknown" \
   || fail 22 "reactivate_user() did not create new user row (got count $COUNT)"
+
+# --------------------------------------------------------------------------
+# 23. K1: sensitivity_label defaults to 'internal' on new document_version
+# --------------------------------------------------------------------------
+# VER4 was created without an explicit sensitivity_label; DEFAULT applies.
+VAL=$(sql "SELECT sensitivity_label FROM document_versions WHERE id='$VER4';")
+[ "$VAL" = "internal" ] \
+  && pass 23 "document_versions.sensitivity_label defaults to 'internal'" \
+  || fail 23 "unexpected sensitivity_label default (got '$VAL')"
+
+# --------------------------------------------------------------------------
+# 24. K5: document_section inserts; chunk section_id FK accepted
+# --------------------------------------------------------------------------
+sql "INSERT INTO document_sections
+       (id, company_id, document_version_id, ordinal, heading, heading_path, depth)
+     VALUES ('$SEC1', '$CO_ACME', '$VER4', 1, '§1 Introduction', '{\"§1 Introduction\"}', 0);" > /dev/null
+
+# Assign the section to CHK1 (which belongs to VER3, not VER4 -- simple FK
+# only checks existence, not version consistency; that's ingest-enforced).
+ERR=$(sql "UPDATE document_chunks SET section_id='$SEC1' WHERE id='$CHK1';" 2>&1 || true)
+echo "$ERR" | grep -qi "error\|exception\|violates" \
+  && fail 24 "section_id FK update failed: $ERR" \
+  || pass 24 "document_chunks.section_id accepted valid section reference"
+
+# --------------------------------------------------------------------------
+# 25. K2: documents.deleted_at + document_chunk_tombstones insert work
+# --------------------------------------------------------------------------
+sql "UPDATE documents SET deleted_at=now() WHERE id='$DOC';" > /dev/null
+sql "INSERT INTO document_chunk_tombstones
+       (company_id, chunk_id, document_version_id, content_hash, reason)
+     VALUES ('$CO_ACME', '$CHK1', '$VER3', 'sha256_of_removed_content', 'gdpr_erasure');" > /dev/null
+
+COUNT=$(sql "SELECT COUNT(*) FROM document_chunk_tombstones
+             WHERE company_id='$CO_ACME' AND chunk_id='$CHK1';")
+[ "$COUNT" -eq 1 ] \
+  && pass 25 "document_chunk_tombstone inserted and queryable" \
+  || fail 25 "document_chunk_tombstone not found (got count $COUNT)"
 
 # --------------------------------------------------------------------------
 # Summary

@@ -27,15 +27,28 @@
 --     "chunk_id":            "<uuid>",
 --     "owner_org_unit_id":   "<uuid>",          -- who manages this document
 --     "access_scope_ids":    ["<uuid>"],         -- which org_units may retrieve this chunk
---     "lifecycle_status":    "active",           -- from document_versions
+--     "lifecycle_status":    "active",           -- from document_versions; filter: active / deprecated
+--     "sensitivity_label":   "internal",         -- from document_versions; filter: public/internal/confidential/restricted
 --     "authority_level":     80,                 -- from documents; 0=informational, 100=mandate
 --     "activated_at":        "2026-06-01T00:00:00Z",  -- when this version became active; null if never activated
 --     "superseded_at":       null,               -- when superseded by a newer version; null if still current
+--     "section_id":          "<uuid>|null",      -- from document_chunks; null for plain (non-section-aware) ingest
+--     "section_heading":     "§3.2 Obligations", -- from document_sections.heading; null if no section
 --     "updated_at":          "..."               -- last payload sync time
 --   }
 --
--- activated_at and superseded_at are required in the payload so C++ can apply
--- historical as-of filters entirely within Qdrant without a Postgres round-trip.
+-- activated_at and superseded_at are required for historical as-of filters
+-- entirely within Qdrant without a Postgres round-trip.
+--
+-- sensitivity_label is required so C++ can filter by session type without
+-- a Postgres lookup:
+--   guest sessions:      sensitivity_label IN ['public']
+--   member sessions:     sensitivity_label IN ['public','internal','confidential']
+--   restricted access:   never in generated answers regardless of filter
+--
+-- section_id + section_heading are optional (null for plain ingest). When
+-- present, C++ can expand results to include parent/sibling sections and
+-- display "§3.2 Obligations" in the citation instead of a raw chunk index.
 --
 -- Each embedding model has its own Qdrant collection (embedding_models.qdrant_collection).
 -- document_chunk_vectors maps chunk_id -> qdrant_point_id per model.
