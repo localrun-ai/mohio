@@ -66,8 +66,11 @@ Worst-case stale window with this policy: 1 clock-tick between the resolver read
 
 ## Qdrant payload resync queue
 
-When memberships or resource_grants change, affected chunk payloads (access_scope_ids)
-must be updated in Qdrant. Changes are enqueued here for background processing.
+When document visibility changes (resource_grant create/revoke, document owner_org_unit
+change, org-unit moves affecting inherited grants), affected chunk payloads
+(access_scope_ids) must be updated in Qdrant. Membership and group member changes do
+NOT trigger payload resyncs; see the invalidation table below. Changes are enqueued
+here for background processing.
 
 | Key | Value | TTL | Notes |
 |-----|-------|-----|-------|

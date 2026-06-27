@@ -58,8 +58,11 @@
 -- owner_org_unit_id vs access_scope_ids:
 --   Ownership (who manages) and visibility (who can retrieve) are separate.
 --   HR owns a policy doc; HR + Payroll + Legal can retrieve it.
---   access_scope_ids is recomputed whenever memberships or resource_grants
---   change and synced to Qdrant (see Redis resync queue in V008).
+--   access_scope_ids is recomputed when document visibility changes:
+--   resource_grant create/revoke, document owner_org_unit change, org-unit
+--   moves that affect inherited grants, or lifecycle changes. User/group
+--   membership changes do NOT rewrite access_scope_ids; they only invalidate
+--   lr:eff cache keys (see Redis invalidation model in V008).
 --
 -- Deletion semantics on owner_org_unit_id:
 --   Intentionally NO ON DELETE action (defaults to RESTRICT). You cannot
