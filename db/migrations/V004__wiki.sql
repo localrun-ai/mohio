@@ -56,31 +56,31 @@ CREATE TRIGGER wiki_pages_validate_actors
 -- ---------------------------------------------------------------------------
 -- Wiki page sources (provenance join table)
 --
--- Each row records one document_version that contributed evidence to a wiki
--- page. document_version_id is NOT NULL: citations must pin a specific version
--- so the provenance remains reproducible after the document is superseded.
+-- Each row records one piece of evidence that contributed to a wiki page.
+-- Rows can be at version granularity (chunk_id NULL) or chunk granularity
+-- (chunk_id NOT NULL). Multiple chunks from the same version are allowed,
+-- each as a separate row - enforced by a functional unique index rather than
+-- the PK (surrogate UUID) so nullable chunk_id is handled correctly.
 --
--- document_id is denormalized from document_versions for query convenience
--- ("which wiki pages cite document X?") without requiring a join through
--- document_versions. Must always match document_versions.document_id.
+-- Three-level FK chain enforces referential integrity end-to-end:
+--   wps_document_same_company_fk:     document exists in company
+--   wps_version_belongs_to_document_fk: version belongs to that document
+--   wps_chunk_belongs_to_version_fk:  chunk belongs to that version
 --
--- chunk_id is optional: when present it records the specific chunk(s) cited,
--- giving sub-version granularity for regeneration. It is NOT in the PK so
--- multiple chunks from the same version can each have their own row.
+-- All FKs are ON DELETE RESTRICT: cited evidence cannot be deleted while a
+-- wiki page cites it. Archive or re-generate the wiki page first.
 --
--- ON DELETE RESTRICT on both document and version FKs: you cannot delete a
--- document or version that is still cited as evidence by a wiki page. The
--- wiki page must be archived or its sources updated first.
+-- MATCH SIMPLE (PostgreSQL default): when chunk_id IS NULL, the chunk FK
+-- is not checked, allowing version-level citations without a specific chunk.
 -- ---------------------------------------------------------------------------
 
 CREATE TABLE wiki_page_sources (
+    id                  UUID        PRIMARY KEY DEFAULT gen_random_uuid(),
     company_id          UUID        NOT NULL,
     wiki_page_id        UUID        NOT NULL,
     document_id         UUID        NOT NULL,
     document_version_id UUID        NOT NULL,
-    chunk_id            UUID,                         -- optional chunk granularity
-
-    PRIMARY KEY (wiki_page_id, document_version_id),
+    chunk_id            UUID,                         -- NULL = version-level citation
 
     CONSTRAINT wps_wiki_page_same_company_fk
         FOREIGN KEY (company_id, wiki_page_id)
@@ -90,19 +90,31 @@ CREATE TABLE wiki_page_sources (
         FOREIGN KEY (company_id, document_id)
         REFERENCES documents(company_id, id) ON DELETE RESTRICT,
 
-    CONSTRAINT wps_version_same_company_fk
-        FOREIGN KEY (company_id, document_version_id)
-        REFERENCES document_versions(company_id, id) ON DELETE RESTRICT,
+    -- Enforces: version belongs to document_id (not just exists in company).
+    CONSTRAINT wps_version_belongs_to_document_fk
+        FOREIGN KEY (company_id, document_id, document_version_id)
+        REFERENCES document_versions(company_id, document_id, id) ON DELETE RESTRICT,
 
-    -- chunk_id is nullable; FK is checked only when non-NULL.
-    CONSTRAINT wps_chunk_same_company_fk
-        FOREIGN KEY (company_id, chunk_id)
-        REFERENCES document_chunks(company_id, id) ON DELETE SET NULL
+    -- Enforces: chunk belongs to document_version_id (MATCH SIMPLE skips when chunk_id IS NULL).
+    CONSTRAINT wps_chunk_belongs_to_version_fk
+        FOREIGN KEY (company_id, document_version_id, chunk_id)
+        REFERENCES document_chunks(company_id, document_version_id, id) ON DELETE RESTRICT
 );
 
-CREATE INDEX wiki_page_sources_page_idx     ON wiki_page_sources (wiki_page_id);
+-- Deduplication: one row per (wiki_page, version, chunk) combination.
+-- COALESCE maps NULL chunk_id to a sentinel so the index treats version-level
+-- citations as a single entry per version rather than allowing unlimited duplicates.
+CREATE UNIQUE INDEX wiki_page_sources_unique_source_idx
+    ON wiki_page_sources (
+        company_id,
+        wiki_page_id,
+        document_version_id,
+        COALESCE(chunk_id, '00000000-0000-0000-0000-000000000000'::uuid)
+    );
+
+CREATE INDEX wiki_page_sources_page_idx     ON wiki_page_sources (company_id, wiki_page_id);
 CREATE INDEX wiki_page_sources_document_idx ON wiki_page_sources (company_id, document_id);
-CREATE INDEX wiki_page_sources_version_idx  ON wiki_page_sources (document_version_id);
+CREATE INDEX wiki_page_sources_version_idx  ON wiki_page_sources (company_id, document_version_id);
 
 -- ---------------------------------------------------------------------------
 -- Link graph: page A references page B within the same org_unit.

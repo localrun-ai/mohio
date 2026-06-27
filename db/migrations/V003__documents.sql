@@ -123,8 +123,11 @@ CREATE TABLE document_versions (
                                  )),
 
     UNIQUE (company_id, document_id, version_no),
-    -- Required target for composite FK from document_chunks.
+    -- (company_id, id): target for composite FKs that only need version identity.
     UNIQUE (company_id, id),
+    -- (company_id, document_id, id): target for composite FKs that must also enforce
+    -- the version belongs to a specific document (used by wiki_page_sources).
+    UNIQUE (company_id, document_id, id),
 
     CONSTRAINT document_versions_document_same_company_fk
         FOREIGN KEY (company_id, document_id)
@@ -203,8 +206,11 @@ CREATE TABLE document_chunks (
     access_scope_ids    UUID[]      NOT NULL DEFAULT '{}',
     created_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
     UNIQUE (document_version_id, chunk_index),
-    -- Required target for composite FK from document_chunk_vectors.
+    -- (company_id, id): target for FKs that only need chunk identity.
     UNIQUE (company_id, id),
+    -- (company_id, document_version_id, id): target for FKs that must also enforce
+    -- the chunk belongs to a specific version (used by wiki_page_sources).
+    UNIQUE (company_id, document_version_id, id),
     CONSTRAINT chunks_version_same_company_fk
         FOREIGN KEY (company_id, document_version_id)
         REFERENCES document_versions(company_id, id) ON DELETE CASCADE
