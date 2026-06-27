@@ -17,7 +17,7 @@
 --   ONE collection per embedding model (e.g. "mohio_docs_bge_m3").
 --   Access control is enforced via payload filters, not collection separation.
 --
--- Qdrant chunk payload:
+-- Qdrant chunk payload (stored in each collection under embedding_models):
 --   {
 --     "company_id":          "<uuid>",
 --     "doc_id":              "<uuid>",
@@ -25,10 +25,12 @@
 --     "chunk_id":            "<uuid>",
 --     "owner_org_unit_id":   "<uuid>",   -- who manages this document
 --     "access_scope_ids":    ["<uuid>"], -- who may retrieve this chunk
---     "lifecycle_status":    "active",
---     "authority_level":     80,
+--     "lifecycle_status":    "active",   -- from document_versions
+--     "authority_level":     80,         -- from documents
 --     "updated_at":          "..."
 --   }
+-- Each embedding model has its own Qdrant collection (embedding_models.qdrant_collection).
+-- document_chunk_vectors maps chunk_id -> qdrant_point_id per model.
 --
 -- Retrieval filter (applied before any chunk reaches the LLM):
 --   company_id        = user.company_id               (exact match)
@@ -141,19 +143,42 @@ CREATE UNIQUE INDEX document_versions_one_active_per_doc_uidx
     WHERE lifecycle_status = 'active';
 
 -- ---------------------------------------------------------------------------
--- Document chunks (Qdrant point registry)
+-- Embedding models (global server configuration; not company-scoped)
+--
+-- Each enabled model maps to exactly one Qdrant collection. The schema
+-- supports multiple simultaneous models (e.g. bge-m3 for multilingual,
+-- e5-large for English-heavy corpora), so re-indexing with a new model
+-- does not require dropping or migrating existing collections.
+--
+-- ON DELETE RESTRICT on document_chunk_vectors.embedding_model_id ensures
+-- you cannot drop a model that still has indexed vectors.
+-- ---------------------------------------------------------------------------
+
+CREATE TABLE embedding_models (
+    id                UUID    PRIMARY KEY DEFAULT gen_random_uuid(),
+    name              TEXT    NOT NULL UNIQUE,      -- e.g. 'bge-m3', 'e5-large'
+    qdrant_collection TEXT    NOT NULL UNIQUE,      -- e.g. 'mohio_docs_bge_m3'
+    dimension         INT     NOT NULL,
+    enabled           BOOLEAN NOT NULL DEFAULT true
+);
+
+-- ---------------------------------------------------------------------------
+-- Document chunks (evidence unit; model-agnostic)
 --
 -- Chunks belong to a specific document_version, not the document itself.
 -- This means historical chat citations (which store document_version_id)
 -- remain resolvable even after the document is superseded by a new version.
 --
 -- Postgres is the source of truth for access_scope_ids.
--- When permissions change, this table identifies which Qdrant point IDs need
--- their payload updated without requiring a full reindex.
+-- When permissions change, this table identifies which chunks need their
+-- Qdrant payload updated without requiring a full reindex.
 --
 -- access_scope_ids (UUID[]) cannot carry FK constraints (PostgreSQL does not
 -- support FKs on array columns). Same-company integrity is enforced by the
 -- application when computing and writing access_scope_ids.
+--
+-- UNIQUE (company_id, id) exposes a composite FK target for
+-- document_chunk_vectors so same-company membership can be enforced.
 -- ---------------------------------------------------------------------------
 
 CREATE TABLE document_chunks (
@@ -161,11 +186,12 @@ CREATE TABLE document_chunks (
     company_id          UUID        NOT NULL,
     document_version_id UUID        NOT NULL,
     chunk_index         INT         NOT NULL,
-    qdrant_point_id     UUID        NOT NULL UNIQUE,
     content_hash        TEXT        NOT NULL,         -- SHA-256 of chunk text
     access_scope_ids    UUID[]      NOT NULL DEFAULT '{}',
     created_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
     UNIQUE (document_version_id, chunk_index),
+    -- Required target for composite FK from document_chunk_vectors.
+    UNIQUE (company_id, id),
     CONSTRAINT chunks_version_same_company_fk
         FOREIGN KEY (company_id, document_version_id)
         REFERENCES document_versions(company_id, id) ON DELETE CASCADE
@@ -173,7 +199,39 @@ CREATE TABLE document_chunks (
 
 CREATE INDEX document_chunks_version_idx   ON document_chunks (document_version_id);
 CREATE INDEX document_chunks_company_idx   ON document_chunks (company_id);
-CREATE INDEX document_chunks_qdrant_idx    ON document_chunks (qdrant_point_id);
 -- GIN index for permission-change propagation:
 -- find all chunks whose access_scope_ids contain a given org_unit_id.
 CREATE INDEX document_chunks_scopes_idx    ON document_chunks USING GIN (access_scope_ids);
+
+-- ---------------------------------------------------------------------------
+-- Document chunk vectors (one row per chunk per embedding model)
+--
+-- Separating vectors from chunks allows multiple embedding models to coexist.
+-- Each model indexes the same chunk text into its own Qdrant collection.
+--
+-- qdrant_point_id is unique per collection (model), not globally, so the
+-- uniqueness constraint is (embedding_model_id, qdrant_point_id).
+--
+-- Cascade chain: companies -> documents -> document_versions ->
+-- document_chunks -> document_chunk_vectors (ON DELETE CASCADE at each step).
+-- ---------------------------------------------------------------------------
+
+CREATE TABLE document_chunk_vectors (
+    company_id         UUID        NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
+    chunk_id           UUID        NOT NULL,
+    embedding_model_id UUID        NOT NULL REFERENCES embedding_models(id) ON DELETE RESTRICT,
+    qdrant_point_id    UUID        NOT NULL,
+    embedded_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
+
+    PRIMARY KEY (chunk_id, embedding_model_id),
+    -- Point IDs are unique within a Qdrant collection (= per model).
+    UNIQUE (embedding_model_id, qdrant_point_id),
+    -- Composite FK enforces chunk belongs to the same company as this vector row.
+    CONSTRAINT chunk_vectors_chunk_same_company_fk
+        FOREIGN KEY (company_id, chunk_id)
+        REFERENCES document_chunks(company_id, id) ON DELETE CASCADE
+);
+
+CREATE INDEX document_chunk_vectors_chunk_idx  ON document_chunk_vectors (chunk_id);
+CREATE INDEX document_chunk_vectors_model_idx  ON document_chunk_vectors (embedding_model_id);
+CREATE INDEX document_chunk_vectors_company_idx ON document_chunk_vectors (company_id);
