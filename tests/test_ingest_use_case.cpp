@@ -289,6 +289,36 @@ TEST_CASE("IngestDocumentVersion: missing file marks version 'error'",
     CHECK(std::string(v[0]["ingest_status"].c_str()) == "error");
 }
 
+TEST_CASE("IngestDocumentVersion: rejected input marks version 'error'",
+          "[integration][ingest]")
+{
+    if (!db_available()) SKIP("DATABASE_URL not set");
+    auto db = wikore::Db::get();
+    seed_ingest_fixtures(db);
+
+    auto dir = std::filesystem::temp_directory_path() / "wikore-ingest-it";
+    std::filesystem::create_directories(dir);
+    auto path = dir / "empty.txt";
+    std::ofstream(path, std::ios::trunc);
+
+    auto uc = make_use_case(db);
+    auto result = drogon::sync_wait(uc.execute(
+        make_ctx(),
+        {.company_id          = CO,
+         .document_id         = DOC,
+         .document_version_id = VERSION,
+         .file_path           = path.string(),
+         .embed_model_id      = "bge-m3"}));
+    REQUIRE_FALSE(result.has_value());
+    CHECK(result.error().message == "ingest.empty_file");
+
+    auto v = exec_sync(db,
+        "SELECT ingest_status, error_msg FROM document_versions WHERE id=$1::uuid",
+        std::string(VERSION));
+    CHECK(std::string(v[0]["ingest_status"].c_str()) == "error");
+    CHECK(std::string(v[0]["error_msg"].c_str()) == "ingest.empty_file");
+}
+
 TEST_CASE("IngestDocumentVersion: cross-tenant cmd is rejected",
           "[integration][ingest]")
 {

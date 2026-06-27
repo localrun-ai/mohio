@@ -2,8 +2,8 @@
 #include "wikore/adapters/postgres/unit_of_work.hpp"
 #include "wikore/adapters/postgres/error_mapper.hpp"
 #include <spdlog/spdlog.h>
+#include <filesystem>
 #include <fstream>
-#include <sstream>
 #include <format>
 
 namespace wikore::application {
@@ -45,7 +45,7 @@ IngestDocumentVersionUseCase::execute(RequestContext ctx,
     auto fail = [&](Error e) -> drogon::Task<Result<void>> {
         co_await repo_->set_ingest_status(
             cmd.company_id, cmd.document_version_id,
-            ingest::IngestStatus::error, db_);
+            ingest::IngestStatus::error, db_, e.message);
         co_return std::unexpected(std::move(e));
     };
 
@@ -54,20 +54,41 @@ IngestDocumentVersionUseCase::execute(RequestContext ctx,
     // -----------------------------------------------------------------------
     std::string content;
     {
+        std::error_code size_error;
+        const auto file_size = std::filesystem::file_size(cmd.file_path, size_error);
+        if (size_error) {
+            co_return co_await fail(
+                Error::invalid_input(std::format("cannot stat {}", cmd.file_path)));
+        }
+        if (file_size > ingest::ParserPort::kMaxInputBytes) {
+            co_return co_await fail(Error::invalid_input("ingest.file_too_large"));
+        }
+
         std::ifstream f(cmd.file_path, std::ios::binary);
         if (!f) {
             co_return co_await fail(
                 Error::invalid_input(std::format("cannot open {}", cmd.file_path)));
         }
-        std::ostringstream buf;
-        buf << f.rdbuf();
-        content = buf.str();
+        content.resize(static_cast<std::size_t>(file_size));
+        f.read(content.data(), static_cast<std::streamsize>(content.size()));
+        if (f.gcount() != static_cast<std::streamsize>(content.size())) {
+            co_return co_await fail(
+                Error::invalid_input(std::format("cannot read {}", cmd.file_path)));
+        }
+        char extra = 0;
+        if (f.get(extra)) {
+            co_return co_await fail(
+                Error::invalid_input("ingest.file_changed_during_read"));
+        }
     }
 
     // -----------------------------------------------------------------------
     // 3. Parse + chunk (pure CPU; no DB connection held)
     // -----------------------------------------------------------------------
-    auto doc = parser_->parse(content, cmd.file_path, "text/plain");
+    auto parsed = parser_->parse(content, cmd.file_path, {});
+    if (!parsed)
+        co_return co_await fail(parsed.error());
+    auto& doc = *parsed;
     spdlog::debug("[ingest] parsed {} sections, {} chars",
                   doc.sections.size(), doc.full_text.size());
 

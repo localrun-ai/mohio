@@ -287,7 +287,8 @@ drogon::Task<Result<void>>
 PostgresDocumentRepo::set_ingest_status(std::string_view         company_id,
                                          std::string_view         document_version_id,
                                          IngestStatus             status,
-                                         drogon::orm::DbClientPtr db)
+                                         drogon::orm::DbClientPtr db,
+                                         std::string_view         error_message)
 {
     if (status == IngestStatus::done) {
         co_return std::unexpected(Error::invalid_state(
@@ -298,7 +299,8 @@ PostgresDocumentRepo::set_ingest_status(std::string_view         company_id,
     const auto status_str = to_string(status);
     constexpr auto kSql = R"(
         UPDATE document_versions
-        SET    ingest_status = $3
+        SET    ingest_status = $3,
+               error_msg = CASE WHEN $3 = 'error' THEN NULLIF($4, '') ELSE NULL END
         WHERE  company_id = $1::uuid AND id = $2::uuid
     )";
 
@@ -306,7 +308,8 @@ PostgresDocumentRepo::set_ingest_status(std::string_view         company_id,
         co_await db->execSqlCoro(kSql,
                                   std::string(company_id),
                                   std::string(document_version_id),
-                                  std::string(status_str));
+                                  std::string(status_str),
+                                  std::string(error_message));
     } catch (const drogon::orm::DrogonDbException& ex) {
         co_return std::unexpected(postgres::map_db_exception(ex));
     }
