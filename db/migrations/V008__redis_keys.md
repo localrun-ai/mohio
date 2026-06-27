@@ -60,13 +60,33 @@ must be updated in Qdrant. Changes are enqueued here for background processing.
 
 ## Invalidation rules
 
-Membership / grant changes have two effects: a fast Redis invalidation and a slower
-Qdrant payload resync. Both must happen.
+Two distinct change types have different downstream effects. Do not conflate them.
+
+### Membership changes vs group member changes
+
+**Membership changes** (`memberships` table: a principal gains/loses access to an
+org_unit) change which org_units' documents a user may retrieve. This alters
+`document.access_scope_ids` stored in Qdrant chunk payloads. Both Redis invalidation
+AND Qdrant payload resync are required.
+
+**Group member changes** (`group_members` table: a user is added to or removed from
+a group) change the user's resolved scope set at query time. They do NOT change
+`document.access_scope_ids` directly - document scopes depend on which org_units
+have grants/memberships, not on group composition per se. Only Redis invalidation
+is required; Qdrant payloads are unchanged.
+
+If a group itself holds a membership (principal_type='group'), then adding a user to
+that group expands their effective scopes. The `lr:eff` cache for that user must be
+dropped so it is recomputed on next query. No Qdrant resync is needed because the
+chunk payloads already include the org_unit in their access_scope_ids.
+
+### Invalidation table
 
 | Event | Redis keys to delete | Qdrant resync? |
 |-------|----------------------|----------------|
-| Member add/remove/role-change | `lr:eff:{company_id}:{user_id}:*` | Yes - enqueue `lr:resync:q` |
-| Resource grant create/revoke | `lr:eff:{company_id}:*:{org_unit_id}` for affected principals | Yes |
+| Membership add/remove/role-change | `lr:eff:{company_id}:{user_id}:*` for each affected user | Yes - enqueue `lr:resync:q` for affected org_unit |
+| Group member add/remove | `lr:eff:{company_id}:{user_id}:*` for the affected user only | No - document scopes unchanged |
+| Resource grant create/revoke | `lr:eff:{company_id}:*:{org_unit_id}` for affected principals | Yes - enqueue `lr:resync:q` |
 | Org_unit create/move | `lr:tree:{company_id}:{parent_id}` | Only if scope changed |
 | Org_unit delete | `lr:tree:*`, `lr:eff:*` for company | Yes - chunks deleted from Qdrant |
 | Document lifecycle change | - | Yes - chunk lifecycle_status in Qdrant payload |
