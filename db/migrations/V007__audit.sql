@@ -1,20 +1,28 @@
--- V007: Audit log (append-only, monthly partitions)
+-- V007: Audit log (append-only, quarterly partitions)
 --
 -- Records every security-relevant action with enough context to answer:
 -- who did what to which resource, when, and from where.
 --
--- FK columns use ON DELETE SET NULL so audit records survive the deletion of
--- the referenced user, company, or org_unit. Composite FKs are NOT used here
--- because audit rows must outlive the entities they reference.
+-- company_id / user_id / org_unit_id are plain UUIDs with NO foreign keys.
+-- Reasons:
+--   1. FK checks acquire a lock on the referenced table on every INSERT,
+--      adding contention on the hot path.
+--   2. ON DELETE SET NULL would null out the actor after a user is deleted,
+--      making the row unattributable - exactly the opposite of what audit needs.
 --
--- Partitioned by created_at month to allow archiving old data without
+-- Callers MUST denormalize identity into detail at write time, e.g.:
+--   { "user_email": "alice@acme.com", "org_unit_name": "HR",
+--     "resource_type": "document", "resource_id": "<uuid>" }
+-- This preserves the full audit trail even after the referenced entity is gone.
+--
+-- Partitioned by created_at quarter to allow archiving old data without
 -- locking or vacuuming the live table.
 
 CREATE TABLE audit_log (
     id          BIGSERIAL,
-    company_id  UUID        REFERENCES companies(id) ON DELETE SET NULL,
-    user_id     UUID        REFERENCES users(id)     ON DELETE SET NULL,
-    org_unit_id UUID        REFERENCES org_units(id) ON DELETE SET NULL,
+    company_id  UUID,                             -- no FK; see header comment
+    user_id     UUID,                             -- no FK; caller puts email in detail
+    org_unit_id UUID,                             -- no FK; caller puts name in detail
     action      TEXT        NOT NULL,
     -- Action namespaces:
     --   auth:    login, logout, token_revoke
