@@ -83,35 +83,44 @@ must be updated in Qdrant. Changes are enqueued here for background processing.
 
 ## Invalidation rules
 
-Two distinct change types have different downstream effects. Do not conflate them.
+### Mental model: two independent axes
 
-### Membership changes vs group member changes
+`access_scope_ids` in a Qdrant chunk payload answers: **"which org_unit IDs grant
+visibility to this chunk?"** This is a property of the document/grant configuration,
+not of the user population.
 
-**Membership changes** (`memberships` table: a principal gains/loses access to an
-org_unit) change which org_units' documents a user may retrieve. This alters
-`document.access_scope_ids` stored in Qdrant chunk payloads. Both Redis invalidation
-AND Qdrant payload resync are required.
+`lr:eff:{company_id}:{user_id}:{org_unit_id}` answers: **"which org_unit IDs does
+this user belong to when querying from this scope?"** This is a property of membership
+and group composition.
 
-**Group member changes** (`group_members` table: a user is added to or removed from
-a group) change the user's resolved scope set at query time. They do NOT change
-`document.access_scope_ids` directly - document scopes depend on which org_units
-have grants/memberships, not on group composition per se. Only Redis invalidation
-is required; Qdrant payloads are unchanged.
+At query time the filter is: `access_scope_ids intersects user.resolved_scopes`.
 
-If a group itself holds a membership (principal_type='group'), then adding a user to
-that group expands their effective scopes. The `lr:eff` cache for that user must be
-dropped so it is recomputed on next query. No Qdrant resync is needed because the
-chunk payloads already include the org_unit in their access_scope_ids.
+The two axes change independently:
+
+- **Membership/group changes** shift user.resolved_scopes. They never alter
+  access_scope_ids stored in Qdrant. Only `lr:eff` keys need invalidation; Qdrant
+  payloads are untouched.
+
+- **Grant/document/org-structure changes** shift which org_units appear in
+  access_scope_ids. Qdrant payload resync is required; `lr:eff` invalidation
+  is also needed for any user whose scope resolution depended on those grants.
+
+Treating membership changes as triggers for Qdrant resync is wrong: adding a single
+user to HR would queue a rewrite of every HR document payload, making routine admin
+operations O(chunks_in_scope) expensive. The correct cost is O(1) Redis key deletes.
 
 ### Invalidation table
 
 | Event | Redis keys to delete | Qdrant resync? |
 |-------|----------------------|----------------|
-| Membership add/remove/role-change | `lr:eff:{company_id}:{user_id}:*` for each affected user | Yes - enqueue `lr:resync:q` for affected org_unit |
-| Group member add/remove | `lr:eff:{company_id}:{user_id}:*` for the affected user only | No - document scopes unchanged |
-| Resource grant create/revoke | `lr:eff:{company_id}:*:{org_unit_id}` for affected principals | Yes - enqueue `lr:resync:q` |
-| Org_unit create/move | `lr:tree:{company_id}:{parent_id}` | Only if scope changed |
-| Org_unit delete | `lr:tree:*`, `lr:eff:*` for company | Yes - chunks deleted from Qdrant |
-| Document lifecycle change | - | Yes - chunk lifecycle_status in Qdrant payload |
+| Membership add/remove (principal=user) | `lr:eff:{company_id}:{user_id}:*` | No - access_scope_ids unchanged |
+| Membership add/remove (principal=group) | `lr:eff:{company_id}:{user_id}:*` for every member of that group | No - access_scope_ids unchanged |
+| Group member add/remove | `lr:eff:{company_id}:{user_id}:*` for the affected user | No - access_scope_ids unchanged |
+| Resource grant create/revoke | `lr:eff:{company_id}:*` for affected principals | Yes - access_scope_ids of in-scope chunks change; enqueue `lr:resync:q` |
+| Document owner_org_unit change | `lr:eff:{company_id}:*` for old and new org_unit | Yes - access_scope_ids recomputed for all chunks of this document |
+| Document lifecycle change (activate/archive) | none | Yes - lifecycle_status field in Qdrant payload |
+| Org_unit create | `lr:tree:{company_id}:{parent_id}` | No - no chunks yet |
+| Org_unit move | `lr:tree:{company_id}:{old_parent}`, `lr:tree:{company_id}:{new_parent}`, `lr:eff:{company_id}:*` for affected scopes | Yes - descendants-grants now expand over a different subtree; enqueue `lr:resync:q` for moved subtree |
+| Org_unit delete | `lr:tree:*`, `lr:eff:*` for company | Yes - chunks owned by deleted unit removed from Qdrant |
 | User update | `lr:user:{user_id}` | No |
 | API key revoke | `lr:api_key:{key_hash}` | No |
