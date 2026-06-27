@@ -35,6 +35,8 @@ CREATE TABLE audit_log (
     PRIMARY KEY (id, created_at)
 ) PARTITION BY RANGE (created_at);
 
+CREATE TABLE audit_log_2026_q2 PARTITION OF audit_log
+    FOR VALUES FROM ('2026-04-01') TO ('2026-07-01');
 CREATE TABLE audit_log_2026_q3 PARTITION OF audit_log
     FOR VALUES FROM ('2026-07-01') TO ('2026-10-01');
 CREATE TABLE audit_log_2026_q4 PARTITION OF audit_log
@@ -43,6 +45,11 @@ CREATE TABLE audit_log_2027_q1 PARTITION OF audit_log
     FOR VALUES FROM ('2027-01-01') TO ('2027-04-01');
 CREATE TABLE audit_log_2027_q2 PARTITION OF audit_log
     FOR VALUES FROM ('2027-04-01') TO ('2027-07-01');
+
+-- Catch-all for any rows that fall outside the explicit quarterly partitions.
+-- Prevents INSERT failures when a new quarter arrives before the partition
+-- is manually added. Rows here should be moved to a named partition promptly.
+CREATE TABLE audit_log_default PARTITION OF audit_log DEFAULT;
 
 CREATE INDEX audit_log_company_idx ON audit_log (company_id,  created_at DESC);
 CREATE INDEX audit_log_user_idx    ON audit_log (user_id,     created_at DESC);
