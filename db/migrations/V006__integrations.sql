@@ -3,8 +3,12 @@
 -- Integrations are scoped to an org_unit. Composite FK enforces that the
 -- org_unit belongs to the same company as the integration record.
 --
--- credentials: AES-256-GCM encrypted JSON blob (base64). Encryption key
--- lives in the CREDENTIALS_KEY environment variable, never in the DB.
+-- credentials: encrypted JSON blob (base64). credentials_alg identifies the
+-- cipher; credentials_key_id identifies which key version was used to encrypt.
+-- The actual key material is never stored in the DB - it lives in a key store
+-- (env var, Vault, etc.) keyed by credentials_key_id. The C++ decrypt path
+-- loads the key by ID, allowing key rotation without re-encrypting all rows
+-- at once: old rows retain their key ID until individually re-encrypted.
 --
 -- MCP tools are the LLM-callable interface per integration.
 -- read_only=true  -> results may be cached in Redis (e.g. jira_search)
@@ -22,7 +26,9 @@ CREATE TABLE integrations (
                             )),
     name        TEXT        NOT NULL,
     base_url    TEXT,                             -- self-hosted Jira/Confluence/GitLab
-    credentials TEXT,                             -- AES-256-GCM encrypted JSON blob
+    credentials         TEXT,                     -- encrypted JSON blob (base64)
+    credentials_key_id  TEXT,                     -- identifies key version used; NULL if no credentials
+    credentials_alg     TEXT NOT NULL DEFAULT 'aes-256-gcm',
     enabled     BOOLEAN     NOT NULL DEFAULT true,
     created_by  UUID        REFERENCES users(id) ON DELETE SET NULL,
     created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
