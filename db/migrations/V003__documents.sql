@@ -25,12 +25,18 @@
 --     "doc_id":              "<uuid>",
 --     "document_version_id": "<uuid>",
 --     "chunk_id":            "<uuid>",
---     "owner_org_unit_id":   "<uuid>",   -- who manages this document
---     "access_scope_ids":    ["<uuid>"], -- who may retrieve this chunk
---     "lifecycle_status":    "active",   -- from document_versions
---     "authority_level":     80,         -- from documents
---     "updated_at":          "..."
+--     "owner_org_unit_id":   "<uuid>",          -- who manages this document
+--     "access_scope_ids":    ["<uuid>"],         -- which org_units may retrieve this chunk
+--     "lifecycle_status":    "active",           -- from document_versions
+--     "authority_level":     80,                 -- from documents; 0=informational, 100=mandate
+--     "activated_at":        "2026-06-01T00:00:00Z",  -- when this version became active; null if never activated
+--     "superseded_at":       null,               -- when superseded by a newer version; null if still current
+--     "updated_at":          "..."               -- last payload sync time
 --   }
+--
+-- activated_at and superseded_at are required in the payload so C++ can apply
+-- historical as-of filters entirely within Qdrant without a Postgres round-trip.
+--
 -- Each embedding model has its own Qdrant collection (embedding_models.qdrant_collection).
 -- document_chunk_vectors maps chunk_id -> qdrant_point_id per model.
 --
