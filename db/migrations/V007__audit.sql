@@ -63,3 +63,33 @@ CREATE INDEX audit_log_company_idx ON audit_log (company_id,  created_at DESC);
 CREATE INDEX audit_log_user_idx    ON audit_log (user_id,     created_at DESC);
 CREATE INDEX audit_log_org_idx     ON audit_log (org_unit_id, created_at DESC);
 CREATE INDEX audit_log_action_idx  ON audit_log (action,      created_at DESC);
+
+-- ---------------------------------------------------------------------------
+-- Enforce append-only semantics at the database level.
+--
+-- Triggers on a partitioned table are automatically inherited by all
+-- partitions (PostgreSQL 13+), so these cover all quarter tables and
+-- audit_log_default without additional declarations.
+--
+-- Defence-in-depth: also create a dedicated DB role for the application
+-- that has INSERT but not UPDATE or DELETE on audit_log and its partitions.
+-- This is a deployment step (not a migration) - do it at provisioning time:
+--   CREATE ROLE mohio_app;
+--   GRANT INSERT ON audit_log TO mohio_app;
+--   REVOKE UPDATE, DELETE ON audit_log FROM mohio_app;
+-- ---------------------------------------------------------------------------
+
+CREATE OR REPLACE FUNCTION prevent_audit_mutation()
+RETURNS TRIGGER LANGUAGE plpgsql AS $$
+BEGIN
+    RAISE EXCEPTION 'audit_log is append-only';
+END;
+$$;
+
+CREATE TRIGGER audit_log_no_update
+    BEFORE UPDATE ON audit_log
+    FOR EACH ROW EXECUTE FUNCTION prevent_audit_mutation();
+
+CREATE TRIGGER audit_log_no_delete
+    BEFORE DELETE ON audit_log
+    FOR EACH ROW EXECUTE FUNCTION prevent_audit_mutation();
