@@ -25,6 +25,13 @@
 --   * The DELETE from resource_grants will fire the V024 resource_grants
 --     history trigger, which writes a 'delete' history row - so the
 --     cleanup itself is auditable in the temporal history.
+--   * users and groups are NOT covered. resource_grants.principal_type is
+--     CHECK-restricted to 'org_unit' for MVP (V002), so users/groups can
+--     never appear as principals in this table today. If/when the schema
+--     is extended to allow principal_type IN ('user','group') (the
+--     access_tokens TEXT[] model discussed in V002's header), add matching
+--     AFTER DELETE triggers on users and groups so revocation cascades
+--     remain symmetric. Until then, this is a deliberate non-issue.
 
 -- ---------------------------------------------------------------------------
 -- documents -> resource_grants

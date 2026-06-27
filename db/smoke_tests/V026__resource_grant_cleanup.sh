@@ -59,29 +59,22 @@ COUNT=$(sql "SELECT COUNT(*) FROM resource_grants
   && pass "V026.3" "org_unit delete cleans grants where it is resource OR principal" \
   || fail "V026.3" "org_unit grants survived (count=$COUNT)"
 
-# V026.4: unrelated grant (in same company) is untouched.
-# Re-create OU_A under a different id to add a fresh independent grant.
+# V026.4: unrelated grant (resource and principal both unrelated to the
+# deleted org_unit) survives. Create a fresh team OU_C with a self-grant,
+# then delete an UNRELATED team OU_D. RG_KEEP must remain.
 OU_C='0a100026-0000-0000-0000-00000000cccc'
-RG_KEEP='6ec90026-0000-0000-0000-000000000005'
-sql "INSERT INTO org_units (id, company_id, parent_id, type, slug, name)
-     VALUES ('$OU_C','$CO_ACME','$ACME_ROOT','team','t26c','T26C');" > /dev/null
-sql "INSERT INTO resource_grants
-       (id, company_id, resource_type, resource_id, principal_type, principal_id, permission)
-     VALUES ('$RG_KEEP','$CO_ACME','org_unit','$OU_C','org_unit','$OU_B','read');" > /dev/null
-sql "DELETE FROM org_units WHERE id='$OU_B';" > /dev/null
-COUNT=$(sql "SELECT COUNT(*) FROM resource_grants WHERE id='$RG_KEEP';")
-# RG_KEEP has OU_B as principal -> deleted by trigger. So actually that should be 0.
-# Test the keep case differently: delete an unrelated team that's NEITHER
-# resource nor principal in RG_KEEP.
 OU_D='0a100026-0000-0000-0000-00000000dddd'
+RG_KEEP='6ec90026-0000-0000-0000-000000000005'
+
 sql "INSERT INTO org_units (id, company_id, parent_id, type, slug, name)
-     VALUES ('$OU_D','$CO_ACME','$ACME_ROOT','team','t26d','T26D');" > /dev/null
-RG_KEEP2='6ec90026-0000-0000-0000-000000000006'
+     VALUES ('$OU_C','$CO_ACME','$ACME_ROOT','team','t26c','T26C'),
+            ('$OU_D','$CO_ACME','$ACME_ROOT','team','t26d','T26D');" > /dev/null
 sql "INSERT INTO resource_grants
        (id, company_id, resource_type, resource_id, principal_type, principal_id, permission)
-     VALUES ('$RG_KEEP2','$CO_ACME','org_unit','$OU_C','org_unit','$OU_C','read');" > /dev/null
+     VALUES ('$RG_KEEP','$CO_ACME','org_unit','$OU_C','org_unit','$OU_C','read');" > /dev/null
+
 sql "DELETE FROM org_units WHERE id='$OU_D';" > /dev/null
-COUNT=$(sql "SELECT COUNT(*) FROM resource_grants WHERE id='$RG_KEEP2';")
+COUNT=$(sql "SELECT COUNT(*) FROM resource_grants WHERE id='$RG_KEEP';")
 [ "$COUNT" = "1" ] \
   && pass "V026.4" "trigger leaves unrelated grants alone" \
   || fail "V026.4" "unrelated grant was removed (count=$COUNT)"
