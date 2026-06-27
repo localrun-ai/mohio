@@ -245,7 +245,8 @@ CREATE TABLE embedding_models (
     name              TEXT    NOT NULL UNIQUE,      -- e.g. 'bge-m3', 'e5-large'
     qdrant_collection TEXT    NOT NULL UNIQUE,      -- e.g. 'wikore_docs_bge_m3'
     dimension         INT     NOT NULL CHECK (dimension > 0),
-    enabled           BOOLEAN NOT NULL DEFAULT true
+    enabled           BOOLEAN NOT NULL DEFAULT true,
+    created_at        TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
 -- ---------------------------------------------------------------------------

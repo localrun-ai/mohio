@@ -263,7 +263,7 @@ CREATE TABLE resource_grants (
 
     granted_by           UUID        REFERENCES users(id) ON DELETE SET NULL,
     granted_at           TIMESTAMPTZ NOT NULL DEFAULT now(),
-    expires_at           TIMESTAMPTZ,
+    expires_at           TIMESTAMPTZ CHECK (expires_at IS NULL OR expires_at > granted_at),
 
     -- Prevent nonsensical combinations: only org_units have descendants.
     CONSTRAINT rg_resource_applies_to_valid
