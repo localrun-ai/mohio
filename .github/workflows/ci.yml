@@ -41,7 +41,6 @@ jobs:
             libspdlog-dev \
             libssl-dev \
             libhiredis-dev \
-            libcatch2-dev \
             uuid-dev \
             git
 
@@ -136,7 +135,6 @@ jobs:
           sudo apt-get install -y --no-install-recommends \
             libssl-dev \
             libhiredis-dev \
-            libcatch2-dev \
             postgresql-client
 
       - name: Download test binary

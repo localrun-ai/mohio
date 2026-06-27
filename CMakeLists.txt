@@ -202,7 +202,15 @@ endif()
 # ---------------------------------------------------------------------------
 option(WIKORE_BUILD_TESTS "Build Catch2 unit tests" ON)
 if(WIKORE_BUILD_TESTS)
-    find_package(Catch2 3 REQUIRED)
+    CPMAddPackage(
+        NAME Catch2
+        GITHUB_REPOSITORY catchorg/Catch2
+        GIT_TAG v3.7.1
+        OPTIONS "CATCH_INSTALL_DOCS OFF"
+    )
+    if(Catch2_ADDED)
+        list(APPEND CMAKE_MODULE_PATH ${Catch2_SOURCE_DIR}/extras)
+    endif()
     enable_testing()
     add_subdirectory(tests)
 endif()
