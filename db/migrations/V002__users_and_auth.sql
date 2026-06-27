@@ -6,15 +6,18 @@
 -- All tables carry company_id and use composite FKs (company_id, other_id) to
 -- enforce same-company membership at the database level.
 --
--- Polymorphic columns (principal_id, resource_id) reference different tables
--- depending on a discriminator column (principal_type, resource_type).
--- PostgreSQL cannot express this as a FK constraint; same-company integrity
--- for these columns is enforced by the application layer.  They are clearly
--- marked below.
+-- Polymorphic columns (resource_id in resource_grants) reference different
+-- tables depending on a discriminator column (resource_type). PostgreSQL cannot
+-- express this as a FK constraint; same-company integrity for those columns is
+-- enforced by a validation trigger in V009.
 --
 -- Access model:
---   memberships    - principal -> org_unit, with role and inheritance rule
---   resource_grants - explicit permission on a specific resource
+--   memberships     - principal (user or group) -> org_unit, with role and
+--                     inheritance rule. Split user_id/group_id columns enforce
+--                     existence via composite FK; exactly-one CHECK enforces
+--                     that exactly one is set.
+--   resource_grants - explicit permission override on a specific resource.
+--                     Polymorphic resource/principal; V009 adds the trigger.
 --   Default is CLOSED: no membership = no access.
 
 -- ---------------------------------------------------------------------------
@@ -56,7 +59,6 @@ CREATE TABLE groups (
     UNIQUE (company_id, name),
     -- Required target for composite FKs from other tables.
     UNIQUE (company_id, id),
-    -- Both external fields must be present or absent together.
     CONSTRAINT groups_external_both_or_neither
         CHECK ((external_provider IS NULL) = (external_group_id IS NULL))
 );
@@ -71,7 +73,8 @@ CREATE INDEX groups_company_id_idx ON groups (company_id);
 -- Group members
 --
 -- company_id is carried here so composite FKs can enforce that group and
--- user belong to the same company.
+-- user belong to the same company. Included in the PK so rows are strictly
+-- scoped to one company even if UUIDs are ever imported or replicated.
 -- ---------------------------------------------------------------------------
 
 CREATE TABLE group_members (
@@ -79,7 +82,7 @@ CREATE TABLE group_members (
     group_id   UUID        NOT NULL,
     user_id    UUID        NOT NULL,
     added_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
-    PRIMARY KEY (group_id, user_id),
+    PRIMARY KEY (company_id, group_id, user_id),
     CONSTRAINT group_members_group_same_company_fk
         FOREIGN KEY (company_id, group_id)
         REFERENCES groups(company_id, id) ON DELETE CASCADE,
@@ -88,11 +91,11 @@ CREATE TABLE group_members (
         REFERENCES users(company_id, id)  ON DELETE CASCADE
 );
 
-CREATE INDEX group_members_user_idx    ON group_members (user_id);
-CREATE INDEX group_members_company_idx ON group_members (company_id);
+CREATE INDEX group_members_user_idx    ON group_members (company_id, user_id);
+CREATE INDEX group_members_group_idx   ON group_members (company_id, group_id);
 
 -- ---------------------------------------------------------------------------
--- Memberships: principal -> org_unit with role and inheritance scope
+-- Memberships: principal (user or group) -> org_unit with role
 --
 -- Role:
 --   viewer  - read documents and wiki, run RAG queries
@@ -100,36 +103,63 @@ CREATE INDEX group_members_company_idx ON group_members (company_id);
 --   admin   - editor + manage members and sub-unit structure
 --
 -- applies_to:
---   self_only              - this org_unit only
---   self_and_descendants   - this org_unit + all children (via closure table)
+--   self_only            - this org_unit only
+--   self_and_descendants - this org_unit + all children (via closure table)
 --
--- principal_id is POLYMORPHIC (user UUID or group UUID depending on
--- principal_type). Same-company integrity is enforced by the application.
+-- Split user_id / group_id replaces the former polymorphic principal_type +
+-- principal_id columns. Composite FKs enforce existence and same-company
+-- membership for both. Exactly one must be non-NULL (enforced by CHECK).
 --
--- Composite FK on org_unit_id enforces that org_unit belongs to the same company.
+-- granted_by: simple FK (not composite) because ON DELETE SET NULL on a
+-- composite FK would null out company_id, violating its NOT NULL constraint.
 -- ---------------------------------------------------------------------------
 
 CREATE TABLE memberships (
-    id             UUID        PRIMARY KEY DEFAULT gen_random_uuid(),
-    company_id     UUID        NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
-    principal_type TEXT        NOT NULL CHECK (principal_type IN ('user', 'group')),
-    principal_id   UUID        NOT NULL,          -- POLYMORPHIC: app enforces same-company
-    org_unit_id    UUID        NOT NULL,
-    role           TEXT        NOT NULL CHECK (role IN ('viewer', 'editor', 'admin')),
-    applies_to     TEXT        NOT NULL DEFAULT 'self_and_descendants'
-                               CHECK (applies_to IN ('self_only', 'self_and_descendants')),
-    granted_by     UUID        REFERENCES users(id) ON DELETE SET NULL,
-    granted_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
-    updated_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
-    UNIQUE (company_id, principal_type, principal_id, org_unit_id),
+    id          UUID        PRIMARY KEY DEFAULT gen_random_uuid(),
+    company_id  UUID        NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
+    user_id     UUID,                             -- set if principal is a user
+    group_id    UUID,                             -- set if principal is a group
+    org_unit_id UUID        NOT NULL,
+    role        TEXT        NOT NULL CHECK (role IN ('viewer', 'editor', 'admin')),
+    applies_to  TEXT        NOT NULL DEFAULT 'self_and_descendants'
+                            CHECK (applies_to IN ('self_only', 'self_and_descendants')),
+    granted_by  UUID        REFERENCES users(id) ON DELETE SET NULL,
+    granted_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+
+    -- Exactly one of user_id / group_id must be set.
+    CONSTRAINT memberships_exactly_one_principal
+        CHECK (
+            (user_id IS NOT NULL AND group_id IS NULL)
+            OR
+            (user_id IS NULL     AND group_id IS NOT NULL)
+        ),
+
+    CONSTRAINT memberships_user_same_company_fk
+        FOREIGN KEY (company_id, user_id)
+        REFERENCES users(company_id, id) ON DELETE CASCADE,
+
+    CONSTRAINT memberships_group_same_company_fk
+        FOREIGN KEY (company_id, group_id)
+        REFERENCES groups(company_id, id) ON DELETE CASCADE,
+
     CONSTRAINT memberships_org_unit_same_company_fk
         FOREIGN KEY (company_id, org_unit_id)
         REFERENCES org_units(company_id, id) ON DELETE CASCADE
 );
 
-CREATE INDEX memberships_org_unit_idx  ON memberships (org_unit_id);
-CREATE INDEX memberships_principal_idx ON memberships (principal_type, principal_id);
-CREATE INDEX memberships_company_idx   ON memberships (company_id);
+-- One membership per (user|group, org_unit) per company.
+CREATE UNIQUE INDEX memberships_user_org_uidx
+    ON memberships (company_id, user_id, org_unit_id)
+    WHERE user_id IS NOT NULL;
+
+CREATE UNIQUE INDEX memberships_group_org_uidx
+    ON memberships (company_id, group_id, org_unit_id)
+    WHERE group_id IS NOT NULL;
+
+CREATE INDEX memberships_org_unit_idx ON memberships (company_id, org_unit_id);
+CREATE INDEX memberships_user_idx     ON memberships (company_id, user_id)  WHERE user_id  IS NOT NULL;
+CREATE INDEX memberships_group_idx    ON memberships (company_id, group_id) WHERE group_id IS NOT NULL;
 
 CREATE TRIGGER memberships_updated_at
     BEFORE UPDATE ON memberships
@@ -139,10 +169,12 @@ CREATE TRIGGER memberships_updated_at
 -- Resource grants: explicit permission override on a specific resource
 --
 -- Used for cross-unit sharing and document/wiki ACL overrides.
--- Example: Legal (org_unit) gets read access to one specific HR document.
+-- Example: Legal org_unit gets read access to one specific HR document.
 --
--- Both principal_id and resource_id are POLYMORPHIC.
--- Same-company integrity is enforced by the application layer.
+-- Both principal_id and resource_id are POLYMORPHIC - the type discriminator
+-- columns determine which table they reference. PostgreSQL cannot express
+-- conditional FKs. Same-company integrity is enforced by the
+-- validate_resource_grant_same_company() trigger added in V009.
 -- ---------------------------------------------------------------------------
 
 CREATE TABLE resource_grants (
@@ -150,20 +182,21 @@ CREATE TABLE resource_grants (
     company_id     UUID        NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
     resource_type  TEXT        NOT NULL
                                CHECK (resource_type IN ('org_unit', 'document', 'wiki_page')),
-    resource_id    UUID        NOT NULL,           -- POLYMORPHIC: app enforces same-company
+    resource_id    UUID        NOT NULL,           -- POLYMORPHIC: V009 trigger validates
     principal_type TEXT        NOT NULL CHECK (principal_type IN ('user', 'group', 'org_unit')),
-    principal_id   UUID        NOT NULL,           -- POLYMORPHIC: app enforces same-company
+    principal_id   UUID        NOT NULL,           -- POLYMORPHIC: V009 trigger validates
     permission     TEXT        NOT NULL CHECK (permission IN ('read', 'write', 'admin')),
     applies_to     TEXT        NOT NULL DEFAULT 'self_only'
                                CHECK (applies_to IN ('self_only', 'self_and_descendants')),
     granted_by     UUID        REFERENCES users(id) ON DELETE SET NULL,
     granted_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
     expires_at     TIMESTAMPTZ,
-    UNIQUE (resource_type, resource_id, principal_type, principal_id)
+    -- company_id included so uniqueness is always tenant-scoped.
+    UNIQUE (company_id, resource_type, resource_id, principal_type, principal_id)
 );
 
-CREATE INDEX resource_grants_resource_idx  ON resource_grants (resource_type, resource_id);
-CREATE INDEX resource_grants_principal_idx ON resource_grants (principal_type, principal_id);
+CREATE INDEX resource_grants_resource_idx  ON resource_grants (company_id, resource_type, resource_id);
+CREATE INDEX resource_grants_principal_idx ON resource_grants (company_id, principal_type, principal_id);
 CREATE INDEX resource_grants_company_idx   ON resource_grants (company_id);
 
 -- ---------------------------------------------------------------------------
