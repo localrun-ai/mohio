@@ -47,8 +47,8 @@ CREATE TABLE chat_turns (
     tool_calls       JSONB       NOT NULL DEFAULT '[]',
     -- Immutable snapshot: which org_unit IDs were searched for this query.
     access_scope_ids UUID[]      NOT NULL DEFAULT '{}',
-    tokens_used      INT,
-    latency_ms       INT,
+    tokens_used      INT         CHECK (tokens_used IS NULL OR tokens_used >= 0),
+    latency_ms       INT         CHECK (latency_ms  IS NULL OR latency_ms  >= 0),
     created_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
     CONSTRAINT chat_turns_session_same_company_fk
         FOREIGN KEY (company_id, session_id)
