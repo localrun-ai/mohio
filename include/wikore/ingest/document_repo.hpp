@@ -58,7 +58,8 @@ public:
     set_ingest_status(std::string_view company_id,
                       std::string_view document_version_id,
                       IngestStatus     status,
-                      drogon::orm::DbClientPtr db) = 0;
+                      drogon::orm::DbClientPtr db,
+                      std::string_view error_message = {}) = 0;
 
     // Transition to 'done' inside the provided UoW. Satisfies V003's
     // document_versions_done_state_chk (ingest_status='done' requires
@@ -99,7 +100,8 @@ public:
     set_ingest_status(std::string_view         company_id,
                       std::string_view         document_version_id,
                       IngestStatus             status,
-                      drogon::orm::DbClientPtr db) override;
+                      drogon::orm::DbClientPtr db,
+                      std::string_view error_message = {}) override;
 
     drogon::Task<Result<void>>
     mark_ingest_done(std::string_view      company_id,
@@ -166,7 +168,8 @@ public:
     set_ingest_status(std::string_view         /*company_id*/,
                       std::string_view         version_id,
                       IngestStatus             status,
-                      drogon::orm::DbClientPtr /*db*/) override
+                      drogon::orm::DbClientPtr /*db*/,
+                      std::string_view         error_message = {}) override
     {
         // Mirror the production guard so tests catch incorrect usage early.
         if (status == IngestStatus::done) {
@@ -174,6 +177,8 @@ public:
                 "set_ingest_status: use mark_ingest_done() for 'done'"));
         }
         last_status_set[std::string(version_id)] = status;
+        if (status == IngestStatus::error)
+            last_error_set[std::string(version_id)] = error_message;
         co_return Result<void>{};
     }
 
@@ -191,6 +196,7 @@ public:
     // Test introspection
     std::map<std::string, IngestStatus> last_status_set;
     std::map<std::string, int>          last_chunk_count;
+    std::map<std::string, std::string>  last_error_set;
 
 private:
     static void assign_fake_ids(ParsedSection& s)

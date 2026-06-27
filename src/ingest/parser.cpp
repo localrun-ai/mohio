@@ -1,9 +1,196 @@
 #include "wikore/ingest/parser.hpp"
+#include <algorithm>
+#include <cctype>
+#include <filesystem>
 #include <functional>
 #include <sstream>
 #include <string_view>
 
 namespace wikore::ingest {
+
+namespace {
+
+constexpr std::string_view kEicarPrefix = R"(X5O!P%@AP[4\PZX54(P^)7CC)7})";
+constexpr std::string_view kEicarMarker = "EICAR-STANDARD-ANTIVIRUS-TEST-FILE";
+
+std::string lower_ascii(std::string value)
+{
+    std::ranges::transform(value, value.begin(), [](unsigned char c) {
+        return static_cast<char>(std::tolower(c));
+    });
+    return value;
+}
+
+std::string extension_of(const std::string& filename)
+{
+    return lower_ascii(std::filesystem::path(filename).extension().string());
+}
+
+bool starts_with_bytes(const std::string& content, std::string_view magic)
+{
+    return content.size() >= magic.size()
+        && std::equal(magic.begin(), magic.end(), content.begin());
+}
+
+Result<std::string> resolve_text_mime(const std::string& content,
+                                      const std::string& filename,
+                                      const std::string& mime_type)
+{
+    if (content.empty())
+        return std::unexpected(Error::invalid_input("ingest.empty_file"));
+    if (content.size() > ParserPort::kMaxInputBytes)
+        return std::unexpected(Error::invalid_input("ingest.file_too_large"));
+    const auto eicar_prefix = content.find(kEicarPrefix);
+    if (eicar_prefix != std::string::npos
+        && content.find(kEicarMarker, eicar_prefix + kEicarPrefix.size())
+            != std::string::npos)
+    {
+        return std::unexpected(
+            Error::invalid_input("ingest.av.eicar_signature_detected"));
+    }
+
+    const auto ext    = extension_of(filename);
+    const bool is_pdf = starts_with_bytes(content, "%PDF-");
+    const bool is_zip = starts_with_bytes(content, std::string_view{"PK\x03\x04", 4});
+
+    if (ext == ".pdf" && !is_pdf)
+        return std::unexpected(Error::invalid_input("ingest.mime_type_mismatch"));
+    if ((ext == ".docx" || ext == ".xlsx" || ext == ".pptx") && !is_zip)
+        return std::unexpected(Error::invalid_input("ingest.mime_type_mismatch"));
+    if (is_pdf)
+        return std::unexpected(Error::invalid_input("ingest.unsupported_format.pdf"));
+    if (is_zip)
+        return std::unexpected(Error::invalid_input("ingest.unsupported_format.office"));
+    if (content.find('\0') != std::string::npos)
+        return std::unexpected(Error::invalid_input("ingest.binary_content"));
+
+    if (ext == ".md" || ext == ".markdown")
+        return std::string{"text/markdown"};
+    if (ext == ".txt" || ext.empty())
+        return std::string{"text/plain"};
+
+    if (mime_type == "text/markdown" || mime_type == "text/plain")
+        return mime_type;
+    return std::unexpected(Error::invalid_input("ingest.unsupported_format"));
+}
+
+bool decode_utf8(std::string_view input, std::size_t& offset,
+                 char32_t& codepoint, std::size_t& width)
+{
+    const auto first = static_cast<unsigned char>(input[offset]);
+    if (first < 0x80) {
+        codepoint = first;
+        width = 1;
+        return true;
+    }
+
+    if ((first & 0xE0) == 0xC0) {
+        codepoint = first & 0x1F;
+        width = 2;
+    } else if ((first & 0xF0) == 0xE0) {
+        codepoint = first & 0x0F;
+        width = 3;
+    } else if ((first & 0xF8) == 0xF0) {
+        codepoint = first & 0x07;
+        width = 4;
+    } else {
+        return false;
+    }
+
+    if (offset + width > input.size())
+        return false;
+    for (std::size_t i = 1; i < width; ++i) {
+        const auto next = static_cast<unsigned char>(input[offset + i]);
+        if ((next & 0xC0) != 0x80)
+            return false;
+        codepoint = (codepoint << 6) | (next & 0x3F);
+    }
+
+    if ((width == 2 && codepoint < 0x80)
+        || (width == 3 && codepoint < 0x800)
+        || (width == 4 && codepoint < 0x10000)
+        || codepoint > 0x10FFFF
+        || (codepoint >= 0xD800 && codepoint <= 0xDFFF))
+    {
+        return false;
+    }
+    return true;
+}
+
+Result<std::string> strip_unicode_tags(std::string_view input)
+{
+    std::string output;
+    output.reserve(input.size());
+    for (std::size_t offset = 0; offset < input.size();) {
+        char32_t codepoint = 0;
+        std::size_t width = 0;
+        if (!decode_utf8(input, offset, codepoint, width))
+            return std::unexpected(Error::invalid_input("ingest.invalid_utf8"));
+
+        if (codepoint < 0xE0000 || codepoint > 0xE007F)
+            output.append(input.substr(offset, width));
+        offset += width;
+    }
+    return output;
+}
+
+std::string strip_markdown_html(std::string input)
+{
+    const auto lower = lower_ascii(input);
+    std::string output;
+    output.reserve(input.size());
+
+    for (std::size_t pos = 0; pos < input.size();) {
+        if (input[pos] != '<') {
+            output.push_back(input[pos++]);
+            continue;
+        }
+
+        const auto tag_end = input.find('>', pos + 1);
+        if (tag_end == std::string::npos) {
+            output.append(input.substr(pos));
+            break;
+        }
+
+        const auto tag = lower.substr(pos + 1, tag_end - pos - 1);
+        std::size_t name_start = 0;
+        if (name_start < tag.size() && tag[name_start] == '/')
+            ++name_start;
+        if (name_start >= tag.size()
+            || !std::isalpha(static_cast<unsigned char>(tag[name_start])))
+        {
+            output.push_back(input[pos++]);
+            continue;
+        }
+        std::size_t name_end = name_start;
+        while (name_end < tag.size()
+               && (std::isalnum(static_cast<unsigned char>(tag[name_end]))
+                   || tag[name_end] == '-'))
+            ++name_end;
+        const auto name = tag.substr(name_start, name_end - name_start);
+
+        const bool hidden = name == "script" || name == "style"
+            || tag.find("display:none") != std::string::npos
+            || tag.find("display: none") != std::string::npos
+            || tag.find("visibility:hidden") != std::string::npos
+            || tag.find("visibility: hidden") != std::string::npos
+            || tag.find(" hidden") != std::string::npos;
+        if (hidden && !name.empty() && tag.front() != '/') {
+            const auto close = "</" + name;
+            const auto close_start = lower.find(close, tag_end + 1);
+            if (close_start == std::string::npos)
+                break;
+            const auto close_end = input.find('>', close_start + close.size());
+            pos = close_end == std::string::npos ? input.size() : close_end + 1;
+            continue;
+        }
+
+        pos = tag_end + 1;
+    }
+    return output;
+}
+
+} // namespace
 
 // ---------------------------------------------------------------------------
 // PlainTextParser
@@ -16,16 +203,26 @@ namespace wikore::ingest {
 // empty heading) whose text is the full document.
 // ---------------------------------------------------------------------------
 
-ParsedDocument
+Result<ParsedDocument>
 PlainTextParser::parse(const std::string& content,
                         const std::string& filename,
                         const std::string& mime_type) const
 {
+    auto resolved_mime = resolve_text_mime(content, filename, mime_type);
+    if (!resolved_mime)
+        return std::unexpected(resolved_mime.error());
+
+    auto normalized = strip_unicode_tags(content);
+    if (!normalized)
+        return std::unexpected(normalized.error());
+    if (*resolved_mime == "text/markdown")
+        *normalized = strip_markdown_html(std::move(*normalized));
+
     ParsedDocument doc;
     doc.filename  = filename;
-    doc.mime_type = mime_type;
+    doc.mime_type = *resolved_mime;
 
-    std::istringstream stream(content);
+    std::istringstream stream(*normalized);
     std::string        line;
 
     // Working state: current heading depth and the section being assembled

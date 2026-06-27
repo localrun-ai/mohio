@@ -1,5 +1,7 @@
 #pragma once
+#include "wikore/domain/types.hpp"
 #include "wikore/ingest/types.hpp"
+#include <cstddef>
 #include <memory>
 #include <string>
 
@@ -18,12 +20,14 @@ class ParserPort {
 public:
     virtual ~ParserPort() = default;
 
+    static constexpr std::size_t kMaxInputBytes = 32U * 1024U * 1024U;
+
     // Parse raw content bytes into a structured ParsedDocument.
     // mime_type is advisory; the parser may inspect content bytes to override.
     // filename is used for ParsedDocument::filename and may guide parsing hints.
-    virtual ParsedDocument parse(const std::string& content,
-                                 const std::string& filename,
-                                 const std::string& mime_type) const = 0;
+    virtual Result<ParsedDocument> parse(const std::string& content,
+                                         const std::string& filename,
+                                         const std::string& mime_type) const = 0;
 };
 
 // ---------------------------------------------------------------------------
@@ -36,9 +40,9 @@ public:
 
 class PlainTextParser : public ParserPort {
 public:
-    ParsedDocument parse(const std::string& content,
-                         const std::string& filename,
-                         const std::string& mime_type) const override;
+    Result<ParsedDocument> parse(const std::string& content,
+                                 const std::string& filename,
+                                 const std::string& mime_type) const override;
 };
 
 } // namespace wikore::ingest
