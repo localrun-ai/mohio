@@ -16,9 +16,32 @@ read when querying a given org_unit) must be fast and consistent.
 
 | Key | Value | TTL | Notes |
 |-----|-------|-----|-------|
-| `lr:eff:{company_id}:{user_id}:{org_unit_id}` | JSON array of UUID strings | 5 min | Resolved access_scope_ids for this user+scope; drives Qdrant filter |
+| `lr:eff:{company_id}:{user_id}:{org_unit_id}` | JSON array of UUID strings | see below | Resolved access_scope_ids for this user+scope; drives Qdrant filter |
 | `lr:user:{user_id}` | JSON Identity record | 5 min | Profile + is_admin; invalidate on user update |
 | `lr:tree:{company_id}:{org_unit_id}` | JSON subtree | 2 min | Admin UI tree; invalidate on any mutation under this node |
+
+### lr:eff TTL policy (grant expiry awareness)
+
+`resource_grants.expires_at` creates a correctness hazard: if an effective scope entry
+is cached with a fixed 5-minute TTL but a contributing grant expires within that window,
+the user retains access after the grant has lapsed.
+
+**Resolution: Option B - clamp TTL to the earliest grant expiry.**
+
+When building and caching an `lr:eff` entry, the access resolver must:
+
+1. Collect `MIN(g.expires_at) FILTER (WHERE g.expires_at IS NOT NULL)` from all
+   `resource_grants` rows that contribute to this user's effective scope.
+2. If `min_expiry IS NULL` (no time-limited grants in scope): use default TTL = 5 min.
+3. If `min_expiry - now() < 0`: the grant has already lapsed; do not cache (or set TTL = 1s).
+4. If `min_expiry - now() < 5 min`: set TTL = `CEIL(min_expiry - now())`.
+5. Otherwise: use default TTL = 5 min.
+
+`memberships` rows have no `expires_at` - indefinite memberships always contribute
+the full 5-minute window. Only `resource_grants` time-limits are involved here.
+
+Worst-case stale window with this policy: 1 clock-tick between the resolver reading
+`MIN(expires_at)` and writing the Redis TTL. Acceptable for enterprise use.
 
 ## Rate limiting
 
