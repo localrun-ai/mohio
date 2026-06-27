@@ -142,8 +142,12 @@ CREATE TABLE org_unit_closure (
         REFERENCES org_units(company_id, id) ON DELETE CASCADE
 );
 
-CREATE INDEX org_unit_closure_descendant_idx ON org_unit_closure (descendant_id);
-CREATE INDEX org_unit_closure_company_idx    ON org_unit_closure (company_id, ancestor_id);
+-- Ancestor -> descendants: "give me all org_units under X in company C"
+CREATE INDEX org_unit_closure_company_ancestor_idx
+    ON org_unit_closure (company_id, ancestor_id, descendant_id);
+-- Descendant -> ancestors: "give me all ancestors of X in company C" (access scope resolution)
+CREATE INDEX org_unit_closure_company_descendant_idx
+    ON org_unit_closure (company_id, descendant_id, ancestor_id);
 
 CREATE OR REPLACE FUNCTION org_unit_closure_on_insert()
 RETURNS TRIGGER LANGUAGE plpgsql AS $$
@@ -152,12 +156,16 @@ BEGIN
     INSERT INTO org_unit_closure (company_id, ancestor_id, descendant_id, depth)
     VALUES (NEW.company_id, NEW.id, NEW.id, 0);
 
-    -- Inherit all ancestor rows from the parent
+    -- Inherit all ancestor rows from the parent.
+    -- company_id filter is redundant given the composite FK, but it lets the
+    -- planner use org_unit_closure_company_descendant_idx instead of scanning
+    -- by descendant_id alone.
     IF NEW.parent_id IS NOT NULL THEN
         INSERT INTO org_unit_closure (company_id, ancestor_id, descendant_id, depth)
         SELECT NEW.company_id, c.ancestor_id, NEW.id, c.depth + 1
         FROM org_unit_closure c
-        WHERE c.descendant_id = NEW.parent_id;
+        WHERE c.company_id    = NEW.company_id
+          AND c.descendant_id = NEW.parent_id;
     END IF;
 
     RETURN NULL;
