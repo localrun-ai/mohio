@@ -64,6 +64,7 @@ cat db/migrations/V001__orgs.sql \
     db/migrations/V014__sensitivity_sections_tombstones.sql \
     db/migrations/V015__outbox.sql \
     db/migrations/V016__usage_events.sql \
+    db/migrations/V017__prompt_templates.sql \
   | docker exec -i "$CONTAINER" psql -U postgres -v ON_ERROR_STOP=1 -q
 echo "-- Migrations loaded."
 echo ""
@@ -466,6 +467,61 @@ ERR_DEL=$(sql "DELETE FROM usage_events WHERE company_id='$CO_ACME';" 2>&1 || tr
 echo "$ERR_UPD$ERR_DEL" | grep -qi "append-only" \
   && pass 30 "usage_events UPDATE and DELETE rejected (append-only)" \
   || fail 30 "append-only enforcement missing: upd='$ERR_UPD' del='$ERR_DEL'"
+
+# --------------------------------------------------------------------------
+# 31. V017: prompt_templates insert + chat_turn references it via composite FK
+# --------------------------------------------------------------------------
+PT1='b00b0001-0000-0000-0000-000000000000'   # prompt template 1 (Acme)
+SES1='5e550001-0000-0000-0000-000000000000'  # chat session
+TRN1='7e550001-0000-0000-0000-000000000000'  # chat turn
+
+sql "INSERT INTO prompt_templates
+       (id, company_id, name, content, content_hash, created_by)
+     VALUES ('$PT1', '$CO_ACME', 'default_chat',
+             'You are Wikore. Cite sources by §.',
+             'sha256_of_v1_content', '$U_ALICE');" > /dev/null
+
+sql "INSERT INTO chat_sessions (id, company_id, org_unit_id, user_id, title)
+     VALUES ('$SES1', '$CO_ACME', '$ACME_ROOT', '$U_ALICE', 'smoke chat');" > /dev/null
+
+sql "INSERT INTO chat_turns
+       (id, company_id, session_id, question, prompt_template_id)
+     VALUES ('$TRN1', '$CO_ACME', '$SES1', 'What is our PTO policy?', '$PT1');" > /dev/null
+
+VAL=$(sql "SELECT prompt_template_id FROM chat_turns WHERE id='$TRN1';")
+[ "$VAL" = "$PT1" ] \
+  && pass 31 "chat_turn pinned to prompt_template via composite FK" \
+  || fail 31 "chat_turn.prompt_template_id mismatch (got '$VAL')"
+
+# --------------------------------------------------------------------------
+# 32. V017: prompt_templates content/name/hash are immutable
+# --------------------------------------------------------------------------
+ERR_CON=$(sql "UPDATE prompt_templates SET content='different' WHERE id='$PT1';" 2>&1 || true)
+ERR_NAM=$(sql "UPDATE prompt_templates SET name='renamed'     WHERE id='$PT1';" 2>&1 || true)
+ERR_HSH=$(sql "UPDATE prompt_templates SET content_hash='x'   WHERE id='$PT1';" 2>&1 || true)
+# description should still be mutable
+sql "UPDATE prompt_templates SET description='clarified purpose' WHERE id='$PT1';" > /dev/null
+DESC=$(sql "SELECT description FROM prompt_templates WHERE id='$PT1';")
+
+echo "$ERR_CON$ERR_NAM$ERR_HSH" | grep -qi "immutable" && [ "$DESC" = "clarified purpose" ] \
+  && pass 32 "prompt_template content/name/hash immutable; description mutable" \
+  || fail 32 "immutability invariants wrong: con='$ERR_CON' nam='$ERR_NAM' hsh='$ERR_HSH' desc='$DESC'"
+
+# --------------------------------------------------------------------------
+# 33. V017: cross-company prompt_template_id rejected by composite FK
+# --------------------------------------------------------------------------
+PT_BETA='b00b0002-0000-0000-0000-000000000000'
+sql "INSERT INTO prompt_templates (id, company_id, name, content, content_hash)
+     VALUES ('$PT_BETA', '$CO_BETA', 'default_chat', 'Beta prompt', 'sha256_beta');" > /dev/null
+
+# Try to pin an Acme chat_turn to Beta's prompt template -- must fail.
+TRN_BAD='7e550002-0000-0000-0000-000000000000'
+ERR=$(sql "INSERT INTO chat_turns
+             (id, company_id, session_id, question, prompt_template_id)
+           VALUES ('$TRN_BAD', '$CO_ACME', '$SES1', 'cross-tenant?', '$PT_BETA');" 2>&1 || true)
+echo "$ERR" | grep -qi "foreign key\|violates" \
+  && pass 33 "cross-company prompt_template_id rejected by composite FK" \
+  || fail 33 "cross-company prompt_template_id was not rejected: $ERR"
 
 # --------------------------------------------------------------------------
 # Summary
