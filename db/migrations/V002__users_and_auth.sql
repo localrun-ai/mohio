@@ -231,10 +231,12 @@ CREATE TRIGGER memberships_validate_actors
 --     'self_and_descendants' is only meaningful when resource_type='org_unit';
 --     documents and wiki_pages have no descendants (enforced by CHECK).
 --
---   principal_applies_to: does the grant cover the specified principal only,
---     or the principal org_unit and all its descendant org_units' members?
---     'self_and_descendants' is only meaningful when principal_type='org_unit';
---     individual users and groups have no org subtree (enforced by CHECK).
+--   principal_applies_to: does the grant cover the specified org_unit only,
+--     or the org_unit and all its descendant org_units' members?
+--     principal_type is restricted to 'org_unit' for MVP. User- and group-
+--     specific grants require switching access_scope_ids to access_tokens
+--     (typed prefix strings) to avoid overgrant via the Qdrant intersection
+--     filter. Revisit when that model is ready.
 --
 -- Example: Legal (org_unit, self_and_descendants) granted read on HR (org_unit,
 --   self_only) means all Legal sub-teams can read HR documents, but NOT HR
@@ -247,7 +249,8 @@ CREATE TABLE resource_grants (
     resource_type        TEXT        NOT NULL
                                      CHECK (resource_type IN ('org_unit', 'document', 'wiki_page')),
     resource_id          UUID        NOT NULL,      -- POLYMORPHIC: V009 trigger validates
-    principal_type       TEXT        NOT NULL CHECK (principal_type IN ('user', 'group', 'org_unit')),
+    -- MVP: org_unit only. User/group-specific grants require access_tokens model (future).
+    principal_type       TEXT        NOT NULL CHECK (principal_type = 'org_unit'),
     principal_id         UUID        NOT NULL,      -- POLYMORPHIC: V009 trigger validates
     permission           TEXT        NOT NULL CHECK (permission IN ('read', 'write', 'admin')),
 

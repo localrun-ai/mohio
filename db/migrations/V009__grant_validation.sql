@@ -1,43 +1,25 @@
 -- V009: resource_grants same-company validation trigger
 --
--- resource_grants uses polymorphic principal_id and resource_id columns that
--- PostgreSQL cannot enforce with foreign keys. This trigger validates that both
--- the principal and the resource exist and belong to the same company as the
--- grant row before every INSERT or UPDATE.
+-- resource_grants.resource_id is polymorphic (org_unit | document | wiki_page)
+-- and cannot be enforced with a FK. This trigger validates that the resource
+-- exists in the correct table and belongs to the same company as the grant row.
 --
--- Must run after V003 (documents) and V004 (wiki_pages) because the trigger
--- function references those tables.
+-- principal_type is restricted to 'org_unit' by CHECK in V002 (MVP). When
+-- user/group-specific grants are added (access_tokens model), extend this
+-- trigger to validate those principal types.
+--
+-- Must run after V003 (documents) and V004 (wiki_pages).
 
 CREATE OR REPLACE FUNCTION validate_resource_grant_same_company()
 RETURNS TRIGGER LANGUAGE plpgsql AS $$
 BEGIN
-    -- Validate principal exists in the correct table for its company.
-    IF NEW.principal_type = 'user' THEN
-        IF NOT EXISTS (
-            SELECT 1 FROM users
-            WHERE company_id = NEW.company_id AND id = NEW.principal_id
-        ) THEN
-            RAISE EXCEPTION 'resource_grants: user % not found in company %',
-                NEW.principal_id, NEW.company_id;
-        END IF;
-
-    ELSIF NEW.principal_type = 'group' THEN
-        IF NOT EXISTS (
-            SELECT 1 FROM groups
-            WHERE company_id = NEW.company_id AND id = NEW.principal_id
-        ) THEN
-            RAISE EXCEPTION 'resource_grants: group % not found in company %',
-                NEW.principal_id, NEW.company_id;
-        END IF;
-
-    ELSIF NEW.principal_type = 'org_unit' THEN
-        IF NOT EXISTS (
-            SELECT 1 FROM org_units
-            WHERE company_id = NEW.company_id AND id = NEW.principal_id
-        ) THEN
-            RAISE EXCEPTION 'resource_grants: org_unit % not found in company %',
-                NEW.principal_id, NEW.company_id;
-        END IF;
+    -- Validate principal org_unit exists in this company.
+    IF NOT EXISTS (
+        SELECT 1 FROM org_units
+        WHERE company_id = NEW.company_id AND id = NEW.principal_id
+    ) THEN
+        RAISE EXCEPTION 'resource_grants: org_unit % not found in company %',
+            NEW.principal_id, NEW.company_id;
     END IF;
 
     -- Validate resource exists in the correct table for its company.
