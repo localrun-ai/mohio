@@ -36,14 +36,18 @@ PromoteDocumentVersionUseCase::execute(
     try {
         co_await uow.exec(
             R"(INSERT INTO audit_log
-                   (company_id, actor_id, actor_type, action, entity_type, entity_id, detail)
-               VALUES ($1, $2, $3, 'document.version.promoted', 'document_version', $4,
-                       jsonb_build_object('document_id', $5::text)))",
+                   (company_id, user_id, action, detail)
+               VALUES ($1, $2, 'document.version.promoted',
+                       jsonb_build_object(
+                           'actor_type',   $3::text,
+                           'document_id',  $4::text,
+                           'version_id',   $5::text
+                       )))",
             ctx.tenant.company_id,
             ctx.principal.user_id,
             actor_type,
-            cmd.version_id,
-            cmd.document_id);
+            cmd.document_id,
+            cmd.version_id);
     } catch (const drogon::orm::DrogonDbException& ex) {
         uow.rollback();
         co_return std::unexpected(postgres::map_db_exception(ex));
@@ -62,23 +66,23 @@ PromoteDocumentVersionUseCase::execute(
                VALUES ($1, $2, 'qdrant_resync_version_lifecycle',
                        jsonb_build_object(
                            'document_id',  $3::text,
-                           'version_id',   $2::text,
+                           'version_id',   $4::text,
                            'new_status',   'active'
                        ),
-                       $4)
+                       $5)
                ON CONFLICT (company_id, job_type, idempotency_key) DO NOTHING)",
             ctx.tenant.company_id,
-            cmd.version_id,
-            cmd.document_id,
-            idempotency_key);
+            cmd.version_id,   // $2 as uuid (aggregate_id)
+            cmd.document_id,  // $3
+            cmd.version_id,   // $4 as text inside jsonb
+            idempotency_key); // $5
     } catch (const drogon::orm::DrogonDbException& ex) {
         uow.rollback();
         co_return std::unexpected(postgres::map_db_exception(ex));
     }
 
-    // Commit: release the transaction shared_ptr -> Drogon auto-commits.
-    // State change + audit + outbox are atomic in the same Postgres transaction.
-    uow.commit();
+    // Commit: await PG acknowledgment so callers see committed data immediately.
+    co_await uow.commit();
 
     spdlog::info("[promote_version] company={} doc={} version={} promoted by user={}",
                  ctx.tenant.company_id, cmd.document_id, cmd.version_id,

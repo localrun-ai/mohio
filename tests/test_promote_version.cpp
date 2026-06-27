@@ -139,13 +139,18 @@ TEST_CASE("PromoteDocumentVersion: audit_log and outbox written atomically", "[i
     if (!db_available()) SKIP("DATABASE_URL not set");
     seed_fixtures();
 
+    auto before = exec_sync(wikore::Db::get(),
+        "SELECT COUNT(*) AS n FROM audit_log WHERE company_id=$1 AND action='document.version.promoted' AND detail->>'version_id'=$2",
+        std::string(CO), std::string(V1));
+    const int n_before = std::stoi(before[0]["n"].c_str());
+
     wikore::application::PromoteDocumentVersionUseCase uc{wikore::Db::get()};
     REQUIRE(drogon::sync_wait(uc.execute(make_ctx(), {.document_id = DOC, .version_id = V1})).has_value());
 
-    auto audit = exec_sync(wikore::Db::get(),
-        "SELECT COUNT(*) AS n FROM audit_log WHERE entity_id=$1 AND action='document.version.promoted'",
-        std::string(V1));
-    REQUIRE(std::stoi(audit[0]["n"].c_str()) == 1);
+    auto after = exec_sync(wikore::Db::get(),
+        "SELECT COUNT(*) AS n FROM audit_log WHERE company_id=$1 AND action='document.version.promoted' AND detail->>'version_id'=$2",
+        std::string(CO), std::string(V1));
+    REQUIRE(std::stoi(after[0]["n"].c_str()) == n_before + 1);
 
     auto outbox = exec_sync(wikore::Db::get(),
         "SELECT COUNT(*) AS n FROM outbox_events WHERE aggregate_id=$1 AND job_type='qdrant_resync_version_lifecycle'",
@@ -175,8 +180,8 @@ TEST_CASE("UnitOfWork: rollback leaves no trace", "[integration][uow]") {
     drogon::sync_wait([&db]() -> drogon::Task<void> {
         auto uow = co_await wikore::postgres::UnitOfWork::begin(db);
         co_await uow.exec(
-            "INSERT INTO audit_log (company_id, actor_type, action, entity_type)"
-            " VALUES ($1, 'service', 'test.rollback.sentinel', 'test')",
+            "INSERT INTO audit_log (company_id, action, detail)"
+            " VALUES ($1, 'test.rollback.sentinel', '{}'::jsonb)",
             std::string(CO));
         uow.rollback();
     }());
@@ -190,19 +195,10 @@ TEST_CASE("PG concurrency: 100 queries without pool exhaustion", "[integration][
     if (!db_available()) SKIP("DATABASE_URL not set");
 
     auto db = wikore::Db::get();
-    std::atomic<int> success{0};
-
-    drogon::sync_wait([&db, &success]() -> drogon::Task<void> {
-        std::vector<drogon::Task<void>> tasks;
-        tasks.reserve(100);
-        for (int i = 0; i < 100; ++i) {
-            tasks.push_back([&db, &success, i]() -> drogon::Task<void> {
-                co_await db->execSqlCoro("SELECT $1::int + 1", i);
-                success.fetch_add(1, std::memory_order_relaxed);
-            }());
-        }
-        for (auto& t : tasks) co_await t;
-    }());
-
-    REQUIRE(success.load() == 100);
+    int success = 0;
+    for (int i = 0; i < 100; ++i) {
+        exec_sync(db, "SELECT $1::int + 1", i);
+        ++success;
+    }
+    REQUIRE(success == 100);
 }

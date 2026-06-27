@@ -1,6 +1,7 @@
 #pragma once
 #include "wikore/domain/types.hpp"
 #include <drogon/orm/DbClient.h>
+#include <drogon/utils/coroutine.h>
 #include <memory>
 
 namespace wikore::postgres {
@@ -8,18 +9,17 @@ namespace wikore::postgres {
 // ---------------------------------------------------------------------------
 // UnitOfWork
 //
-// Wraps a Drogon Transaction. Drogon's Transaction commits automatically when
-// the shared_ptr ref-count reaches zero; calling rollback() before then
-// discards all statements. There is no explicit commitCoro() - releasing the
-// UoW is the commit.
+// Wraps a Drogon Transaction. commit() is an async Task that uses
+// Transaction::setCommitCallback to await PG acknowledgment before returning,
+// ensuring callers see committed data on subsequent queries.
 //
 // Pattern:
 //   auto uow = co_await UnitOfWork::begin(db);
 //   co_await uow.exec("INSERT INTO ...", args...);
 //   co_await uow.exec("INSERT INTO ...", args...);
-//   uow.commit();   // releases tx_ -> auto-commit
+//   co_await uow.commit();   // awaits PG COMMIT acknowledgment
 //   // OR
-//   uow.rollback(); // calls tx_->rollback() then releases
+//   uow.rollback();          // synchronous; calls tx_->rollback() then releases
 //
 // If the UoW goes out of scope without commit() being called the destructor
 // logs a warning and calls rollback().
@@ -41,11 +41,9 @@ public:
             std::move(sql), std::forward<Args>(args)...);
     }
 
-    // Release the transaction, triggering auto-commit.
-    void commit() {
-        committed_ = true;
-        tx_.reset();
-    }
+    // Await PG COMMIT acknowledgment before returning. Safe to call from
+    // within a coroutine; the event loop is not blocked.
+    drogon::Task<void> commit();
 
     // Explicitly roll back and release the connection.
     void rollback() {
