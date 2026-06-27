@@ -282,3 +282,145 @@ The schema went from "good MVP draft with two blockers" to "ready to write C++ a
 The remaining items in this review are real but small. Ship.
 
 — Reviewer: Claude (Opus 4.7)
+
+---
+
+## Product perspective (out-of-band, not a schema finding)
+
+Honest take after reading the schema end-to-end twice: this is a genuinely good project and the angle is sharper than "another self-hosted RAG."
+
+**The org-tree + access scope is the real moat.** Most self-hosted RAG (PrivateGPT, AnythingLLM, Open WebUI + plugins, Cognita, Verba, Quivr) treats permissions as an afterthought — usually flat "workspaces" or "collections." Enterprises don't work like that. HR can read everything in HR, only HR managers can read terminations, finance shares some things with HR-managers-only, contractors have time-boxed access. The closure-table org tree + `memberships` + `resource_grants` + the resolver writing scope IDs into the Qdrant payload is the *correct shape* for that problem. Most competitors would have to rewrite their data model to catch up.
+
+**The boring infrastructure is right.** Things that look unsexy but separate real products from weekend projects:
+
+- Composite FKs everywhere (`(company_id, id)`) — hard tenant boundary at the DB layer, not just in app code. Almost nobody does this; it's the #1 source of cross-tenant data leaks.
+- `document_versions` with one-active-per-doc + `wiki_page_versions` mirroring it — citation reproducibility is a regulated-industry requirement and most RAG tools just don't have it.
+- Reverse-index Sets for cache invalidation instead of `SCAN`/`KEYS` — actual operational thinking.
+- Soft deactivation with deny-list-by-construction so FK anchors stay valid.
+
+**Honest about being a wiki + RAG, not just RAG.** The "wiki pages with sources" model is more useful to enterprises than pure chat. Chat is ephemeral; wiki pages become institutional knowledge with provenance. Stronger value prop than "talk to your docs."
+
+**Where I'd worry:**
+
+- **Pricing/positioning vs Glean.** Glean owns the "enterprise search + RAG with permissions" mindshare at $40+/user/month. Wikore's natural pitch is "self-hosted, your data never leaves" — that wins regulated industries (legal, healthcare, defense, gov) but it's a narrow slice. Decide early: is this for the 10% who can't use Glean, or are you trying to compete on features for the 90% who could?
+- **Onboarding cost.** Correctness costs setup: an admin has to mirror their actual org structure. Most companies don't have that cleanly encoded anywhere. SCIM/Workday/HRIS connectors will be critical and are a chore to build well.
+- **Embedding/inference cost at scale.** Self-hosted means the customer eats the GPU bill. Pricing-by-document and pricing-by-seat both have failure modes; think it through before sales conversations.
+- **The "respect access rights" message has to be provable.** Eventually you'll need a real audit story ("show me every chat answer that ever included content from doc X") and a SOC2/ISO27001 path. The `audit_log` and version pinning give you the bones; selling it is a separate effort.
+
+**Bottom line:** the schema work I've reviewed is at the level of teams I'd take seriously. Not vaporware, not "OpenAI wrapper #847". The org-access-aware angle is a real wedge and the data model commits to it properly. If C++ retrieval execution matches the SQL discipline shown here, this is a credible enterprise play.
+
+---
+
+## Killer features worth deciding *now*, while still in DB phase
+
+Schema-level decisions are cheap now and expensive after launch. The eight items below are not all "must ship"; they are "must decide on or against, with eyes open, before the first paying customer's data lives in the system." Each is grounded in a concrete schema sketch so the choice is binary, not vibey.
+
+Ordering: roughly by ratio of (long-term leverage) to (cost to add now).
+
+### K1. Sensitivity labels (orthogonal to org-unit access)
+
+**What:** `documents.sensitivity_label TEXT` (enum: `public`, `internal`, `confidential`, `restricted`) plus `wiki_pages.sensitivity_label`.
+
+**Why DB-phase:** Sensitivity is *orthogonal* to org-unit scope. A document can be in `HR` (access-scoped) but labelled `confidential` (treat differently regardless of who can see it). Different sensitivity = different retention, different export rules, different DLP integration, different "can this appear in an answer to an external collaborator." Retrofitting means classifying every existing doc — painful at customer scale.
+
+**Cost:** one column + one CHECK + one partial index. Maybe 30 lines of SQL.
+
+**Killer feature it enables:** "Confidential-tier documents never appear in chat answers for guest users. Restricted-tier documents never appear in any answer; they only surface via direct browse + log every read." That's a compliance-grade story.
+
+### K2. Source tombstones (right-to-be-forgotten primitive)
+
+**What:** `documents.deleted_at TIMESTAMPTZ` + `document_chunks_tombstones (chunk_id, deleted_at, reason)` so deletion from upstream source is a recoverable, auditable event rather than a hard DELETE.
+
+**Why DB-phase:** GDPR Article 17 ("right to erasure") and SOX retention often pull in opposite directions. You need to delete from Qdrant immediately on source deletion, but you also need to prove you deleted it (audit log keeps row count and content hash, not content). The contract has to exist in the schema or every customer asks for it differently.
+
+**Cost:** one column on `documents`, one tombstone table, one nightly sweep job spec. Probably 80 lines.
+
+**Killer feature it enables:** "Erasure request handled in <24h with cryptographic proof of removal from vector index AND a tamper-evident audit row." Sellable to legal/compliance.
+
+### K3. Document review cycles / staleness signal
+
+**What:** `documents.review_due_at TIMESTAMPTZ` + `documents.last_reviewed_at TIMESTAMPTZ` + `documents.review_owner_user_id`. Set on upload (e.g. policy = 12 months, procedure = 6 months).
+
+**Why DB-phase:** A core enterprise pain is "the wiki says X but the policy was updated three years ago and nobody knows which is current." Without a `review_due_at` indexed column, you can't surface "27 documents are overdue for review" on the admin dashboard, and you can't downweight stale documents in retrieval.
+
+**Cost:** three columns, one index on `(company_id, review_due_at) WHERE review_due_at IS NOT NULL`. Maybe 20 lines.
+
+**Killer feature it enables:** "Stale-content warning banner on wiki pages whose sources are overdue for review" + retrieval-time freshness scoring. This is the difference between a wiki that decays and one that stays alive.
+
+### K4. Curated answer cards / hard routes
+
+**What:** `curated_answers (id, company_id, trigger_phrases TEXT[], answer_markdown, attached_document_version_ids UUID[], priority INT, valid_from, valid_until, owner_user_id)`.
+
+**Why DB-phase:** Hard routes (admin says "if anyone asks about parental leave, ALWAYS show this card first, then RAG") are one of Glean's killer features. They side-step the model's variance for high-stakes questions (legal, HR, compliance). Without a table, every admin tries to encode them as fake "FAQ" wiki pages and the retrieval layer can't distinguish them.
+
+**Cost:** one table, one GIN index on `trigger_phrases`, a small embedding column for semantic match. Maybe 60 lines.
+
+**Killer feature it enables:** "For these 40 questions, the answer is exactly this — and it's owned by the legal team, not the AI." Massive trust win.
+
+### K5. Section / heading hierarchy preserved through chunking
+
+**What:** `document_sections (id, company_id, document_version_id, parent_section_id, ordinal, heading_path TEXT[], depth)` referenced by `document_chunks.section_id`.
+
+**Why DB-phase:** Most RAGs lose hierarchy after chunking — they index a 200-page policy as 800 disconnected chunks. With a section tree, the retriever can:
+- cite "§3.2.1" instead of "page 47"
+- expand "give me parent + this chunk + sibling chunks" for high-importance hits
+- return navigable in-context references in chat ("see also §3.2.2")
+
+Retrofitting requires re-running ingest on the entire corpus — for a customer with 50k documents that's days of GPU time and a coordination headache.
+
+**Cost:** one table, one FK from chunks, ingest pipeline must populate it. The schema part is ~40 lines; the ingest work is real.
+
+**Killer feature it enables:** legal/policy customers in particular will not buy a RAG that cites "chunk 247 of doc_3491.pdf". Section-aware citations are table stakes there.
+
+### K6. Chunk-level + answer-level feedback
+
+**What:** `chat_turn_feedback (id, company_id, chat_turn_id, user_id, signal SMALLINT [-1|+1], reason TEXT, created_at)` and `chunk_quality_signals (chunk_id, positive_count, negative_count, last_signal_at)` — the second updated by a trigger or batch job from the first.
+
+**Why DB-phase:** Without per-chunk signal, you cannot tune retrieval based on real usage. Every quality regression after launch is invisible. Adding feedback after the fact loses 6-12 months of training-signal-shaped data. Costs nothing now; impossible to recover later.
+
+**Cost:** two tables, two indexes, one BEFORE INSERT trigger. ~50 lines.
+
+**Killer feature it enables:** "retrieval quality improves over time without admin work" + an admin dashboard of "lowest-scoring chunks → flagged for review."
+
+### K7. Eval harness schema (regression-proof retrieval changes)
+
+**What:** `eval_runs (id, company_id, run_label, git_sha, started_at, finished_at)`, `eval_questions (id, company_id, question_text, gold_chunk_ids UUID[], gold_answer_markdown)`, `eval_grades (run_id, question_id, retrieved_chunk_ids, score, rubric_breakdown JSONB)`.
+
+**Why DB-phase:** Every retrieval or prompt change after launch needs to be benchmarked against a baseline. Without persistent eval data in the DB, you're either re-running JSON-on-disk evals (Astraea's pain point we just discussed) or you're shipping changes blind. Having the schema means the harness lives next to the prod data, can use real chunk_ids, and admins can see "retrieval improved on legal queries by 8% in v2.3.1" in the UI.
+
+**Cost:** three small tables. ~60 lines.
+
+**Killer feature it enables:** trustworthy A/B testing of retrievers, rerankers, and prompt changes. A safety story to enterprise buyers: "every change goes through eval before it touches your tenant."
+
+### K8. Shared chat with frozen access scope
+
+**What:** `shared_chat_threads (id, company_id, chat_id, shared_by_user_id, shared_at, access_scope_snapshot UUID[], revoked_at)`. The snapshot is the *original* asker's resolved scope at the moment of sharing.
+
+**Why DB-phase:** Without the snapshot, "Alice shares an HR answer with Bob" leaks: either Bob sees content Alice could see but Bob cannot (security bug), or the chat re-runs retrieval under Bob's scope and the cited chunks disappear (broken UX). With the snapshot, the share is auditable, revocable, and self-consistent. Retrofitting is risky because old shares predate the snapshot.
+
+**Cost:** one table, one composite index. ~30 lines.
+
+**Killer feature it enables:** safe collaboration on AI answers — a core enterprise workflow that pure-RAG products do badly.
+
+---
+
+### What I would *not* add now
+
+For completeness, things tempting at this stage that I'd actively defer:
+
+- **PostgreSQL Row Level Security (RLS).** Already discussed in F10. Application-layer access resolution + composite FKs already give the boundary; RLS adds operational complexity (every connection needs role context) without changing the threat model meaningfully. Add only if a specific customer demands it.
+- **Plugin SDK / app marketplace.** Wait until you have 3+ real integrations and can extract the shape from them, not before.
+- **Multi-region / cross-region replication tables.** Decide *whether* to be multi-region first; the schema work is small and following the answer.
+- **A/B experiment bucketing on `users`.** Tempting but premature; eval harness (K7) covers offline. Online buckets can land later as one column.
+
+### Decision request
+
+Of K1–K8, the ones I'd want a decision on **before C++ retrieval work begins**, because they affect chunk/document/payload shape:
+
+- **K1 sensitivity_label** — touches Qdrant payload (retrieval filter) and ingest classifier hook.
+- **K2 tombstones** — touches the Qdrant sync job contract.
+- **K5 section hierarchy** — touches the ingest pipeline deeply; cheapest to bake in from day one.
+
+The other five (K3, K4, K6, K7, K8) can be added in a later migration without re-ingesting anything, so they can be deferred to post-MVP without regret.
+
+— Reviewer: Claude (Opus 4.7)
