@@ -275,6 +275,14 @@ CREATE TABLE resource_grants (
 CREATE INDEX resource_grants_resource_idx  ON resource_grants (company_id, resource_type, resource_id);
 CREATE INDEX resource_grants_principal_idx ON resource_grants (company_id, principal_type, principal_id);
 CREATE INDEX resource_grants_company_idx   ON resource_grants (company_id);
+-- Access resolver hot path: fetch all active grants for a principal and compute
+-- MIN(expires_at) to determine lr:eff TTL. expires_at trailing so the planner
+-- can filter or sort by it without a separate scan.
+CREATE INDEX resource_grants_principal_active_idx
+    ON resource_grants (company_id, principal_type, principal_id, expires_at);
+-- Resync worker hot path: find all grants on a resource to recompute access_scope_ids.
+CREATE INDEX resource_grants_resource_active_idx
+    ON resource_grants (company_id, resource_type, resource_id, expires_at);
 
 CREATE OR REPLACE FUNCTION validate_resource_grants_actors()
 RETURNS TRIGGER LANGUAGE plpgsql AS $$
