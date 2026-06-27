@@ -132,7 +132,7 @@ CREATE TABLE org_unit_closure (
     ancestor_id   UUID NOT NULL,
     descendant_id UUID NOT NULL,
     depth         INT  NOT NULL CHECK (depth >= 0),
-    PRIMARY KEY (ancestor_id, descendant_id),
+    PRIMARY KEY (company_id, ancestor_id, descendant_id),
     CONSTRAINT closure_ancestor_same_company_fk
         FOREIGN KEY (company_id, ancestor_id)
         REFERENCES org_units(company_id, id) ON DELETE CASCADE,
