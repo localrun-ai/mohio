@@ -35,6 +35,7 @@ WIKI='b100a001-0000-0000-0000-000000000000'     # wiki page
 WVER='b100a002-0000-0000-0000-000000000000'     # wiki page version 1
 VER4='7e100004-0000-0000-0000-000000000000'     # version 4 (for promotion tests)
 OU_ENG='0a100002-0000-0000-0000-000000000000'   # Engineering department (Acme child, for move test)
+OUTBOX1='0b0x0001-0000-0000-0000-000000000001'  # outbox event 1
 SEC1='5ec10001-0000-0000-0000-000000000000'     # document_section (for K5 test)
 
 # --------------------------------------------------------------------------
@@ -61,7 +62,7 @@ cat db/migrations/V001__orgs.sql \
     db/migrations/V012__move_org_unit.sql \
     db/migrations/V013__reactivate_user.sql \
     db/migrations/V014__sensitivity_sections_tombstones.sql \
-    db/migrations/V013__reactivate_user.sql \
+    db/migrations/V015__outbox.sql \
   | docker exec -i "$CONTAINER" psql -U postgres -v ON_ERROR_STOP=1 -q
 echo "-- Migrations loaded."
 echo ""
@@ -400,6 +401,45 @@ COUNT=$(sql "SELECT COUNT(*) FROM document_chunk_tombstones
 [ "$COUNT" -eq 1 ] \
   && pass 25 "document_chunk_tombstone inserted and queryable" \
   || fail 25 "document_chunk_tombstone not found (got count $COUNT)"
+
+# --------------------------------------------------------------------------
+# 26. V015: outbox_events table exists and accepts an insert
+# --------------------------------------------------------------------------
+sql "INSERT INTO outbox_events
+       (id, company_id, aggregate_id, job_type, payload, idempotency_key)
+     VALUES ('$OUTBOX1', '$CO_ACME', '$DOC', 'qdrant_resync_version_lifecycle',
+             '{\"document_id\": \"$DOC\"}', 'smoke:promote:$DOC:$VER4');" > /dev/null
+
+COUNT=$(sql "SELECT COUNT(*) FROM outbox_events WHERE id='$OUTBOX1';")
+[ "$COUNT" -eq 1 ] \
+  && pass 26 "outbox_events insert accepted" \
+  || fail 26 "outbox_events insert failed (count=$COUNT)"
+
+# --------------------------------------------------------------------------
+# 27. V015: duplicate idempotency key is rejected
+# --------------------------------------------------------------------------
+ERR=$(sql "INSERT INTO outbox_events
+             (company_id, aggregate_id, job_type, payload, idempotency_key)
+           VALUES ('$CO_ACME', '$DOC', 'qdrant_resync_version_lifecycle',
+                   '{}', 'smoke:promote:$DOC:$VER4');" 2>&1 || true)
+echo "$ERR" | grep -qi "unique\|duplicate" \
+  && pass 27 "duplicate idempotency key rejected by unique constraint" \
+  || fail 27 "duplicate idempotency key was not rejected: $ERR"
+
+# --------------------------------------------------------------------------
+# 28. V015: ON CONFLICT DO NOTHING silently ignores duplicate
+# --------------------------------------------------------------------------
+sql "INSERT INTO outbox_events
+       (company_id, aggregate_id, job_type, payload, idempotency_key)
+     VALUES ('$CO_ACME', '$DOC', 'qdrant_resync_version_lifecycle',
+             '{}', 'smoke:promote:$DOC:$VER4')
+     ON CONFLICT (company_id, job_type, idempotency_key) DO NOTHING;" > /dev/null
+
+COUNT=$(sql "SELECT COUNT(*) FROM outbox_events
+             WHERE company_id='$CO_ACME' AND idempotency_key='smoke:promote:$DOC:$VER4';")
+[ "$COUNT" -eq 1 ] \
+  && pass 28 "ON CONFLICT DO NOTHING: still exactly 1 row after duplicate insert" \
+  || fail 28 "unexpected row count after ON CONFLICT DO NOTHING (got $COUNT)"
 
 # --------------------------------------------------------------------------
 # Summary
