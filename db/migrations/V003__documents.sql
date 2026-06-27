@@ -198,7 +198,8 @@ CREATE TABLE document_chunks (
     company_id          UUID        NOT NULL,
     document_version_id UUID        NOT NULL,
     chunk_index         INT         NOT NULL,
-    content_hash        TEXT        NOT NULL,         -- SHA-256 of chunk text
+    content             TEXT        NOT NULL,         -- exact chunk text passed to the LLM
+    content_hash        TEXT        NOT NULL,         -- SHA-256 of content; used for dedup and diff
     access_scope_ids    UUID[]      NOT NULL DEFAULT '{}',
     created_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
     UNIQUE (document_version_id, chunk_index),
