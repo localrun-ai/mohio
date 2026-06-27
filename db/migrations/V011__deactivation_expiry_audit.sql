@@ -44,6 +44,26 @@ CREATE INDEX users_active_email_idx
 --   effective cache TTL = min(default 5 min,
 --                             next contributing resource_grant expiry,
 --                             next contributing membership expiry)
+--
+-- Re-granting expired memberships:
+--   The unique index memberships_user_org_uidx (created in V002) enforces
+--   one row per (company, user, org_unit) regardless of expiry. So re-granting
+--   an expired membership is NOT a plain INSERT - it would fail with unique
+--   violation against the still-present expired row. The supported flow:
+--
+--     UPDATE memberships
+--     SET    expires_at = $new_expiry,
+--            granted_at = now(),
+--            granted_by = $admin_id
+--     WHERE  company_id  = $cid
+--       AND  user_id     = $uid
+--       AND  org_unit_id = $ou_id
+--       AND  (expires_at IS NULL OR expires_at <= now());
+--
+--   Application access-resolution queries that want only currently-valid
+--   memberships must filter:  (expires_at IS NULL OR expires_at > now()).
+--   We do not add a partial unique index gated on expires_at > now() because
+--   now() is not immutable and PostgreSQL rejects it in index predicates.
 -- ---------------------------------------------------------------------------
 
 ALTER TABLE memberships
@@ -81,14 +101,15 @@ CREATE INDEX audit_log_company_action_idx
 --
 -- rag_sources is the audit trail of LLM evidence; silent type regressions
 -- (object instead of array, scalar, etc.) corrupt citation reproducibility.
+-- Both columns are NOT NULL DEFAULT '[]' (V005), so no IS NULL branch needed.
 -- The constraint is intentionally lightweight (typeof check only) so it
 -- does not prevent valid array shapes from evolving over time.
 -- ---------------------------------------------------------------------------
 
 ALTER TABLE chat_turns
     ADD CONSTRAINT chat_turns_rag_sources_array_chk
-    CHECK (rag_sources IS NULL OR jsonb_typeof(rag_sources) = 'array');
+    CHECK (jsonb_typeof(rag_sources) = 'array');
 
 ALTER TABLE chat_turns
     ADD CONSTRAINT chat_turns_tool_calls_array_chk
-    CHECK (tool_calls IS NULL OR jsonb_typeof(tool_calls) = 'array');
+    CHECK (jsonb_typeof(tool_calls) = 'array');

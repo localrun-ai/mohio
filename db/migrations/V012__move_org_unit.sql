@@ -21,6 +21,20 @@
 --             produce the new ancestor-to-subtree links.
 --     Step 3: Update parent_id under the session flag.
 --   Internal links (N -> N's descendants) are untouched in both steps.
+--
+-- Concurrency contract:
+--   This function locks only the moved node (FOR UPDATE) and the new parent
+--   (FOR UPDATE). It does NOT lock the descendants of the moved subtree.
+--   If a concurrent transaction DELETEs a descendant of the moved node mid-move,
+--   the Step 2 INSERT references a descendant_id that no longer exists and the
+--   transaction aborts with a foreign-key violation (closure_descendant_same_company_fk).
+--   No data corruption occurs - the move is atomic - but callers MUST be
+--   prepared to retry on FK violation. If retry-loops are unacceptable for the
+--   caller, add LOCK TABLE org_units IN SHARE MODE at the top of this function;
+--   that blocks all org_units writes for the company during the move.
+--   Two concurrent moves of intersecting subtrees (e.g. move A under B while
+--   moving B under A) will deadlock and PostgreSQL will abort one - the caller
+--   sees an abort, not corruption.
 
 -- ---------------------------------------------------------------------------
 -- Updated parent-guard trigger
@@ -90,6 +104,16 @@ BEGIN
     -- Reject moving under self.
     IF p_node_id = p_new_parent_id THEN
         RAISE EXCEPTION 'org_unit cannot be moved under itself (%)', p_node_id;
+    END IF;
+
+    -- No-op early exit: if the node is already a direct child of the requested
+    -- parent, skip the closure rebuild entirely. Without this guard the
+    -- function would delete and re-insert the exact same closure rows -
+    -- correct but wasteful, and produces noisy audit log entries for nothing.
+    IF (SELECT parent_id FROM org_units
+        WHERE company_id = p_company_id AND id = p_node_id) = p_new_parent_id
+    THEN
+        RETURN;
     END IF;
 
     -- Reject cycle: new parent must not be a descendant of the node.

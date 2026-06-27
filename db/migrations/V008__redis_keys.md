@@ -17,8 +17,8 @@ read when querying a given org_unit) must be fast and consistent.
 | Key | Value | TTL | Notes |
 |-----|-------|-----|-------|
 | `lr:eff:{company_id}:{user_id}:{org_unit_id}` | JSON array of UUID strings | see below | Resolved access_scope_ids for this user+scope; drives Qdrant filter |
-| `lr:eff:keys:user:{company_id}:{user_id}` | Redis Set of `lr:eff:*` key names | 30-60 min | Reverse index: tracks all cached eff keys for this user in this company |
-| `lr:eff:keys:company:{company_id}` | Redis Set of `lr:eff:*` key names | 30-60 min | Reverse index: tracks all cached eff keys for this company (for company-wide invalidation) |
+| `lr:eff:keys:user:{company_id}:{user_id}` | Redis Set of `lr:eff:*` key names | 30 min (refreshed on every SADD) | Reverse index: tracks all cached eff keys for this user in this company |
+| `lr:eff:keys:company:{company_id}` | Redis Set of `lr:eff:*` key names | 30 min (refreshed on every SADD) | Reverse index: tracks all cached eff keys for this company (for company-wide invalidation) |
 | `lr:user:{user_id}` | JSON Identity record | 5 min | Profile + is_admin; invalidate on user update |
 | `lr:tree:{company_id}:{org_unit_id}` | JSON subtree | 2 min | Admin UI tree; invalidate on any mutation under this node |
 
@@ -31,13 +31,23 @@ entries) rather than O(total keyspace).
 
 **On every `lr:eff` cache write:**
 ```
-SET lr:eff:{cid}:{uid}:{oid} <value> EX <ttl>
-SADD lr:eff:keys:user:{cid}:{uid} "lr:eff:{cid}:{uid}:{oid}"
-SADD lr:eff:keys:company:{cid} "lr:eff:{cid}:{uid}:{oid}"
+SET    lr:eff:{cid}:{uid}:{oid} <value> EX <ttl>
+SADD   lr:eff:keys:user:{cid}:{uid}    "lr:eff:{cid}:{uid}:{oid}"
+EXPIRE lr:eff:keys:user:{cid}:{uid}    1800
+SADD   lr:eff:keys:company:{cid}       "lr:eff:{cid}:{uid}:{oid}"
+EXPIRE lr:eff:keys:company:{cid}       1800
 ```
-Set TTL for reverse-index keys should be longer than the eff TTL (30-60 min vs 5 min)
-so the Set outlives its members. Stale members (keys already expired) are harmless:
-DEL on a non-existent key is a no-op.
+Set TTL for reverse-index keys must be longer than the eff TTL (30 min vs 5 min)
+so the Set outlives its members. The `EXPIRE` MUST be reissued on every `SADD`:
+`SADD` does not refresh TTL, so without the explicit `EXPIRE` an active user's
+reverse-index Set would die at the 30-min mark even though their eff entries
+keep getting rewritten every 5 min - subsequent invalidations would then see
+an empty Set and silently skip the user's stale eff entries until those
+entries expire naturally. Implementations SHOULD batch the five commands
+above into a single `MULTI/EXEC` or Lua script for atomicity (otherwise a
+crash between `SADD` and `EXPIRE` leaves a Set with no TTL, leaking memory).
+Stale members (keys already expired) are harmless: DEL on a non-existent
+key is a no-op.
 
 **On invalidation (e.g., membership change for user U in company C):**
 ```

@@ -60,16 +60,22 @@ BEGIN
     END IF;
 
     -- Verify the target version exists, belongs to this document, and is ready.
+    -- archived versions are terminal: explicitly reject promotion back from
+    -- archived so an "archived" lifecycle change cannot be silently undone
+    -- by a stray promote call. If rollback to an archived version is ever
+    -- needed, introduce an explicit unarchive_document_version() function
+    -- so the intent is auditable in code review.
     PERFORM 1
     FROM document_versions
     WHERE company_id    = p_company_id
       AND document_id   = p_document_id
       AND id            = p_version_id
-      AND ingest_status = 'done';
+      AND ingest_status = 'done'
+      AND lifecycle_status <> 'archived';
 
     IF NOT FOUND THEN
         RAISE EXCEPTION 'Version % is not promotable for document % '
-            '(not found, wrong document, or ingest not done)',
+            '(not found, wrong document, ingest not done, or archived)',
             p_version_id, p_document_id;
     END IF;
 

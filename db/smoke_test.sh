@@ -58,6 +58,7 @@ cat db/migrations/V001__orgs.sql \
     db/migrations/V010__promotion_functions.sql \
     db/migrations/V011__deactivation_expiry_audit.sql \
     db/migrations/V012__move_org_unit.sql \
+    db/migrations/V013__reactivate_user.sql \
   | docker exec -i "$CONTAINER" psql -U postgres -v ON_ERROR_STOP=1 -q
 echo "-- Migrations loaded."
 echo ""
@@ -293,6 +294,72 @@ ROWS=$(sql "SELECT COUNT(*) FROM org_unit_closure
 [ "$ROWS" -eq 3 ] \
   && pass 17 "moved org_unit closure correct: 3 ancestor rows (self + OU_ENG + root)" \
   || fail 17 "expected 3 ancestor rows after move, got $ROWS"
+
+# --------------------------------------------------------------------------
+# 18. move_org_unit() no-op (already direct child) returns without error,
+#     leaves closure unchanged (Opus V2-N6 early-exit guard)
+# --------------------------------------------------------------------------
+ERR=$(sql "SELECT move_org_unit('$CO_ACME', '$OU_HR', '$OU_ENG');" 2>&1 || true)
+ROWS=$(sql "SELECT COUNT(*) FROM org_unit_closure
+            WHERE company_id='$CO_ACME' AND descendant_id='$OU_HR';")
+if echo "$ERR" | grep -qi "error\|exception"; then
+    fail 18 "no-op move_org_unit() raised: $ERR"
+elif [ "$ROWS" -eq 3 ]; then
+    pass 18 "no-op move_org_unit() returns clean and leaves closure intact"
+else
+    fail 18 "no-op move corrupted closure (expected 3 rows, got $ROWS)"
+fi
+
+# --------------------------------------------------------------------------
+# 19. promote_document_version() refuses to revive an archived version
+#     (Opus V2-N5 archived-is-terminal guard)
+# --------------------------------------------------------------------------
+# VER3 was deprecated by test 12's promotion. Archive it, then try to promote.
+sql "UPDATE document_versions SET lifecycle_status='archived'
+     WHERE id='$VER3';" > /dev/null
+ERR=$(sql "SELECT promote_document_version('$CO_ACME', '$DOC', '$VER3');" 2>&1 || true)
+echo "$ERR" | grep -qi "not promotable\|archived" \
+  && pass 19 "promote_document_version() rejects archived version" \
+  || fail 19 "archived version was promoted (expected rejection, got: $ERR)"
+
+# --------------------------------------------------------------------------
+# 20-22. reactivate_user() tests (V013, Opus V2-N3)
+# --------------------------------------------------------------------------
+# Soft-deactivate Alice, then revive her via reactivate_user() using her
+# original (issuer, sub). The function must clear deactivated_at and
+# refresh PII fields rather than fail on the unique constraint.
+sql "UPDATE users SET deactivated_at=now() WHERE id='$U_ALICE';" > /dev/null
+
+# --------------------------------------------------------------------------
+# 20. reactivate_user() revives Alice, returns her existing id, clears deactivated_at
+# --------------------------------------------------------------------------
+RID=$(sql "SELECT reactivate_user('$CO_ACME', 'local', 'sub1',
+                                  'alice+new@acme.com', 'Alice Reactivated', NULL);")
+[ "$RID" = "$U_ALICE" ] \
+  && pass 20 "reactivate_user() returned Alice's existing id" \
+  || fail 20 "reactivate_user() returned wrong id (expected $U_ALICE, got $RID)"
+
+# --------------------------------------------------------------------------
+# 21. After reactivation, deactivated_at is NULL and PII fields refreshed
+# --------------------------------------------------------------------------
+ROW=$(sql "SELECT deactivated_at IS NULL AND email='alice+new@acme.com'
+                  AND display_name='Alice Reactivated'
+           FROM users WHERE id='$U_ALICE';")
+[ "$ROW" = "t" ] \
+  && pass 21 "reactivate_user() cleared deactivated_at and refreshed PII" \
+  || fail 21 "reactivate_user() did not properly revive user (got $ROW)"
+
+# --------------------------------------------------------------------------
+# 22. reactivate_user() for unknown (issuer, sub) inserts a new user row
+# --------------------------------------------------------------------------
+NID=$(sql "SELECT reactivate_user('$CO_ACME', 'local', 'sub_new',
+                                  'newcomer@acme.com', 'New Comer', NULL);")
+COUNT=$(sql "SELECT COUNT(*) FROM users
+             WHERE id='$NID' AND company_id='$CO_ACME'
+               AND external_sub='sub_new' AND deactivated_at IS NULL;")
+[ "$COUNT" -eq 1 ] \
+  && pass 22 "reactivate_user() inserts new user when (issuer,sub) unknown" \
+  || fail 22 "reactivate_user() did not create new user row (got count $COUNT)"
 
 # --------------------------------------------------------------------------
 # Summary
