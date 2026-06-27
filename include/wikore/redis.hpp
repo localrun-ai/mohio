@@ -2,9 +2,9 @@
 #include <string>
 #include <optional>
 #include <chrono>
-#include "mohio/config.hpp"
+#include "wikore/config.hpp"
 
-namespace mohio {
+namespace wikore {
 
 // Thread-safe synchronous Redis client backed by a fixed connection pool.
 // Silently degrades (nullopt / no-op) when Redis is unavailable or not
@@ -28,4 +28,4 @@ struct Redis {
     static void del(std::string_view key);
 };
 
-} // namespace mohio
+} // namespace wikore

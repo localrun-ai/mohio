@@ -1,4 +1,4 @@
-#include "mohio/redis.hpp"
+#include "wikore/redis.hpp"
 #include <hiredis/hiredis.h>
 #include <spdlog/spdlog.h>
 #include <atomic>
@@ -8,7 +8,7 @@
 #include <string>
 #include <vector>
 
-namespace mohio {
+namespace wikore {
 
 namespace {
 
@@ -176,4 +176,4 @@ void Redis::del(std::string_view key) {
     if (r) freeReplyObject(r);
 }
 
-} // namespace mohio
+} // namespace wikore

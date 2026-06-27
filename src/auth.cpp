@@ -16,10 +16,10 @@
 //
 // Identity is serialized as JSON for Redis storage via glaze auto-reflection.
 
-#include "mohio/auth.hpp"
-#include "mohio/config.hpp"
-#include "mohio/redis.hpp"
-#include "mohio/db.hpp"
+#include "wikore/auth.hpp"
+#include "wikore/config.hpp"
+#include "wikore/redis.hpp"
+#include "wikore/db.hpp"
 
 #include <jwt-cpp/jwt.h>
 #include <glaze/glaze.hpp>
@@ -51,17 +51,17 @@
 #include <thread>
 #include <vector>
 
-namespace mohio {
+namespace wikore {
 
 // ---------------------------------------------------------------------------
 // glaze meta: must be in the glz namespace, defined after the type
 // ---------------------------------------------------------------------------
 
-} // namespace mohio
+} // namespace wikore
 
 template<>
-struct glz::meta<mohio::Identity> {
-    using T = mohio::Identity;
+struct glz::meta<wikore::Identity> {
+    using T = wikore::Identity;
     static constexpr auto value = glz::object(
         "user_id",      &T::user_id,
         "email",        &T::email,
@@ -70,7 +70,7 @@ struct glz::meta<mohio::Identity> {
     );
 };
 
-namespace mohio {
+namespace wikore {
 
 // ---------------------------------------------------------------------------
 // Module-level state
@@ -385,11 +385,11 @@ std::optional<Identity> validate_jwt(std::string_view token) {
             id.display_name = decoded.get_payload_claim("preferred_username").as_string();
 
         // Keycloak puts roles in realm_access.roles[]. Serialize to string and
-        // search for "admin" / "mohio-admin" - avoids a full picojson traversal.
+        // search for "admin" / "wikore-admin" - avoids a full picojson traversal.
         if (decoded.has_payload_claim("realm_access")) {
             auto ra_str = decoded.get_payload_claim("realm_access").to_json().serialize();
             id.is_admin = ra_str.find("\"admin\"")       != std::string::npos ||
-                          ra_str.find("\"mohio-admin\"") != std::string::npos;
+                          ra_str.find("\"wikore-admin\"") != std::string::npos;
         }
 
         // JTI revocation: presence of the key means revoked.
@@ -560,4 +560,4 @@ void AdminFilter::doFilter(const drogon::HttpRequestPtr& req,
     }
 }
 
-} // namespace mohio
+} // namespace wikore

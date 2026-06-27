@@ -1,8 +1,8 @@
 #pragma once
 #include <drogon/orm/DbClient.h>
-#include "mohio/config.hpp"
+#include "wikore/config.hpp"
 
-namespace mohio {
+namespace wikore {
 
 // Thin accessor for Drogon's built-in async PostgreSQL connection pool.
 // Call Db::init() once in main() before drogon::app().run().
@@ -12,4 +12,4 @@ struct Db {
     static drogon::orm::DbClientPtr get();
 };
 
-} // namespace mohio
+} // namespace wikore

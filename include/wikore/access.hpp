@@ -4,7 +4,7 @@
 #include <optional>
 #include <drogon/drogon.h>
 
-namespace mohio {
+namespace wikore {
 
 // Roles that can appear in memberships and api_keys.
 enum class Role { viewer, editor, admin };
@@ -88,4 +88,4 @@ private:
                                         std::string_view org_unit_id);
 };
 
-} // namespace mohio
+} // namespace wikore

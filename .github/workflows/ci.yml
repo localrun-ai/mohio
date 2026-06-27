@@ -1,0 +1,180 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  # --------------------------------------------------------------------------
+  # Schema smoke tests: load V001-V015 into a real Postgres 17 container
+  # and verify all 28 behavioral checks pass.
+  # Fast (<2 min). No C++ compilation required.
+  # --------------------------------------------------------------------------
+  schema:
+    name: Schema smoke tests
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run smoke tests
+        run: bash db/smoke_test.sh
+
+  # --------------------------------------------------------------------------
+  # C++ build and unit tests
+  # Installs dependencies via apt, builds all four binaries and the test
+  # binary, runs the non-DB Catch2 tests.  Integration tests skip cleanly
+  # when DATABASE_URL is absent so we run the full test suite here.
+  # Built artifacts are uploaded so the integration job can skip recompilation.
+  # --------------------------------------------------------------------------
+  build:
+    name: Build + unit tests
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            cmake ninja-build ccache \
+            libspdlog-dev \
+            libssl-dev \
+            libhiredis-dev \
+            libjsoncpp-dev \
+            libpq-dev \
+            uuid-dev \
+            git
+
+      - name: Cache ccache objects
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ccache
+          key: ccache-${{ runner.os }}-${{ hashFiles('CMakeLists.txt', 'cmake/**') }}
+          restore-keys: ccache-${{ runner.os }}-
+
+      - name: Cache CPM packages
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/CPM
+            build-ci/_deps
+          key: cpm-${{ runner.os }}-${{ hashFiles('cmake/dependencies.cmake', 'cmake/CPM.cmake') }}
+          restore-keys: cpm-${{ runner.os }}-
+
+      - name: Configure
+        env:
+          CCACHE_BASEDIR: ${{ github.workspace }}
+          CCACHE_DIR: ~/.cache/ccache
+          CCACHE_COMPRESS: "true"
+          CCACHE_COMPRESSLEVEL: "6"
+        run: |
+          cmake -B build-ci -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DWIKORE_NATIVE_OPTS=OFF \
+            -DWIKORE_BUILD_TESTS=ON \
+            -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
+            -DCMAKE_C_COMPILER_LAUNCHER=ccache
+
+      - name: Build
+        env:
+          CCACHE_BASEDIR: ${{ github.workspace }}
+          CCACHE_DIR: ~/.cache/ccache
+        run: |
+          cmake --build build-ci --parallel
+          ccache -s
+
+      - name: Unit tests (integration tests skip without DATABASE_URL)
+        run: ctest --test-dir build-ci --output-on-failure
+
+      - name: Upload test binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: wikore-tests
+          path: build-ci/tests/wikore_tests
+          retention-days: 1
+
+  # --------------------------------------------------------------------------
+  # Integration tests: C++ tests that require a live Postgres + Redis.
+  # Downloads the test binary from the build job instead of recompiling.
+  # --------------------------------------------------------------------------
+  integration:
+    name: Integration tests
+    runs-on: ubuntu-24.04
+    needs: build
+
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_USER: wikore
+          POSTGRES_PASSWORD: wikore
+          POSTGRES_DB: wikore
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U wikore"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+      redis:
+        image: redis:7
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install runtime dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            libssl-dev \
+            libhiredis-dev \
+            libjsoncpp-dev \
+            libpq-dev \
+            libspdlog-dev \
+            uuid-dev \
+            postgresql-client
+
+      - name: Download test binary
+        uses: actions/download-artifact@v4
+        with:
+          name: wikore-tests
+          path: build-ci/tests
+
+      - name: Make binary executable
+        run: chmod +x build-ci/tests/wikore_tests
+
+      - name: Load schema migrations
+        env:
+          PGPASSWORD: wikore
+        run: |
+          cat db/migrations/V001__orgs.sql \
+              db/migrations/V002__users_and_auth.sql \
+              db/migrations/V003__documents.sql \
+              db/migrations/V004__wiki.sql \
+              db/migrations/V005__chat.sql \
+              db/migrations/V006__integrations.sql \
+              db/migrations/V007__audit.sql \
+              db/migrations/V009__grant_validation.sql \
+              db/migrations/V010__promotion_functions.sql \
+              db/migrations/V011__deactivation_expiry_audit.sql \
+              db/migrations/V012__move_org_unit.sql \
+              db/migrations/V013__reactivate_user.sql \
+              db/migrations/V014__sensitivity_sections_tombstones.sql \
+              db/migrations/V015__outbox.sql \
+            | psql -h localhost -U wikore -d wikore -v ON_ERROR_STOP=1 -q
+
+      - name: Integration tests
+        env:
+          DATABASE_URL: postgresql://wikore:wikore@localhost:5432/wikore
+          REDIS_URL: redis://localhost:6379/0
+        run: |
+          build-ci/tests/wikore_tests "[integration]"

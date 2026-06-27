@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.28)
-project(mohio CXX)
+project(wikore CXX)
 
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -19,8 +19,8 @@ endif()
 # ---------------------------------------------------------------------------
 add_compile_options($<$<CONFIG:Release>:-O3>)
 
-option(MOHIO_NATIVE_OPTS "Apply -march=native and -flto=thin in Release" ON)
-if(MOHIO_NATIVE_OPTS)
+option(WIKORE_NATIVE_OPTS "Apply -march=native and -flto=thin in Release" ON)
+if(WIKORE_NATIVE_OPTS)
     add_compile_options($<$<CONFIG:Release>:-flto=thin>)
     add_compile_options($<$<CONFIG:Release>:-march=native>)
     add_compile_options($<$<CONFIG:Release>:-fno-plt>)
@@ -45,8 +45,8 @@ include(CheckCXXCompilerFlag)
 check_cxx_compiler_flag(-Wno-missing-designated-field-initializers
     _WNO_MISSING_DESIGNATED_SUPPORTED)
 
-add_library(mohio_warnings INTERFACE)
-target_compile_options(mohio_warnings INTERFACE
+add_library(wikore_warnings INTERFACE)
+target_compile_options(wikore_warnings INTERFACE
     -Wall -Wextra -Wpedantic
     -Wno-missing-field-initializers
     $<$<BOOL:${_WNO_MISSING_DESIGNATED_SUPPORTED}>:-Wno-missing-designated-field-initializers>
@@ -70,42 +70,35 @@ endif()
 # ---------------------------------------------------------------------------
 # CPM packages
 # ---------------------------------------------------------------------------
-include(cmake/CPM.cmake)
+include(cmake/dependencies.cmake)
 
-CPMAddPackage(
-    NAME drogon
-    GITHUB_REPOSITORY drogonframework/drogon
-    GIT_TAG v1.9.7
-    OPTIONS
-        "BUILD_EXAMPLES OFF"
-        "BUILD_CTL OFF"
-        "BUILD_TESTING OFF"
-        "BUILD_DROGON_SHARED OFF"
+# ---------------------------------------------------------------------------
+# wikore_infra: foundation adapters (postgres UoW, error mapper)
+# ---------------------------------------------------------------------------
+add_library(wikore_infra STATIC
+    src/adapters/postgres/unit_of_work.cpp
+    src/adapters/postgres/error_mapper.cpp
 )
-if(drogon_ADDED)
-    set_property(TARGET drogon PROPERTY SYSTEM ON)
-    target_compile_options(drogon PRIVATE -Wno-deprecated-declarations)
-endif()
-
-CPMAddPackage(
-    NAME glaze
-    GITHUB_REPOSITORY stephenberry/glaze
-    GIT_TAG v4.4.3
-    OPTIONS "glaze_ENABLE_AVX2 OFF"
-)
-
-# jwt-cpp: header-only RS256/HS256 JWT validation
-CPMAddPackage(
-    NAME jwt-cpp
-    GITHUB_REPOSITORY Thalhammer/jwt-cpp
-    GIT_TAG v0.7.0
-    OPTIONS "JWT_BUILD_EXAMPLES OFF" "JWT_BUILD_TESTS OFF"
+target_include_directories(wikore_infra PUBLIC include)
+target_link_libraries(wikore_infra PUBLIC
+    spdlog::spdlog
+    drogon
+    PkgConfig::LIBUUID
+    wikore_warnings
 )
 
 # ---------------------------------------------------------------------------
-# mohio_core: config, auth, DB helpers, org tree, access resolution
+# wikore_app: application use cases
 # ---------------------------------------------------------------------------
-add_library(mohio_core STATIC
+add_library(wikore_app STATIC
+    src/application/promote_document_version.cpp
+)
+target_link_libraries(wikore_app PUBLIC wikore_infra)
+
+# ---------------------------------------------------------------------------
+# wikore_core: config, auth, DB helpers, org tree, access resolution
+# ---------------------------------------------------------------------------
+add_library(wikore_core STATIC
     src/config.cpp
     src/auth.cpp
     src/db.cpp
@@ -113,43 +106,43 @@ add_library(mohio_core STATIC
     src/access.cpp
     src/redis.cpp
 )
-target_include_directories(mohio_core PUBLIC include)
-target_link_libraries(mohio_core PUBLIC
+target_include_directories(wikore_core PUBLIC include)
+target_link_libraries(wikore_core PUBLIC
     spdlog::spdlog
     OpenSSL::SSL
     OpenSSL::Crypto
     drogon
     glaze::glaze
     jwt-cpp::jwt-cpp
-    mohio_warnings
+    wikore_warnings
 )
-target_link_libraries(mohio_core PRIVATE hiredis::hiredis)
+target_link_libraries(wikore_core PRIVATE hiredis::hiredis)
 
 # ---------------------------------------------------------------------------
-# mohio_rag: embedder, retriever, reranker, generator, pipeline
+# wikore_rag: embedder, retriever, reranker, generator, pipeline
 # ---------------------------------------------------------------------------
-add_library(mohio_rag STATIC
+add_library(wikore_rag STATIC
     src/rag/embedder.cpp
     src/rag/retriever.cpp
     src/rag/reranker.cpp
     src/rag/generator.cpp
     src/rag/pipeline.cpp
 )
-target_link_libraries(mohio_rag PUBLIC mohio_core)
+target_link_libraries(wikore_rag PUBLIC wikore_core)
 
 # ---------------------------------------------------------------------------
-# mohio_wiki: wiki store + ops (DB-backed, org-scoped)
+# wikore_wiki: wiki store + ops (DB-backed, org-scoped)
 # ---------------------------------------------------------------------------
-add_library(mohio_wiki STATIC
+add_library(wikore_wiki STATIC
     src/wiki/store.cpp
     src/wiki/ops.cpp
 )
-target_link_libraries(mohio_wiki PUBLIC mohio_core mohio_rag)
+target_link_libraries(wikore_wiki PUBLIC wikore_core wikore_rag)
 
 # ---------------------------------------------------------------------------
-# mohio_mcp: MCP tool registry + built-in integration adapters
+# wikore_mcp: MCP tool registry + built-in integration adapters
 # ---------------------------------------------------------------------------
-add_library(mohio_mcp STATIC
+add_library(wikore_mcp STATIC
     src/mcp/registry.cpp
     src/mcp/slack.cpp
     src/mcp/jira.cpp
@@ -157,22 +150,27 @@ add_library(mohio_mcp STATIC
     src/mcp/github.cpp
     src/mcp/webhook.cpp
 )
-target_link_libraries(mohio_mcp PUBLIC mohio_core)
+target_link_libraries(wikore_mcp PUBLIC wikore_core)
 
 # ---------------------------------------------------------------------------
 # Apps
 # ---------------------------------------------------------------------------
-option(MOHIO_BUILD_APPS "Build the API server binary" ON)
-if(MOHIO_BUILD_APPS)
+option(WIKORE_BUILD_APPS "Build all wikore binaries" ON)
+if(WIKORE_BUILD_APPS)
     add_subdirectory(apps/api)
+    add_subdirectory(apps/ingest)
+    add_subdirectory(apps/scheduler)
+    add_subdirectory(apps/eval)
 endif()
 
 # ---------------------------------------------------------------------------
 # Tests
 # ---------------------------------------------------------------------------
-option(MOHIO_BUILD_TESTS "Build Catch2 unit tests" ON)
-if(MOHIO_BUILD_TESTS)
-    find_package(Catch2 3 REQUIRED)
+option(WIKORE_BUILD_TESTS "Build Catch2 unit tests" ON)
+if(WIKORE_BUILD_TESTS)
+    if(Catch2_SOURCE_DIR)
+        list(APPEND CMAKE_MODULE_PATH ${Catch2_SOURCE_DIR}/extras)
+    endif()
     enable_testing()
     add_subdirectory(tests)
 endif()

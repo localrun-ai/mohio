@@ -3,7 +3,7 @@
 #include <string_view>
 #include <drogon/drogon.h>
 
-namespace mohio::mcp {
+namespace wikore::mcp {
 
 // JSON Schema snippet for a tool parameter.
 struct ParamSchema {
@@ -36,4 +36,4 @@ public:
            std::string_view credentials) = 0;
 };
 
-} // namespace mohio::mcp
+} // namespace wikore::mcp
