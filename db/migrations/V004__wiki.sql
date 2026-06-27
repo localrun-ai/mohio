@@ -101,16 +101,17 @@ CREATE TABLE wiki_page_sources (
         REFERENCES document_chunks(company_id, document_version_id, id) ON DELETE RESTRICT
 );
 
--- Deduplication: one row per (wiki_page, version, chunk) combination.
--- COALESCE maps NULL chunk_id to a sentinel so the index treats version-level
--- citations as a single entry per version rather than allowing unlimited duplicates.
-CREATE UNIQUE INDEX wiki_page_sources_unique_source_idx
-    ON wiki_page_sources (
-        company_id,
-        wiki_page_id,
-        document_version_id,
-        COALESCE(chunk_id, '00000000-0000-0000-0000-000000000000'::uuid)
-    );
+-- Deduplication: one row per (wiki_page, version) for version-level citations,
+-- one row per (wiki_page, version, chunk) for chunk-level citations.
+-- Two partial indexes are cleaner than a COALESCE sentinel and correctly handle
+-- the case where an all-zero UUID might legitimately exist as a real chunk_id.
+CREATE UNIQUE INDEX wiki_page_sources_version_unique_idx
+    ON wiki_page_sources (company_id, wiki_page_id, document_version_id)
+    WHERE chunk_id IS NULL;
+
+CREATE UNIQUE INDEX wiki_page_sources_chunk_unique_idx
+    ON wiki_page_sources (company_id, wiki_page_id, document_version_id, chunk_id)
+    WHERE chunk_id IS NOT NULL;
 
 CREATE INDEX wiki_page_sources_page_idx     ON wiki_page_sources (company_id, wiki_page_id);
 CREATE INDEX wiki_page_sources_document_idx ON wiki_page_sources (company_id, document_id);
