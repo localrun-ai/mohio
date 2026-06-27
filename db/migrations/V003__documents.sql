@@ -116,17 +116,18 @@ CREATE TABLE document_versions (
     id               UUID        PRIMARY KEY DEFAULT gen_random_uuid(),
     company_id       UUID        NOT NULL,
     document_id      UUID        NOT NULL,
-    version_no       INT         NOT NULL,        -- monotonically increasing per document
+    version_no       INT         NOT NULL CHECK (version_no > 0),
     source_hash      TEXT        NOT NULL,        -- SHA-256 of the source file
     source_uri       TEXT,                        -- storage path / URL for this file
-    size_bytes       BIGINT,
+    size_bytes       BIGINT      CHECK (size_bytes >= 0),
     ingest_status    TEXT        NOT NULL DEFAULT 'pending'
                                  CHECK (ingest_status IN (
                                      'pending','processing','done','error'
                                  )),
-    chunk_count      INT,                         -- set after successful ingest
+    chunk_count      INT         CHECK (chunk_count >= 0),
     created_by       UUID        REFERENCES users(id) ON DELETE SET NULL,
     created_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
     completed_at     TIMESTAMPTZ,
     activated_at     TIMESTAMPTZ,   -- set when version transitions to 'active'
     superseded_at    TIMESTAMPTZ,   -- set when a newer version becomes 'active'
@@ -146,6 +147,17 @@ CREATE TABLE document_versions (
             AND activated_at  IS NOT NULL
             AND superseded_at IS NULL
         )
+    ),
+    -- A done ingest must record when it finished and how many chunks it produced.
+    CONSTRAINT document_versions_done_state_chk CHECK (
+        ingest_status <> 'done'
+        OR (completed_at IS NOT NULL AND chunk_count IS NOT NULL)
+    ),
+    -- Active lifecycle requires completed ingest (implied by active_state_chk above,
+    -- stated explicitly here for clarity when reading the constraint list in isolation).
+    CONSTRAINT document_versions_active_requires_done_chk CHECK (
+        lifecycle_status <> 'active'
+        OR ingest_status = 'done'
     ),
 
     UNIQUE (company_id, document_id, version_no),
@@ -187,6 +199,10 @@ $$;
 CREATE TRIGGER document_versions_validate_actors
     BEFORE INSERT OR UPDATE ON document_versions
     FOR EACH ROW EXECUTE FUNCTION validate_document_versions_actors();
+
+CREATE TRIGGER document_versions_updated_at
+    BEFORE UPDATE ON document_versions
+    FOR EACH ROW EXECUTE FUNCTION set_updated_at();
 
 -- ---------------------------------------------------------------------------
 -- Embedding models (global server configuration; not company-scoped)
