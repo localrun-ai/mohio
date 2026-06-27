@@ -1,0 +1,200 @@
+[
+  {
+    "filename": "empty.pdf",
+    "generator": "empty_pdf",
+    "failure_class": "empty-file",
+    "category": "malformed",
+    "expected_behaviour": "reject; audit",
+    "expected_error_code": "ingest.empty_file",
+    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "size_bytes": 0,
+    "notes": "Zero-byte file with .pdf extension. The magic-byte sniff finds nothing; ingest worker rejects with ingest.empty_file."
+  },
+  {
+    "filename": "empty.docx",
+    "generator": "empty_docx",
+    "failure_class": "empty-file",
+    "category": "malformed",
+    "expected_behaviour": "reject; audit",
+    "expected_error_code": "ingest.empty_file",
+    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "size_bytes": 0,
+    "notes": "Zero-byte file with .docx extension. Same handling as empty.pdf."
+  },
+  {
+    "filename": "truncated.pdf",
+    "generator": "truncated_pdf",
+    "failure_class": "truncated-file",
+    "category": "malformed",
+    "expected_behaviour": "reject; audit",
+    "expected_error_code": "ingest.parse_error.unexpected_eof",
+    "sha256": "2fb9856baf2de4890c5a79541001f1ea19eb34385793492f0b3d6f98d1c9cc3f",
+    "size_bytes": 218,
+    "notes": "PDF header + stream object that declares more bytes than the file contains. Parser hits EOF mid-stream."
+  },
+  {
+    "filename": "mime_mismatch.pdf",
+    "generator": "mime_mismatch_pdf",
+    "failure_class": "mime-mismatch",
+    "category": "malformed",
+    "expected_behaviour": "reject via magic-byte sniff; audit",
+    "expected_error_code": "ingest.mime_type_mismatch",
+    "sha256": "bd7b4f140252c4636024d0736be0727a1b23d5e522caa5f013092bf98639ddbd",
+    "size_bytes": 1301,
+    "notes": "Valid DOCX zip body wrapped in a .pdf filename. Magic-byte sniff sees PK\\x03\\x04, not %PDF. Trusting the extension would route this to the PDF parser and crash it."
+  },
+  {
+    "filename": "malformed_xml.docx",
+    "generator": "malformed_xml_docx",
+    "failure_class": "malformed-xml",
+    "category": "malformed",
+    "expected_behaviour": "reject; audit",
+    "expected_error_code": "ingest.parse_error.malformed_xml",
+    "sha256": "d0ae3d44c6605bd349b776e65203da57761c713dc6ad984aaae1eb728f6f7bdd",
+    "size_bytes": 1255,
+    "notes": "Valid zip envelope; word/document.xml has an unclosed <w:t> tag. Parser should raise a clear parse error rather than silently truncating."
+  },
+  {
+    "filename": "missing_part.docx",
+    "generator": "missing_part_docx",
+    "failure_class": "missing-required-part",
+    "category": "malformed",
+    "expected_behaviour": "reject; audit",
+    "expected_error_code": "ingest.docx.missing_document_xml",
+    "sha256": "dd6f3158603b8a1e1f419d55b980d06c4b4c161d8105a07903063486f49b368c",
+    "size_bytes": 960,
+    "notes": "Valid zip with [Content_Types].xml and _rels/.rels but no word/document.xml. OOXML requires this part; absence is a hard parse error."
+  },
+  {
+    "filename": "zipslip.docx",
+    "generator": "zipslip_docx",
+    "failure_class": "zip-slip",
+    "category": "dangerous",
+    "expected_behaviour": "reject; audit; security event",
+    "expected_error_code": "ingest.zip_slip_path",
+    "sha256": "7fdf81f0b323ac5d13645a84eaa00abb662d7b961c522c18ac80cb62395ebd6e",
+    "size_bytes": 1549,
+    "notes": "DOCX zip whose directory contains an entry named '../../../etc/wikore-zipslip-canary'. A naive extractor that joins entry names with the destination dir would write outside the sandbox. The ingest worker MUST normalize each entry path and reject any that escape the destination."
+  },
+  {
+    "filename": "xxe.docx",
+    "generator": "xxe_docx",
+    "failure_class": "xxe-external-entity",
+    "category": "dangerous",
+    "expected_behaviour": "refuse to resolve external entities; ingest stripped text; audit",
+    "expected_error_code": "ingest.xxe_external_entity",
+    "sha256": "2dd0339d509ce0285995dd7376c3f7cb6d1911d47a65ee32cb1e6a015b4776da",
+    "size_bytes": 1336,
+    "notes": "DOCX whose document.xml declares an external entity pointing at file:///etc/passwd. XML parsers configured without secure-by-default settings will resolve it. wikore-ingest's XML parser MUST disable external entity resolution; an explicit security audit event SHOULD be logged when an external entity is encountered."
+  },
+  {
+    "filename": "xml_bomb.docx",
+    "generator": "xml_bomb_docx",
+    "failure_class": "xml-bomb",
+    "category": "dangerous",
+    "expected_behaviour": "enforce max nesting depth (256); reject",
+    "expected_error_code": "ingest.xml_depth_exceeded",
+    "sha256": "3c2d15a68ddfb56df6a3a7ab0229b28eed1fd7733a839dc71c82b39ec32a997e",
+    "size_bytes": 15269,
+    "notes": "DOCX with 2000 levels of nested elements. Not a billion-laughs (XXE hardening already blocks entity-based bombs); exercises raw element-depth limits."
+  },
+  {
+    "filename": "oversized_attribute.xlsx",
+    "generator": "oversized_attribute_xlsx",
+    "failure_class": "oversized-attribute",
+    "category": "dangerous",
+    "expected_behaviour": "enforce attribute-length cap (64 KB); reject",
+    "expected_error_code": "ingest.xml_attribute_too_large",
+    "sha256": "3200bb4be990af9847c21ee27d17e38d322aa0e653f5f0f653c5edf470ca9669",
+    "size_bytes": 1050856,
+    "notes": "XLSX with one XML attribute holding 1 MB of data. Defends against parsers that allocate per-attribute buffers without an upper bound."
+  },
+  {
+    "filename": "eicar.txt",
+    "generator": "eicar_txt",
+    "failure_class": "malware-eicar-signature",
+    "category": "dangerous",
+    "expected_behaviour": "AV scan -> reject; audit; security event",
+    "expected_error_code": "ingest.av.eicar_signature_detected",
+    "sha256": "275a021bbfb6489e54d471899f7db9d1663fc695ec2fe2a2c4538aabf651fd0f",
+    "size_bytes": 68,
+    "notes": "The standard EICAR antivirus test signature. 68-byte ASCII string designed by EICAR specifically so AV products can be tested without distributing real malware. NOT a virus; AV products are required to flag this exact byte sequence."
+  },
+  {
+    "filename": "eicar_in_pdf.pdf",
+    "generator": "eicar_in_pdf",
+    "failure_class": "malware-eicar-signature",
+    "category": "dangerous",
+    "expected_behaviour": "AV scan -> reject; audit; security event",
+    "expected_error_code": "ingest.av.eicar_signature_detected",
+    "sha256": "e27ad7d60006506a24cac0b3abec6272d2d23eb57d3c812d566e75f3c3b21f60",
+    "size_bytes": 506,
+    "notes": "Minimal PDF carrying the EICAR signature in a content stream. Demonstrates that AV scanning must inspect the full byte sequence, not just filename or MIME."
+  },
+  {
+    "filename": "pdf_with_js.pdf",
+    "generator": "pdf_with_javascript",
+    "failure_class": "pdf-javascript-action",
+    "category": "dangerous",
+    "expected_behaviour": "detect /JS or /JavaScript; strip from extraction; ingest text; audit",
+    "expected_error_code": "ingest.pdf.javascript_action_stripped",
+    "sha256": "7fbea9dc653fc8915e9639388a1568e790f59f375be584074332ee62e754b6b6",
+    "size_bytes": 464,
+    "notes": "PDF with an /OpenAction containing /JS. Some PDF viewers execute this; ingest workers should detect, strip, and audit. Text content can still be extracted and embedded."
+  },
+  {
+    "filename": "docx_with_macro.docx",
+    "generator": "docx_with_macro",
+    "failure_class": "office-macros",
+    "category": "dangerous",
+    "expected_behaviour": "reject OR strip vbaProject.bin + ingest cleaned doc; audit",
+    "expected_error_code": "ingest.docx.macro_detected",
+    "sha256": "5ec930499018f93028a3962c20b7b0d9db698227892e1b17906823036af0cb9e",
+    "size_bytes": 1935,
+    "notes": "DOCX whose zip directory contains word/vbaProject.bin. The bin bytes here are decoy (not a real VBA project) but the entry's presence is the canonical macro-bearing signal. Decision (reject vs strip-and-ingest) is per-tenant policy in companies.settings."
+  },
+  {
+    "filename": "prompt_inject_basic.md",
+    "generator": "prompt_inject_basic_md",
+    "failure_class": "prompt-injection-text",
+    "category": "prompt-injection",
+    "expected_behaviour": "ingest normally; mitigation is at LLM layer, not ingest",
+    "expected_error_code": null,
+    "sha256": "30cc0300064358f70f098dcdbd63df56e55574780492af65b082903782428e09",
+    "size_bytes": 389,
+    "notes": "Plain-text injection attempt. Ingest behaviour: TREAT AS NORMAL EVIDENCE. The mitigation is twofold: (1) system prompt MUST framing-isolate retrieved evidence from user instructions; (2) EvidenceGate prevents the retriever from feeding chunks that the user is not entitled to see. The eval harness exercises both."
+  },
+  {
+    "filename": "prompt_inject_hidden_html.md",
+    "generator": "prompt_inject_hidden_html_md",
+    "failure_class": "prompt-injection-hidden-html",
+    "category": "prompt-injection",
+    "expected_behaviour": "strip HTML during markdown parse; ingest cleaned text only",
+    "expected_error_code": null,
+    "sha256": "9a64c027171d92b7b81a002954cab40c5e093e1057ba1861e891ca4feaa3ab6d",
+    "size_bytes": 330,
+    "notes": "Injection text hidden inside a <span style='display:none'>. The chunk's embedded text MUST NOT contain the hidden payload. Markdown parser should treat HTML tags as text (raw passthrough is unsafe) or strip them."
+  },
+  {
+    "filename": "prompt_inject_unicode_tags.md",
+    "generator": "prompt_inject_unicode_tags_md",
+    "failure_class": "prompt-injection-unicode-tags",
+    "category": "prompt-injection",
+    "expected_behaviour": "strip Cf-category Unicode (esp. U+E0000..U+E007F) during normalization",
+    "expected_error_code": null,
+    "sha256": "11abbc35b88a705cb69bb1cb126f57badf1fa7af8fa3799acab970be50a4eaa5",
+    "size_bytes": 406,
+    "notes": "Injection encoded in the Unicode Tags block (U+E0000..U+E007F). Invisible to humans, opaque to most renderers, but survives text extraction. Text normalization MUST strip these codepoints before embedding so the LLM never sees them."
+  },
+  {
+    "filename": "prompt_inject_exfil.md",
+    "generator": "prompt_inject_exfil_md",
+    "failure_class": "prompt-injection-exfil-link",
+    "category": "prompt-injection",
+    "expected_behaviour": "ingest text; do not auto-fetch external image URLs; UI requires explicit click",
+    "expected_error_code": null,
+    "sha256": "5b665ab231e353a5c11be40cfece4e36ed6449025df7eed792e89c706b541f5f",
+    "size_bytes": 194,
+    "notes": "Markdown image pointing at an attacker URL with templated query parameters. Auto-fetching during embedding or rendering would leak the document's existence and tenant IP. UI rendering policy: external images require user click; cite-only mode never resolves them."
+  }
+]
