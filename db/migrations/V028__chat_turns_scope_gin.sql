@@ -1,4 +1,4 @@
--- V026: GIN index on chat_turns.access_scope_ids
+-- V028: GIN index on chat_turns.access_scope_ids
 --
 -- chat_turns.access_scope_ids (V005) is documented as "an immutable snapshot
 -- of the org_unit IDs that were searched, forming an audit record of what
