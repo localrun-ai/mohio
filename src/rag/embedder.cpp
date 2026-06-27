@@ -42,7 +42,11 @@ LlamaEmbedder::LlamaEmbedder(std::string base_url, std::string model, int dims)
 drogon::Task<Result<Embedding>>
 LlamaEmbedder::embed(std::string text)
 {
-    auto result = co_await embed_batch({std::move(text)});
+    // Avoid braced-init-list + std::move on coroutine param: GCC 13 ICE in
+    // build_special_member_call. Build the vector explicitly instead.
+    std::vector<std::string> batch;
+    batch.push_back(std::move(text));
+    auto result = co_await embed_batch(std::move(batch));
     if (!result)
         co_return std::unexpected(result.error());
     if (result->empty())
