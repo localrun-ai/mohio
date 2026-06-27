@@ -17,8 +17,43 @@ read when querying a given org_unit) must be fast and consistent.
 | Key | Value | TTL | Notes |
 |-----|-------|-----|-------|
 | `lr:eff:{company_id}:{user_id}:{org_unit_id}` | JSON array of UUID strings | see below | Resolved access_scope_ids for this user+scope; drives Qdrant filter |
+| `lr:eff:keys:user:{company_id}:{user_id}` | Redis Set of `lr:eff:*` key names | 30-60 min | Reverse index: tracks all cached eff keys for this user in this company |
+| `lr:eff:keys:company:{company_id}` | Redis Set of `lr:eff:*` key names | 30-60 min | Reverse index: tracks all cached eff keys for this company (for company-wide invalidation) |
 | `lr:user:{user_id}` | JSON Identity record | 5 min | Profile + is_admin; invalidate on user update |
 | `lr:tree:{company_id}:{org_unit_id}` | JSON subtree | 2 min | Admin UI tree; invalidate on any mutation under this node |
+
+### Reverse-index sets: why and how
+
+Production Redis guidance bans KEYS and SCAN with wildcards (O(keyspace) operation
+that blocks the event loop). Instead, each `lr:eff` cache write also registers the
+full key name into two reverse-index Sets so invalidation can be O(actual cached
+entries) rather than O(total keyspace).
+
+**On every `lr:eff` cache write:**
+```
+SET lr:eff:{cid}:{uid}:{oid} <value> EX <ttl>
+SADD lr:eff:keys:user:{cid}:{uid} "lr:eff:{cid}:{uid}:{oid}"
+SADD lr:eff:keys:company:{cid} "lr:eff:{cid}:{uid}:{oid}"
+```
+Set TTL for reverse-index keys should be longer than the eff TTL (30-60 min vs 5 min)
+so the Set outlives its members. Stale members (keys already expired) are harmless:
+DEL on a non-existent key is a no-op.
+
+**On invalidation (e.g., membership change for user U in company C):**
+```
+SMEMBERS lr:eff:keys:user:{C}:{U}   -> [key1, key2, ...]
+DEL key1 key2 ...
+DEL lr:eff:keys:user:{C}:{U}
+```
+
+**On company-wide invalidation (e.g., org_unit delete):**
+```
+SMEMBERS lr:eff:keys:company:{C}    -> [key1, key2, ...]
+DEL key1 key2 ...
+DEL lr:eff:keys:company:{C}
+```
+After the DEL loop, also remove the per-user reverse-index keys for affected users
+(or let them expire naturally - they are self-consistent since the eff keys are gone).
 
 ### lr:eff TTL policy (grant expiry awareness)
 
@@ -114,16 +149,19 @@ operations O(chunks_in_scope) expensive. The correct cost is O(1) Redis key dele
 
 ### Invalidation table
 
+"SMEMBERS+DEL user" means: SMEMBERS `lr:eff:keys:user:{C}:{U}` -> DEL those keys -> DEL the Set.
+"SMEMBERS+DEL company" means: SMEMBERS `lr:eff:keys:company:{C}` -> DEL those keys -> DEL the Set.
+
 | Event | Redis keys to delete | Qdrant resync? |
 |-------|----------------------|----------------|
-| Membership add/remove (principal=user) | `lr:eff:{company_id}:{user_id}:*` | No - access_scope_ids unchanged |
-| Membership add/remove (principal=group) | `lr:eff:{company_id}:{user_id}:*` for every member of that group | No - access_scope_ids unchanged |
-| Group member add/remove | `lr:eff:{company_id}:{user_id}:*` for the affected user | No - access_scope_ids unchanged |
-| Resource grant create/revoke | `lr:eff:{company_id}:*` for affected principals | Yes - access_scope_ids of in-scope chunks change; enqueue `lr:resync:q` |
-| Document owner_org_unit change | `lr:eff:{company_id}:*` for old and new org_unit | Yes - access_scope_ids recomputed for all chunks of this document |
+| Membership add/remove (principal=user) | SMEMBERS+DEL user for affected user | No - access_scope_ids unchanged |
+| Membership add/remove (principal=group) | SMEMBERS+DEL user for every member of that group | No - access_scope_ids unchanged |
+| Group member add/remove | SMEMBERS+DEL user for the affected user | No - access_scope_ids unchanged |
+| Resource grant create/revoke | SMEMBERS+DEL user for each principal in affected org_unit's member list | Yes - access_scope_ids of in-scope chunks change; enqueue `lr:resync:q` |
+| Document owner_org_unit change | SMEMBERS+DEL user for members of old and new org_unit | Yes - access_scope_ids recomputed for all chunks of this document |
 | Document lifecycle change (activate/archive) | none | Yes - lifecycle_status field in Qdrant payload |
 | Org_unit create | `lr:tree:{company_id}:{parent_id}` | No - no chunks yet |
-| Org_unit move | `lr:tree:{company_id}:{old_parent}`, `lr:tree:{company_id}:{new_parent}`, `lr:eff:{company_id}:*` for affected scopes | Yes - descendants-grants now expand over a different subtree; enqueue `lr:resync:q` for moved subtree |
-| Org_unit delete | `lr:tree:*`, `lr:eff:*` for company | Yes - chunks owned by deleted unit removed from Qdrant |
+| Org_unit move | `lr:tree:{company_id}:{old_parent}`, `lr:tree:{company_id}:{new_parent}`, SMEMBERS+DEL user for all users in moved subtree | Yes - descendants-grants now expand over a different subtree; enqueue `lr:resync:q` for moved subtree |
+| Org_unit delete | SMEMBERS+DEL company, then DEL all `lr:tree:{company_id}:*` keys (tracked separately or scanned at low frequency) | Yes - chunks owned by deleted unit removed from Qdrant |
 | User update | `lr:user:{user_id}` | No |
 | API key revoke | `lr:api_key:{key_hash}` | No |

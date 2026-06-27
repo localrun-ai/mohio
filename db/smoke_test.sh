@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # db/smoke_test.sh - Schema smoke test suite
 #
-# Spins up a throwaway Postgres 17 container, loads all migrations, runs 10
+# Spins up a throwaway Postgres 17 container, loads all migrations, runs 15
 # behavioral checks, then tears down.  Exit code 0 = all passed.
 #
 # Usage: ./db/smoke_test.sh
@@ -32,6 +32,8 @@ VER2='7e100002-0000-0000-0000-000000000000'     # version 2 (second active - sho
 VER3='7e100003-0000-0000-0000-000000000000'     # version 3 (different version for FK test)
 CHK1='c0100001-0000-0000-0000-000000000000'     # chunk in VER3
 WIKI='b100a001-0000-0000-0000-000000000000'     # wiki page
+WVER='b100a002-0000-0000-0000-000000000000'     # wiki page version 1
+VER4='7e100004-0000-0000-0000-000000000000'     # version 4 (for promotion tests)
 
 # --------------------------------------------------------------------------
 # Start container and load schema
@@ -52,6 +54,7 @@ cat db/migrations/V001__orgs.sql \
     db/migrations/V006__integrations.sql \
     db/migrations/V007__audit.sql \
     db/migrations/V009__grant_validation.sql \
+    db/migrations/V010__promotion_functions.sql \
   | docker exec -i "$CONTAINER" psql -U postgres -v ON_ERROR_STOP=1 -q
 echo "-- Migrations loaded."
 echo ""
@@ -186,16 +189,82 @@ sql "INSERT INTO document_chunks
        (id, company_id, document_version_id, chunk_index, content, content_hash)
      VALUES ('$CHK1', '$CO_ACME', '$VER3', 0, 'text', 'ch');" > /dev/null
 
-sql "INSERT INTO wiki_pages (id, company_id, org_unit_id, slug, title, content)
-     VALUES ('$WIKI', '$CO_ACME', '$ACME_ROOT', 'policy', 'Policy', 'Content');" > /dev/null
+sql "INSERT INTO wiki_pages (id, company_id, org_unit_id, slug, title)
+     VALUES ('$WIKI', '$CO_ACME', '$ACME_ROOT', 'policy', 'Policy');" > /dev/null
+
+sql "INSERT INTO wiki_page_versions
+       (id, company_id, wiki_page_id, version_no, content, content_hash, lifecycle_status)
+     VALUES ('$WVER', '$CO_ACME', '$WIKI', 1, 'Content v1', 'h_wiki1', 'active');" > /dev/null
 
 # CHK1 belongs to VER3 but we cite it under VER1 - must fail
 ERR=$(sql "INSERT INTO wiki_page_sources
-             (company_id, wiki_page_id, document_id, document_version_id, chunk_id)
-           VALUES ('$CO_ACME', '$WIKI', '$DOC', '$VER1', '$CHK1');" 2>&1 || true)
+             (company_id, wiki_page_version_id, document_id, document_version_id, chunk_id)
+           VALUES ('$CO_ACME', '$WVER', '$DOC', '$VER1', '$CHK1');" 2>&1 || true)
 echo "$ERR" | grep -qi "foreign key\|violates" \
   && pass 10 "wiki_page_sources chunk from wrong version rejected by FK" \
   || fail 10 "chunk from wrong version was not blocked (got: $ERR)"
+
+# --------------------------------------------------------------------------
+# 11-15. promote_document_version() tests
+# --------------------------------------------------------------------------
+# Set up a second 'done' document version (VER4) for promotion tests.
+# VER3 is currently the active version.
+sql "INSERT INTO document_versions
+       (id, company_id, document_id, version_no, source_hash,
+        ingest_status, completed_at, chunk_count, lifecycle_status)
+     VALUES ('$VER4', '$CO_ACME', '$DOC', 4, 'h4',
+             'done', now(), 2, 'draft');" > /dev/null
+
+# --------------------------------------------------------------------------
+# 11. Direct activate-first update fails (unique violation: VER3 already active)
+# --------------------------------------------------------------------------
+ERR=$(sql "UPDATE document_versions
+           SET lifecycle_status='active', activated_at=now(), superseded_at=NULL
+           WHERE id='$VER4';" 2>&1 || true)
+echo "$ERR" | grep -qi "unique\|duplicate" \
+  && pass 11 "direct activate without deprecating old version rejected by partial unique index" \
+  || fail 11 "direct activate-first was not blocked (got: $ERR)"
+
+# --------------------------------------------------------------------------
+# 12. promote_document_version() succeeds
+# --------------------------------------------------------------------------
+ERR=$(sql "SELECT promote_document_version('$CO_ACME', '$DOC', '$VER4');" 2>&1 || true)
+echo "$ERR" | grep -qi "error\|exception" \
+  && fail 12 "promote_document_version() raised an error: $ERR" \
+  || pass 12 "promote_document_version() completed without error"
+
+# --------------------------------------------------------------------------
+# 13. Exactly one active version remains after promotion
+# --------------------------------------------------------------------------
+COUNT=$(sql "SELECT COUNT(*) FROM document_versions
+             WHERE company_id='$CO_ACME' AND document_id='$DOC'
+               AND lifecycle_status='active';")
+[ "$COUNT" -eq 1 ] \
+  && pass 13 "exactly one active version after promotion (got $COUNT)" \
+  || fail 13 "expected 1 active version after promotion, got $COUNT"
+
+# --------------------------------------------------------------------------
+# 14. Previously active version (VER3) now has superseded_at set
+# --------------------------------------------------------------------------
+COUNT=$(sql "SELECT COUNT(*) FROM document_versions
+             WHERE id='$VER3'
+               AND lifecycle_status='deprecated'
+               AND superseded_at IS NOT NULL;")
+[ "$COUNT" -eq 1 ] \
+  && pass 14 "old active version deprecated with superseded_at set" \
+  || fail 14 "old active version not correctly deprecated (got $COUNT)"
+
+# --------------------------------------------------------------------------
+# 15. New active version (VER4) has activated_at set and superseded_at NULL
+# --------------------------------------------------------------------------
+COUNT=$(sql "SELECT COUNT(*) FROM document_versions
+             WHERE id='$VER4'
+               AND lifecycle_status='active'
+               AND activated_at IS NOT NULL
+               AND superseded_at IS NULL;")
+[ "$COUNT" -eq 1 ] \
+  && pass 15 "new active version has activated_at set and superseded_at NULL" \
+  || fail 15 "new active version state incorrect (got $COUNT)"
 
 # --------------------------------------------------------------------------
 # Summary
