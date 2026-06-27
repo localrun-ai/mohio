@@ -70,41 +70,7 @@ endif()
 # ---------------------------------------------------------------------------
 # CPM packages
 # ---------------------------------------------------------------------------
-include(cmake/CPM.cmake)
-
-CPMAddPackage(
-    NAME drogon
-    GITHUB_REPOSITORY drogonframework/drogon
-    GIT_TAG v1.9.7
-    OPTIONS
-        "BUILD_EXAMPLES OFF"
-        "BUILD_CTL OFF"
-        "BUILD_TESTING OFF"
-        "BUILD_DROGON_SHARED OFF"
-)
-if(drogon_ADDED)
-    set_property(TARGET drogon PROPERTY SYSTEM ON)
-    target_compile_options(drogon PRIVATE -Wno-deprecated-declarations)
-endif()
-
-CPMAddPackage(
-    NAME glaze
-    GITHUB_REPOSITORY stephenberry/glaze
-    GIT_TAG v4.4.3
-    OPTIONS "glaze_ENABLE_AVX2 OFF"
-)
-
-# jwt-cpp: header-only RS256/HS256 JWT validation
-CPMAddPackage(
-    NAME jwt-cpp
-    GITHUB_REPOSITORY Thalhammer/jwt-cpp
-    GIT_TAG v0.7.0
-    OPTIONS "JWT_BUILD_EXAMPLES OFF" "JWT_BUILD_TESTS OFF"
-)
-
-# uuid for uuid_generate() in domain/types.hpp
-find_package(PkgConfig REQUIRED)
-pkg_check_modules(LIBUUID REQUIRED IMPORTED_TARGET uuid)
+include(cmake/dependencies.cmake)
 
 # ---------------------------------------------------------------------------
 # wikore_infra: foundation adapters (postgres UoW, error mapper)
@@ -202,13 +168,7 @@ endif()
 # ---------------------------------------------------------------------------
 option(WIKORE_BUILD_TESTS "Build Catch2 unit tests" ON)
 if(WIKORE_BUILD_TESTS)
-    CPMAddPackage(
-        NAME Catch2
-        GITHUB_REPOSITORY catchorg/Catch2
-        GIT_TAG v3.7.1
-        OPTIONS "CATCH_INSTALL_DOCS OFF"
-    )
-    if(Catch2_ADDED)
+    if(Catch2_SOURCE_DIR)
         list(APPEND CMAKE_MODULE_PATH ${Catch2_SOURCE_DIR}/extras)
     endif()
     enable_testing()

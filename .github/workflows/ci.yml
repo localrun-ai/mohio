@@ -59,7 +59,7 @@ jobs:
           path: |
             ~/.cache/CPM
             build-ci/_deps
-          key: cpm-${{ runner.os }}-${{ hashFiles('CMakeLists.txt') }}
+          key: cpm-${{ runner.os }}-${{ hashFiles('cmake/dependencies.cmake', 'cmake/CPM.cmake') }}
           restore-keys: cpm-${{ runner.os }}-
 
       - name: Configure
