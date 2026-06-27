@@ -1,30 +1,11 @@
 #include <catch2/catch_test_macros.hpp>
-#include <catch2/catch_approx.hpp>
+#include "wikore/adapters/postgres/error_mapper_internal.hpp"
 
 // Test the constraint-name extraction logic in pg_error_mapper.
-// These tests do NOT need a Postgres connection; they verify the regex
-// parsing of PG error message strings and the constraint->Error mapping.
+// Uses the production extract_constraint() via error_mapper_internal.hpp so
+// any change to the regex is immediately caught here.
 
-// Pull the internal extract_constraint function by re-including the regex
-// logic under test. We test the public map_db_exception() indirectly by
-// constructing DrogonDbException subclasses in the integration tests;
-// here we only verify the name extraction heuristic.
-
-#include <regex>
-#include <string>
-
-namespace {
-
-// Mirror of the production extract_constraint() logic.
-std::string extract_constraint(const std::string& msg) {
-    static const std::regex re(R"re(constraint "([^"]+)")re");
-    std::smatch m;
-    if (std::regex_search(msg, m, re))
-        return m[1].str();
-    return {};
-}
-
-} // namespace
+using wikore::postgres::detail::extract_constraint;
 
 TEST_CASE("extract_constraint: unique violation message", "[error_mapper]") {
     const std::string msg =

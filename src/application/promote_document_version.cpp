@@ -32,14 +32,16 @@ PromoteDocumentVersionUseCase::execute(
     }
 
     // Step 2: write audit log row in the same transaction.
+    const auto actor_type = ctx.principal.is_service_account ? "service" : "user";
     try {
         co_await uow.exec(
             R"(INSERT INTO audit_log
                    (company_id, actor_id, actor_type, action, entity_type, entity_id, detail)
-               VALUES ($1, $2, 'user', 'document.version.promoted', 'document_version', $3,
-                       jsonb_build_object('document_id', $4::text)))",
+               VALUES ($1, $2, $3, 'document.version.promoted', 'document_version', $4,
+                       jsonb_build_object('document_id', $5::text)))",
             ctx.tenant.company_id,
             ctx.principal.user_id,
+            actor_type,
             cmd.version_id,
             cmd.document_id);
     } catch (const drogon::orm::DrogonDbException& ex) {
@@ -48,7 +50,11 @@ PromoteDocumentVersionUseCase::execute(
     }
 
     // Step 3: write outbox event for Qdrant payload resync in the same transaction.
-    const auto idempotency_key = std::format("promote:{}:{}", cmd.document_id, cmd.version_id);
+    // Idempotency key includes trace_id so: (a) retries of the same HTTP request are
+    // idempotent, and (b) a genuine re-promotion (new request, new trace_id) always
+    // creates a fresh outbox entry even if the version was previously promoted.
+    const auto idempotency_key = std::format("promote:{}:{}:{}",
+        cmd.document_id, cmd.version_id, ctx.span.trace_id);
     try {
         co_await uow.exec(
             R"(INSERT INTO outbox_events

@@ -35,7 +35,7 @@ WIKI='b100a001-0000-0000-0000-000000000000'     # wiki page
 WVER='b100a002-0000-0000-0000-000000000000'     # wiki page version 1
 VER4='7e100004-0000-0000-0000-000000000000'     # version 4 (for promotion tests)
 OU_ENG='0a100002-0000-0000-0000-000000000000'   # Engineering department (Acme child, for move test)
-OUTBOX1='0b0x0001-0000-0000-0000-000000000001'  # outbox event 1
+OUTBOX1='0b0c0001-0000-0000-0000-000000000001'  # outbox event 1
 SEC1='5ec10001-0000-0000-0000-000000000000'     # document_section (for K5 test)
 
 # --------------------------------------------------------------------------

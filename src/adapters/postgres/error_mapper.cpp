@@ -1,9 +1,9 @@
 #include "wikore/adapters/postgres/error_mapper.hpp"
+#include "wikore/adapters/postgres/error_mapper_internal.hpp"
 #include <drogon/orm/Exception.h>
 #include <unordered_map>
 #include <string>
 #include <string_view>
-#include <regex>
 
 namespace wikore::postgres {
 
@@ -66,21 +66,6 @@ const std::unordered_map<std::string, Error> k_constraint_map = {
 
 } // namespace
 
-namespace {
-
-// Drogon's Postgres driver does not expose PG_DIAG_CONSTRAINT_NAME directly.
-// Extract the constraint name from the PG error message text, which contains
-// the pattern: constraint "constraint_name"
-std::string extract_constraint(const std::string& msg) {
-    static const std::regex re(R"re(constraint "([^"]+)")re");
-    std::smatch m;
-    if (std::regex_search(msg, m, re))
-        return m[1].str();
-    return {};
-}
-
-} // namespace
-
 Error map_db_exception(const drogon::orm::DrogonDbException& ex) {
     // DrogonDbException is not std::exception; use .base() then dynamic_cast
     // to SqlError to access SQLSTATE.
@@ -88,7 +73,7 @@ Error map_db_exception(const drogon::orm::DrogonDbException& ex) {
 
     const std::string msg        = ex.base().what();
     const std::string sqlstate   = sql_err ? sql_err->sqlState() : "";
-    const std::string constraint = extract_constraint(msg);
+    const std::string constraint = detail::extract_constraint(msg);
 
     if (sqlstate == SQLSTATE_SERIALIZATION_FAILURE || sqlstate == SQLSTATE_DEADLOCK)
         return Error::conflict("transaction conflict, retry: " + msg);
