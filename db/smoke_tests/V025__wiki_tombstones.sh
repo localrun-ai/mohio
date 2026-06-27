@@ -61,9 +61,35 @@ sql "INSERT INTO wiki_page_version_tombstones
      VALUES ('cafe0025-0000-0000-0000-000000000000',
              'b100c025-0000-0000-0000-00000000000a','b100c025-0000-0000-0000-000000000000',
              'h_cafe','source_deleted');" > /dev/null
-sql "DELETE FROM companies WHERE id='cafe0025-0000-0000-0000-000000000000';" > /dev/null
+# The append-only trigger blocks the cascade-DELETE on tombstones, which in
+# turn blocks the parent DELETE FROM companies. Tombstones are durable proof
+# of removal; losing them on a tenant purge would erase the audit trail.
+# Full tenant erasure is an ops procedure that must explicitly bypass the
+# trigger (privileged role + temporary trigger disable).
+ERR=$(sql "DELETE FROM companies WHERE id='cafe0025-0000-0000-0000-000000000000';" 2>&1 || true)
 COUNT=$(sql "SELECT COUNT(*) FROM wiki_page_version_tombstones
              WHERE company_id='cafe0025-0000-0000-0000-000000000000';")
-[ "$COUNT" = "0" ] \
-  && pass "V025.6" "tombstones cascade-purged on company delete" \
-  || fail "V025.6" "tombstones not purged (count=$COUNT)"
+echo "$ERR" | grep -qi "append-only" && [ "$COUNT" = "1" ] \
+  && pass "V025.6" "tombstones protected from company-cascade delete (append-only)" \
+  || fail "V025.6" "expected cascade block + tombstone preserved (err='$ERR' count=$COUNT)"
+
+# --------------------------------------------------------------------------
+# V025.7-V025.8: direct UPDATE / DELETE on tombstones rejected by the
+# append-only trigger.
+# --------------------------------------------------------------------------
+sql "INSERT INTO wiki_page_version_tombstones
+       (company_id, wiki_page_version_id, wiki_page_id, content_hash, reason)
+     VALUES ('$CO_ACME', 'b100b025-0000-0000-0000-0000000000ff','$WP25',
+             'h25_alt','gdpr_erasure');" > /dev/null
+
+ERR=$(sql "UPDATE wiki_page_version_tombstones
+           SET reason='changed' WHERE wiki_page_version_id='b100b025-0000-0000-0000-0000000000ff';" 2>&1 || true)
+echo "$ERR" | grep -qi "append-only" \
+  && pass "V025.7" "wiki_page_version_tombstones UPDATE rejected (append-only)" \
+  || fail "V025.7" "UPDATE not rejected: $ERR"
+
+ERR=$(sql "DELETE FROM wiki_page_version_tombstones
+           WHERE wiki_page_version_id='b100b025-0000-0000-0000-0000000000ff';" 2>&1 || true)
+echo "$ERR" | grep -qi "append-only" \
+  && pass "V025.8" "wiki_page_version_tombstones DELETE rejected (append-only)" \
+  || fail "V025.8" "DELETE not rejected: $ERR"

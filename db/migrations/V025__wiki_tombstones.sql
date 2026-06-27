@@ -62,3 +62,28 @@ CREATE INDEX wiki_page_version_tombstones_company_time_idx
 -- Lookup by page: "prove all versions of wiki page P were erased."
 CREATE INDEX wiki_page_version_tombstones_page_idx
     ON wiki_page_version_tombstones (company_id, wiki_page_id);
+
+-- ---------------------------------------------------------------------------
+-- Append-only enforcement (mirrors V014's document_chunk_tombstones and
+-- V007's audit_log). A tombstone is a durable record that specific content
+-- was deliberately removed; allowing UPDATE or DELETE would let an attacker
+-- (or buggy code) erase the proof of removal, defeating the whole point.
+--
+-- Defence-in-depth: also revoke at the role level on deploy:
+--   REVOKE UPDATE, DELETE ON wiki_page_version_tombstones FROM wikore_app;
+-- ---------------------------------------------------------------------------
+
+CREATE OR REPLACE FUNCTION prevent_wiki_tombstone_mutation()
+RETURNS TRIGGER LANGUAGE plpgsql AS $$
+BEGIN
+    RAISE EXCEPTION 'wiki_page_version_tombstones is append-only';
+END;
+$$;
+
+CREATE TRIGGER wiki_page_version_tombstones_no_update
+    BEFORE UPDATE ON wiki_page_version_tombstones
+    FOR EACH ROW EXECUTE FUNCTION prevent_wiki_tombstone_mutation();
+
+CREATE TRIGGER wiki_page_version_tombstones_no_delete
+    BEFORE DELETE ON wiki_page_version_tombstones
+    FOR EACH ROW EXECUTE FUNCTION prevent_wiki_tombstone_mutation();
