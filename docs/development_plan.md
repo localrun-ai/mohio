@@ -95,9 +95,20 @@ through it.
 - Ingest worker (`wikore-ingest`) consumes
   `lr:ingest:q:{company_id}` Redis lists. Per-tenant fair scheduling
   (round-robin across tenant lists).
-- PDF/DOCX/HTML parsers (vendored: poppler, libdocx, lexbor). Section
-  hierarchy (K5) extracted during parse and written to
-  `document_sections`.
+- Document parsers. Section hierarchy (K5) extracted during parse and
+  written to `document_sections`.
+  - **PDF**: poppler (vcpkg) for text + heading detection via font-size
+    heuristics or tagged PDF structure.
+  - **DOCX**: own implementation (~300 lines) using pugixml + miniz
+    (both vcpkg, header-friendly). Unzip the `.docx`, parse
+    `word/document.xml`, walk `<w:p>` elements: heading level from
+    `<w:pPr><w:pStyle w:val="HeadingN"/>`, text from `<w:t>` runs,
+    tables flattened cell-by-cell. No third-party DOCX library
+    (duckX/minidocx do not expose paragraph style names reliably,
+    which is required for section hierarchy).
+  - **HTML**: lexbor (vcpkg) walking heading tags h1-h6.
+  - **Plain text / Markdown**: line-based heading detection (# / ## or
+    ALL CAPS line heuristic); no external parser needed.
 - Chunker: target 600-char chunks with 100-char overlap, respects
   section boundaries (chunk does not span sections). `section_id` set
   on `document_chunks`.
@@ -498,6 +509,7 @@ Per release candidate:
 | llama-server reranker performance insufficient | medium | medium | Decouple; can swap to a separate reranker service over HTTP |
 | bge-m3 embedding quality insufficient for legal/HR | low | medium | Eval harness in iteration 5 lets us swap models with a new Qdrant collection |
 | Section parsing produces poor trees for some PDF formats | high | medium | Make `section_id` nullable (already done in V014); start without section expansion for unparseable docs |
+| DOCX third-party library does not expose paragraph styles | resolved | - | Own parser via pugixml + miniz; ~300 lines, controls exactly which XML fields are read |
 | Test corpus does not match real customer documents | medium | high | First pilot customer's corpus replaces the synthetic corpus after iteration 3 |
 | Cancellation safety bugs leak resources | medium | medium | Aggressive RAII + fault-injection tests in iteration 3 |
 | Outbox worker becomes a bottleneck under heavy invalidation | low | low | Horizontal scaling pattern; multiple scheduler instances via advisory locks |
