@@ -216,22 +216,51 @@ CREATE TRIGGER memberships_validate_actors
 -- columns determine which table they reference. PostgreSQL cannot express
 -- conditional FKs. Same-company integrity is enforced by the
 -- validate_resource_grant_same_company() trigger added in V009.
+--
+-- applies_to semantics (two independent axes, both default to self_only):
+--
+--   resource_applies_to: does the grant cover the specified resource only,
+--     or the resource org_unit and all its descendants?
+--     'self_and_descendants' is only meaningful when resource_type='org_unit';
+--     documents and wiki_pages have no descendants (enforced by CHECK).
+--
+--   principal_applies_to: does the grant cover the specified principal only,
+--     or the principal org_unit and all its descendant org_units' members?
+--     'self_and_descendants' is only meaningful when principal_type='org_unit';
+--     individual users and groups have no org subtree (enforced by CHECK).
+--
+-- Example: Legal (org_unit, self_and_descendants) granted read on HR (org_unit,
+--   self_only) means all Legal sub-teams can read HR documents, but NOT HR
+--   sub-team documents.
 -- ---------------------------------------------------------------------------
 
 CREATE TABLE resource_grants (
-    id             UUID        PRIMARY KEY DEFAULT gen_random_uuid(),
-    company_id     UUID        NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
-    resource_type  TEXT        NOT NULL
-                               CHECK (resource_type IN ('org_unit', 'document', 'wiki_page')),
-    resource_id    UUID        NOT NULL,           -- POLYMORPHIC: V009 trigger validates
-    principal_type TEXT        NOT NULL CHECK (principal_type IN ('user', 'group', 'org_unit')),
-    principal_id   UUID        NOT NULL,           -- POLYMORPHIC: V009 trigger validates
-    permission     TEXT        NOT NULL CHECK (permission IN ('read', 'write', 'admin')),
-    applies_to     TEXT        NOT NULL DEFAULT 'self_only'
-                               CHECK (applies_to IN ('self_only', 'self_and_descendants')),
-    granted_by     UUID        REFERENCES users(id) ON DELETE SET NULL,
-    granted_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
-    expires_at     TIMESTAMPTZ,
+    id                   UUID        PRIMARY KEY DEFAULT gen_random_uuid(),
+    company_id           UUID        NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
+    resource_type        TEXT        NOT NULL
+                                     CHECK (resource_type IN ('org_unit', 'document', 'wiki_page')),
+    resource_id          UUID        NOT NULL,      -- POLYMORPHIC: V009 trigger validates
+    principal_type       TEXT        NOT NULL CHECK (principal_type IN ('user', 'group', 'org_unit')),
+    principal_id         UUID        NOT NULL,      -- POLYMORPHIC: V009 trigger validates
+    permission           TEXT        NOT NULL CHECK (permission IN ('read', 'write', 'admin')),
+
+    -- Resource axis: self_and_descendants only valid for org_unit resources.
+    resource_applies_to  TEXT        NOT NULL DEFAULT 'self_only'
+                                     CHECK (resource_applies_to IN ('self_only', 'self_and_descendants')),
+    -- Principal axis: self_and_descendants only valid for org_unit principals.
+    principal_applies_to TEXT        NOT NULL DEFAULT 'self_only'
+                                     CHECK (principal_applies_to IN ('self_only', 'self_and_descendants')),
+
+    granted_by           UUID        REFERENCES users(id) ON DELETE SET NULL,
+    granted_at           TIMESTAMPTZ NOT NULL DEFAULT now(),
+    expires_at           TIMESTAMPTZ,
+
+    -- Prevent nonsensical combinations: only org_units have descendants.
+    CONSTRAINT rg_resource_applies_to_valid
+        CHECK (resource_applies_to   = 'self_only' OR resource_type   = 'org_unit'),
+    CONSTRAINT rg_principal_applies_to_valid
+        CHECK (principal_applies_to  = 'self_only' OR principal_type  = 'org_unit'),
+
     -- company_id included so uniqueness is always tenant-scoped.
     UNIQUE (company_id, resource_type, resource_id, principal_type, principal_id)
 );
