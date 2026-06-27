@@ -8,10 +8,12 @@
 --
 -- Lifecycle model:
 --   document_versions.lifecycle_status drives retrieval, not documents.
---   Only 'active' versions are indexed in Qdrant (enforced by a partial
---   unique index that allows at most one active version per document).
---   When a new version is promoted to 'active', the previous version is
---   set to 'deprecated'. 'archived' = permanently withdrawn from retrieval.
+--   All versions with ingest_status='done' are indexed in Qdrant; the
+--   lifecycle_status field is stored in the payload and used as a filter.
+--   A partial unique index enforces at most one active version per document.
+--   When a new version is activated, the previous version becomes 'deprecated'
+--   (its payload lifecycle_status is updated in Qdrant; chunks remain indexed).
+--   'archived' = excluded from all retrieval including historical queries.
 --
 -- Qdrant collection strategy:
 --   ONE collection per embedding model (e.g. "mohio_docs_bge_m3").
@@ -32,10 +34,20 @@
 -- Each embedding model has its own Qdrant collection (embedding_models.qdrant_collection).
 -- document_chunk_vectors maps chunk_id -> qdrant_point_id per model.
 --
--- Retrieval filter (applied before any chunk reaches the LLM):
---   company_id        = user.company_id               (exact match)
---   access_scope_ids  intersects user.resolved_scopes  (Match Any)
---   lifecycle_status  = "active"                       (exact match)
+-- Retrieval filters:
+--   Default (current knowledge):
+--     company_id        = user.company_id               (exact match)
+--     access_scope_ids  intersects user.resolved_scopes  (Match Any)
+--     lifecycle_status  = "active"                       (exact match)
+--
+--   Historical / as-of (e.g. "what was policy on 2026-05-15?"):
+--     company_id        = user.company_id               (exact match)
+--     access_scope_ids  intersects user.resolved_scopes  (Match Any)
+--     lifecycle_status  in ["active", "deprecated"]      (Match Any)
+--     activated_at      <= target_date                   (range)
+--     superseded_at     > target_date OR is null         (range)
+--
+--   'archived' versions are never returned by either filter.
 --
 -- owner_org_unit_id vs access_scope_ids:
 --   Ownership (who manages) and visibility (who can retrieve) are separate.
