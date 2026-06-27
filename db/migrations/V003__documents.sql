@@ -168,6 +168,21 @@ CREATE TABLE document_versions (
         lifecycle_status <> 'active'
         OR ingest_status = 'done'
     ),
+    -- A version cannot be superseded before it was activated.
+    -- Guards the as-of interval [activated_at, superseded_at).
+    CONSTRAINT document_versions_superseded_after_activated_chk CHECK (
+        activated_at IS NULL
+        OR superseded_at IS NULL
+        OR superseded_at > activated_at
+    ),
+    -- A deprecated version that was once active must have a superseded_at set.
+    -- Without this, a deprecated row with activated_at but no superseded_at would
+    -- appear valid forever in historical as-of queries.
+    CONSTRAINT document_versions_deprecated_interval_chk CHECK (
+        lifecycle_status <> 'deprecated'
+        OR activated_at IS NULL
+        OR superseded_at IS NOT NULL
+    ),
 
     UNIQUE (company_id, document_id, version_no),
     -- (company_id, id): target for composite FKs that only need version identity.
