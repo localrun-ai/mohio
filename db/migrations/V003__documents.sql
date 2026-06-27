@@ -229,7 +229,7 @@ CREATE TABLE embedding_models (
     id                UUID    PRIMARY KEY DEFAULT gen_random_uuid(),
     name              TEXT    NOT NULL UNIQUE,      -- e.g. 'bge-m3', 'e5-large'
     qdrant_collection TEXT    NOT NULL UNIQUE,      -- e.g. 'wikore_docs_bge_m3'
-    dimension         INT     NOT NULL,
+    dimension         INT     NOT NULL CHECK (dimension > 0),
     enabled           BOOLEAN NOT NULL DEFAULT true
 );
 
