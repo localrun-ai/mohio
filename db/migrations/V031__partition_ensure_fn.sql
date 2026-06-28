@@ -3,23 +3,39 @@
 -- PartitionMaintainer (wikore-scheduler) pre-creates quarterly audit_log and
 -- monthly usage_events partitions. The runtime role (wikore_app) holds DML
 -- on these tables but not CREATE TABLE; these SECURITY DEFINER functions run
--- under the owner's (migration role's) CREATE privilege so the scheduler can
--- call them without schema-creation rights.
+-- under the owner's (migration role's) CREATE privilege.
 --
 -- Security properties:
 --   1. Each function only touches its named parent table; no generic parent arg.
---   2. Partition name and date bounds are DERIVED from typed (INT) inputs, not
---      caller-supplied strings, so there is no path to arbitrary DDL.
---   3. REVOKE EXECUTE FROM PUBLIC appears immediately after CREATE OR REPLACE
---      so the migration-owner privilege window is closed before the GRANT below.
---   4. GRANT EXECUTE is conditional: runs only when wikore_app already exists
---      so clean CI installs do not fail. Production provisioning must create the
---      role before running migrations; the DO block grants idempotently.
+--   2. Partition name and date bounds are DERIVED from typed (INT) inputs so
+--      there is no path to arbitrary DDL names or ranges.
+--   3. Bounds are constructed with make_timestamptz(...,'UTC') to prevent
+--      session-timezone drift from creating shifted or overlapping partitions.
+--   4. Existence check uses pg_inherits to verify the table is actually an
+--      attached partition of the expected parent, not just any same-named table.
+--   5. REVOKE EXECUTE FROM PUBLIC appears immediately after each CREATE so the
+--      migration-owner privilege is closed before the selective GRANT below.
+--   6. wikore_app is created here (idempotent) so grants are always applied and
+--      the scheduler never gets "permission denied" due to provisioning order.
+
+-- ---------------------------------------------------------------------------
+-- Provision the runtime role idempotently so GRANT below is unconditional.
+-- If the DBA pre-created the role the EXCEPTION block is a no-op.
+-- If the migration user lacks CREATE ROLE the DO block will raise, failing
+-- the migration loudly rather than silently skipping grants.
+-- ---------------------------------------------------------------------------
+
+DO $role$
+BEGIN
+    CREATE ROLE wikore_app;
+EXCEPTION WHEN duplicate_object THEN NULL;
+END
+$role$;
 
 -- ---------------------------------------------------------------------------
 -- wikore_ensure_audit_log_partition(year_val INT, quarter_val INT)
---   Returns TRUE if a new quarterly partition was created, FALSE if it
---   already existed. Quarter must be 1-4; year must be 2024-2099.
+--   Returns TRUE if a new quarterly partition was created, FALSE if an
+--   attached partition for that period already exists.
 -- ---------------------------------------------------------------------------
 
 CREATE OR REPLACE FUNCTION wikore_ensure_audit_log_partition(
@@ -35,8 +51,8 @@ DECLARE
     start_month    INT;
     end_month      INT;
     end_year       INT;
-    from_val       TEXT;
-    to_val         TEXT;
+    from_ts        TIMESTAMPTZ;
+    to_ts          TIMESTAMPTZ;
     already_exists BOOLEAN;
 BEGIN
     IF quarter_val NOT BETWEEN 1 AND 4 THEN
@@ -54,31 +70,41 @@ BEGIN
         end_month := end_month - 12;
         end_year  := end_year  + 1;
     END IF;
-    from_val := year_val::TEXT || '-' || lpad(start_month::TEXT, 2, '0') || '-01';
-    to_val   := end_year::TEXT  || '-' || lpad(end_month::TEXT,  2, '0') || '-01';
 
+    -- Build UTC-pinned timestamptz bounds so session timezone cannot shift them.
+    from_ts := make_timestamptz(year_val, start_month, 1, 0, 0, 0.0, 'UTC');
+    to_ts   := make_timestamptz(end_year,  end_month,  1, 0, 0, 0.0, 'UTC');
+
+    -- Verify via pg_inherits that an ATTACHED partition for this period exists,
+    -- not just any relation that happens to share the name.
     SELECT EXISTS (
-        SELECT 1 FROM pg_class c
-        JOIN pg_namespace n ON n.oid = c.relnamespace
-        WHERE c.relname = partition_name AND n.nspname = 'public'
+        SELECT 1
+        FROM   pg_class      c
+        JOIN   pg_namespace  n  ON n.oid  = c.relnamespace
+        JOIN   pg_inherits   i  ON i.inhrelid = c.oid
+        JOIN   pg_class      p  ON p.oid  = i.inhparent
+        JOIN   pg_namespace  pn ON pn.oid = p.relnamespace
+        WHERE  c.relname  = partition_name AND n.nspname  = 'public'
+          AND  p.relname  = 'audit_log'    AND pn.nspname = 'public'
     ) INTO already_exists;
     IF already_exists THEN RETURN FALSE; END IF;
 
     EXECUTE format(
         'CREATE TABLE public.%I PARTITION OF public.audit_log '
-        'FOR VALUES FROM (%L::timestamptz) TO (%L::timestamptz)',
-        partition_name, from_val, to_val
+        'FOR VALUES FROM (%L) TO (%L)',
+        partition_name, from_ts, to_ts
     );
     RETURN TRUE;
 END;
 $$;
 
 REVOKE EXECUTE ON FUNCTION wikore_ensure_audit_log_partition(INT, INT) FROM PUBLIC;
+GRANT  EXECUTE ON FUNCTION wikore_ensure_audit_log_partition(INT, INT) TO   wikore_app;
 
 -- ---------------------------------------------------------------------------
 -- wikore_ensure_usage_events_partition(year_val INT, month_val INT)
---   Returns TRUE if a new monthly partition was created, FALSE if it
---   already existed. Month must be 1-12; year must be 2024-2099.
+--   Returns TRUE if a new monthly partition was created, FALSE if an
+--   attached partition for that period already exists.
 -- ---------------------------------------------------------------------------
 
 CREATE OR REPLACE FUNCTION wikore_ensure_usage_events_partition(
@@ -93,8 +119,8 @@ DECLARE
     partition_name TEXT;
     next_month     INT;
     next_year      INT;
-    from_val       TEXT;
-    to_val         TEXT;
+    from_ts        TIMESTAMPTZ;
+    to_ts          TIMESTAMPTZ;
     already_exists BOOLEAN;
 BEGIN
     IF month_val NOT BETWEEN 1 AND 12 THEN
@@ -111,32 +137,38 @@ BEGIN
         next_month := 1;
         next_year  := next_year + 1;
     END IF;
-    from_val := year_val::TEXT || '-' || lpad(month_val::TEXT,  2, '0') || '-01';
-    to_val   := next_year::TEXT || '-' || lpad(next_month::TEXT, 2, '0') || '-01';
+
+    from_ts := make_timestamptz(year_val, month_val,  1, 0, 0, 0.0, 'UTC');
+    to_ts   := make_timestamptz(next_year, next_month, 1, 0, 0, 0.0, 'UTC');
 
     SELECT EXISTS (
-        SELECT 1 FROM pg_class c
-        JOIN pg_namespace n ON n.oid = c.relnamespace
-        WHERE c.relname = partition_name AND n.nspname = 'public'
+        SELECT 1
+        FROM   pg_class      c
+        JOIN   pg_namespace  n  ON n.oid  = c.relnamespace
+        JOIN   pg_inherits   i  ON i.inhrelid = c.oid
+        JOIN   pg_class      p  ON p.oid  = i.inhparent
+        JOIN   pg_namespace  pn ON pn.oid = p.relnamespace
+        WHERE  c.relname  = partition_name   AND n.nspname  = 'public'
+          AND  p.relname  = 'usage_events'   AND pn.nspname = 'public'
     ) INTO already_exists;
     IF already_exists THEN RETURN FALSE; END IF;
 
     EXECUTE format(
         'CREATE TABLE public.%I PARTITION OF public.usage_events '
-        'FOR VALUES FROM (%L::timestamptz) TO (%L::timestamptz)',
-        partition_name, from_val, to_val
+        'FOR VALUES FROM (%L) TO (%L)',
+        partition_name, from_ts, to_ts
     );
     RETURN TRUE;
 END;
 $$;
 
 REVOKE EXECUTE ON FUNCTION wikore_ensure_usage_events_partition(INT, INT) FROM PUBLIC;
+GRANT  EXECUTE ON FUNCTION wikore_ensure_usage_events_partition(INT, INT) TO   wikore_app;
 
 -- ---------------------------------------------------------------------------
 -- wikore_check_partition_overflow()
---   Returns one row per monitored default partition indicating whether any
---   rows are present. The runtime role does not need direct SELECT on the
---   child tables; this function provides a tightly bounded read path.
+--   Returns one row per monitored default partition with has_rows=TRUE when
+--   any rows exist. Eliminates the need for direct SELECT on child tables.
 -- ---------------------------------------------------------------------------
 
 CREATE OR REPLACE FUNCTION wikore_check_partition_overflow()
@@ -155,18 +187,4 @@ END;
 $$;
 
 REVOKE EXECUTE ON FUNCTION wikore_check_partition_overflow() FROM PUBLIC;
-
--- ---------------------------------------------------------------------------
--- Grants: conditional on wikore_app existing so clean installs do not fail.
--- Production deployments must CREATE ROLE wikore_app before running Flyway.
--- ---------------------------------------------------------------------------
-
-DO $grants$
-BEGIN
-    IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'wikore_app') THEN
-        GRANT EXECUTE ON FUNCTION wikore_ensure_audit_log_partition(INT, INT)    TO wikore_app;
-        GRANT EXECUTE ON FUNCTION wikore_ensure_usage_events_partition(INT, INT) TO wikore_app;
-        GRANT EXECUTE ON FUNCTION wikore_check_partition_overflow()              TO wikore_app;
-    END IF;
-END
-$grants$;
+GRANT  EXECUTE ON FUNCTION wikore_check_partition_overflow() TO   wikore_app;

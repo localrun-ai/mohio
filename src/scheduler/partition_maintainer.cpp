@@ -123,7 +123,16 @@ drogon::Task<void> PartitionMaintainer::run_once()
                  opts_.audit_log_lookahead, opts_.usage_events_lookahead);
 
     // --- Advisory lock + DDL phase ---
-    int created = 0;
+    //
+    // No per-statement try/catch inside the loops: a PostgreSQL statement error
+    // leaves the transaction aborted, so any subsequent uow.exec would silently
+    // fail and uow.commit() would roll back. Catching per-statement would let
+    // the code log "created" for partitions that are never actually committed.
+    // Instead, let any error propagate to the outer catch which logs and exits
+    // the sweep; the next daily cycle retries.
+    //
+    // "created" names are accumulated locally and logged only after a successful
+    // commit so reported counts always match what is actually in the catalog.
     try {
         auto uow = co_await postgres::UnitOfWork::begin(db_);
 
@@ -139,10 +148,10 @@ drogon::Task<void> PartitionMaintainer::run_once()
         }
 
         {
+            std::vector<std::string> created_names;
             auto [year, month] = utc_year_month();
 
-            // audit_log: quarterly - pass typed (year, quarter) args so the
-            // SECURITY DEFINER function derives the name and bounds internally.
+            // audit_log: quarterly
             const int quarter = (month - 1) / 3 + 1;
             for (int i = 0; i < opts_.audit_log_lookahead; ++i) {
                 int q = quarter + i;
@@ -150,52 +159,39 @@ drogon::Task<void> PartitionMaintainer::run_once()
                 q     = ((q - 1) % 4) + 1;
 
                 std::string label = std::format("audit_log_{}_q{}", y, q);
-                try {
-                    auto r = co_await uow.exec(
-                        "SELECT public.wikore_ensure_audit_log_partition($1,$2) AS created",
-                        y, q);
-                    if (!r.empty() && r[0]["created"].as<bool>()) {
-                        spdlog::info("[partition-maintainer] created {}", label);
-                        ++created;
-                    } else {
-                        spdlog::debug("[partition-maintainer] already exists: {}", label);
-                    }
-                } catch (const drogon::orm::DrogonDbException& ex) {
-                    spdlog::error("[partition-maintainer] failed to ensure {}: {}",
-                                  label, ex.base().what());
-                }
+                spdlog::debug("[partition-maintainer] ensuring {}", label);
+                auto r = co_await uow.exec(
+                    "SELECT public.wikore_ensure_audit_log_partition($1,$2) AS created",
+                    y, q);
+                if (!r.empty() && r[0]["created"].as<bool>())
+                    created_names.push_back(std::move(label));
             }
 
-            // usage_events: monthly - same pattern.
+            // usage_events: monthly
             for (int i = 0; i < opts_.usage_events_lookahead; ++i) {
                 int m = month + i;
                 int y = year + (m - 1) / 12;
                 m     = ((m - 1) % 12) + 1;
 
                 std::string label = std::format("usage_events_{}_{:02d}", y, m);
-                try {
-                    auto r = co_await uow.exec(
-                        "SELECT public.wikore_ensure_usage_events_partition($1,$2) AS created",
-                        y, m);
-                    if (!r.empty() && r[0]["created"].as<bool>()) {
-                        spdlog::info("[partition-maintainer] created {}", label);
-                        ++created;
-                    } else {
-                        spdlog::debug("[partition-maintainer] already exists: {}", label);
-                    }
-                } catch (const drogon::orm::DrogonDbException& ex) {
-                    spdlog::error("[partition-maintainer] failed to ensure {}: {}",
-                                  label, ex.base().what());
-                }
+                spdlog::debug("[partition-maintainer] ensuring {}", label);
+                auto r = co_await uow.exec(
+                    "SELECT public.wikore_ensure_usage_events_partition($1,$2) AS created",
+                    y, m);
+                if (!r.empty() && r[0]["created"].as<bool>())
+                    created_names.push_back(std::move(label));
+            }
+
+            if (auto r = co_await uow.commit(); !r) {
+                spdlog::error("[partition-maintainer] commit failed: {}", r.error().message);
+            } else {
+                for (const auto& name : created_names)
+                    spdlog::info("[partition-maintainer] created {}", name);
+                partitions_created_.fetch_add(created_names.size());
+                spdlog::info("[partition-maintainer] sweep complete; created={}",
+                             created_names.size());
             }
         }
-
-        if (auto r = co_await uow.commit(); !r)
-            spdlog::error("[partition-maintainer] commit failed: {}", r.error().message);
-        else
-            partitions_created_.fetch_add(static_cast<std::size_t>(created));
-
-        spdlog::info("[partition-maintainer] sweep complete; created={}", created);
     } catch (const drogon::orm::DrogonDbException& ex) {
         spdlog::error("[partition-maintainer] sweep failed: {}", ex.base().what());
     }
