@@ -84,21 +84,24 @@ drogon::Task<void> PartitionMaintainer::interruptible_sleep()
 
 drogon::Task<void> PartitionMaintainer::check_default_overflow()
 {
-    for (const char* tbl : {"audit_log_default", "usage_events_default"}) {
-        try {
-            auto rows = co_await db_->execSqlCoro(
-                std::format("SELECT EXISTS(SELECT 1 FROM {} LIMIT 1) AS has_rows", tbl));
-            if (!rows.empty() && rows[0]["has_rows"].as<bool>()) {
+    // Use the SECURITY DEFINER helper (V031) so the runtime role does not
+    // need direct SELECT on the child default-partition tables.
+    try {
+        auto rows = co_await db_->execSqlCoro(
+            "SELECT partition_table, has_rows "
+            "FROM public.wikore_check_partition_overflow()");
+        for (const auto& row : rows) {
+            if (row["has_rows"].as<bool>()) {
                 spdlog::critical(
                     "[partition-maintainer] OVERFLOW: rows found in {} - "
                     "a named partition was missing at insert time. "
                     "Ops required: DETACH, move rows, ATTACH.",
-                    tbl);
+                    row["partition_table"].as<std::string>());
             }
-        } catch (const drogon::orm::DrogonDbException& ex) {
-            spdlog::error("[partition-maintainer] overflow check failed for {}: {}",
-                          tbl, ex.base().what());
         }
+    } catch (const drogon::orm::DrogonDbException& ex) {
+        spdlog::error("[partition-maintainer] overflow check failed: {}",
+                      ex.base().what());
     }
 }
 
@@ -138,64 +141,51 @@ drogon::Task<void> PartitionMaintainer::run_once()
         {
             auto [year, month] = utc_year_month();
 
-            // audit_log: quarterly
+            // audit_log: quarterly - pass typed (year, quarter) args so the
+            // SECURITY DEFINER function derives the name and bounds internally.
             const int quarter = (month - 1) / 3 + 1;
             for (int i = 0; i < opts_.audit_log_lookahead; ++i) {
                 int q = quarter + i;
                 int y = year + (q - 1) / 4;
                 q     = ((q - 1) % 4) + 1;
 
-                int start_m = (q - 1) * 3 + 1;
-                int end_m   = start_m + 3;
-                int end_y   = y;
-                if (end_m > 12) { end_m -= 12; ++end_y; }
-
-                std::string name = std::format("audit_log_{}_q{}", y, q);
-                std::string from = std::format("{}-{:02d}-01", y, start_m);
-                std::string to   = std::format("{}-{:02d}-01", end_y, end_m);
-
+                std::string label = std::format("audit_log_{}_q{}", y, q);
                 try {
                     auto r = co_await uow.exec(
-                        "SELECT wikore_ensure_partition($1,$2,$3,$4) AS created",
-                        std::string("audit_log"), name, from, to);
+                        "SELECT public.wikore_ensure_audit_log_partition($1,$2) AS created",
+                        y, q);
                     if (!r.empty() && r[0]["created"].as<bool>()) {
-                        spdlog::info("[partition-maintainer] created {}", name);
+                        spdlog::info("[partition-maintainer] created {}", label);
                         ++created;
                     } else {
-                        spdlog::debug("[partition-maintainer] already exists: {}", name);
+                        spdlog::debug("[partition-maintainer] already exists: {}", label);
                     }
                 } catch (const drogon::orm::DrogonDbException& ex) {
                     spdlog::error("[partition-maintainer] failed to ensure {}: {}",
-                                  name, ex.base().what());
+                                  label, ex.base().what());
                 }
             }
 
-            // usage_events: monthly
+            // usage_events: monthly - same pattern.
             for (int i = 0; i < opts_.usage_events_lookahead; ++i) {
                 int m = month + i;
                 int y = year + (m - 1) / 12;
                 m     = ((m - 1) % 12) + 1;
 
-                int next_m = m + 1, next_y = y;
-                if (next_m > 12) { next_m = 1; ++next_y; }
-
-                std::string name = std::format("usage_events_{}_{:02d}", y, m);
-                std::string from = std::format("{}-{:02d}-01", y, m);
-                std::string to   = std::format("{}-{:02d}-01", next_y, next_m);
-
+                std::string label = std::format("usage_events_{}_{:02d}", y, m);
                 try {
                     auto r = co_await uow.exec(
-                        "SELECT wikore_ensure_partition($1,$2,$3,$4) AS created",
-                        std::string("usage_events"), name, from, to);
+                        "SELECT public.wikore_ensure_usage_events_partition($1,$2) AS created",
+                        y, m);
                     if (!r.empty() && r[0]["created"].as<bool>()) {
-                        spdlog::info("[partition-maintainer] created {}", name);
+                        spdlog::info("[partition-maintainer] created {}", label);
                         ++created;
                     } else {
-                        spdlog::debug("[partition-maintainer] already exists: {}", name);
+                        spdlog::debug("[partition-maintainer] already exists: {}", label);
                     }
                 } catch (const drogon::orm::DrogonDbException& ex) {
                     spdlog::error("[partition-maintainer] failed to ensure {}: {}",
-                                  name, ex.base().what());
+                                  label, ex.base().what());
                 }
             }
         }
