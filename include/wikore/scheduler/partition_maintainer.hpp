@@ -41,16 +41,19 @@ public:
 
     drogon::Task<void> run();
 
-    // Single sweep: creates missing partitions and checks for overflow.
+    // Single sweep under the advisory lock. Creates missing partitions via
+    // wikore_ensure_partition() (V031 SECURITY DEFINER function) and checks
+    // for default-partition overflow. Non-owning replicas skip silently.
     // Exposed for testing.
     drogon::Task<void> run_once();
 
+    // Counts partitions actually created (wikore_ensure_partition returned
+    // TRUE). IF NOT EXISTS no-ops are not counted.
     std::size_t partitions_created() const { return partitions_created_.load(); }
 
 private:
-    drogon::Task<void> ensure_audit_log_partitions();
-    drogon::Task<void> ensure_usage_events_partitions();
     drogon::Task<void> check_default_overflow();
+    drogon::Task<void> interruptible_sleep();
 
     drogon::orm::DbClientPtr db_;
     ShutdownPredicate        shutdown_;
