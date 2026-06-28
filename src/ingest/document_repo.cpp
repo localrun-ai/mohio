@@ -283,62 +283,156 @@ PostgresDocumentRepo::write_chunks(std::vector<Chunk>&             chunks,
 //     AND chunk_count to be non-NULL. Caller passes both.
 // ---------------------------------------------------------------------------
 
-drogon::Task<Result<void>>
+drogon::Task<Result<bool>>
 PostgresDocumentRepo::set_ingest_status(std::string_view         company_id,
                                          std::string_view         document_version_id,
                                          IngestStatus             status,
-                                         drogon::orm::DbClientPtr db,
-                                         std::string_view         error_message)
+                                         std::string_view         claim_token,
+                                         std::string_view         error_message,
+                                         drogon::orm::DbClientPtr db)
 {
     if (status == IngestStatus::done) {
         co_return std::unexpected(Error::invalid_state(
             "set_ingest_status: use mark_ingest_done() to set 'done' "
             "(it must also set completed_at and chunk_count)"));
     }
+    if (status == IngestStatus::processing) {
+        co_return std::unexpected(Error::invalid_state(
+            "set_ingest_status: use claim_for_processing() for "
+            "'processing' (it generates the per-claim ownership token)"));
+    }
 
     const auto status_str = to_string(status);
+    // CAS-style predicate:
+    //  * always-true id+company_id check
+    //  * when claim_token is non-empty, ALSO require the row's stored
+    //    token to match -- this is how we prevent a worker that was
+    //    reset by the polling fallback from terminally overwriting a
+    //    newer worker's state.
+    //  * terminal transitions clear ingest_claim_token (the row is no
+    //    longer claimed); pending transitions preserve the existing
+    //    token (today there is no such caller, but harmless).
+    //
+    // ATOMICALLY clears ingest_job_payload alongside ingest_claim_token
+    // on terminal flips (done/error). Keeping the payload-clear inside
+    // the token-gated UPDATE prevents a stale worker from erasing a
+    // re-triggered version's recovery state through a separate
+    // unconditional UPDATE (which we previously had in worker.cpp's
+    // post-Processed cleanup).
     constexpr auto kSql = R"(
         UPDATE document_versions
-        SET    ingest_status = $3,
-               error_msg = CASE WHEN $3 = 'error' THEN NULLIF($4, '') ELSE NULL END
-        WHERE  company_id = $1::uuid AND id = $2::uuid
+        SET    ingest_status      = $3,
+               error_msg          = CASE WHEN $3 = 'error'
+                                         THEN NULLIF($5, '') ELSE NULL END,
+               ingest_claim_token = CASE WHEN $3 IN ('error', 'done')
+                                         THEN NULL ELSE ingest_claim_token END,
+               ingest_job_payload = CASE WHEN $3 IN ('error', 'done')
+                                         THEN NULL ELSE ingest_job_payload END
+        WHERE  company_id = $1::uuid
+          AND  id         = $2::uuid
+          AND  ($4 = '' OR ingest_claim_token::text = $4)
+        RETURNING id
     )";
 
     try {
-        co_await db->execSqlCoro(kSql,
-                                  std::string(company_id),
-                                  std::string(document_version_id),
-                                  std::string(status_str),
-                                  std::string(error_message));
+        auto rows = co_await db->execSqlCoro(kSql,
+                                              std::string(company_id),
+                                              std::string(document_version_id),
+                                              std::string(status_str),
+                                              std::string(claim_token),
+                                              std::string(error_message));
+        co_return rows.size() == 1;
     } catch (const drogon::orm::DrogonDbException& ex) {
         co_return std::unexpected(postgres::map_db_exception(ex));
     }
-    co_return Result<void>{};
 }
 
-drogon::Task<Result<void>>
+drogon::Task<Result<std::optional<std::string>>>
+PostgresDocumentRepo::claim_for_processing(std::string_view         company_id,
+                                            std::string_view         document_version_id,
+                                            std::string_view         payload_json,
+                                            drogon::orm::DbClientPtr db)
+{
+    // Atomic CAS that:
+    //   * flips ingest_status from 'pending' to 'processing'
+    //   * persists ingest_job_payload (NULL if caller passed empty)
+    //   * generates a fresh ingest_claim_token (UUID) and RETURNs it,
+    //     so the caller can present it to mark_ingest_done /
+    //     set_ingest_status('error') as proof of ownership
+    //   * gates on lifecycle_status so archived versions cannot be
+    //     re-ingested (V010 treats archived as terminal-no-retrieval)
+    //
+    // Returns std::nullopt if the row is no longer claimable (already
+    // processing/done/error/archived), in which case the caller should
+    // ack the delivery as a duplicate.
+    constexpr auto kSql = R"(
+        UPDATE document_versions
+        SET    ingest_status      = 'processing',
+               ingest_job_payload = NULLIF($3, '')::jsonb,
+               ingest_claim_token = gen_random_uuid()
+        WHERE  company_id        = $1::uuid
+          AND  id                = $2::uuid
+          AND  ingest_status     = 'pending'
+          AND  lifecycle_status  IN ('draft', 'deprecated')
+        RETURNING ingest_claim_token::text AS token
+    )";
+    try {
+        auto rows = co_await db->execSqlCoro(kSql,
+                                              std::string(company_id),
+                                              std::string(document_version_id),
+                                              std::string(payload_json));
+        if (rows.empty())
+            co_return std::optional<std::string>{};
+        co_return std::optional<std::string>{
+            rows[0]["token"].as<std::string>()};
+    } catch (const drogon::orm::DrogonDbException& ex) {
+        co_return std::unexpected(postgres::map_db_exception(ex));
+    }
+}
+
+drogon::Task<Result<bool>>
 PostgresDocumentRepo::mark_ingest_done(std::string_view      company_id,
                                        std::string_view      document_version_id,
                                        int                   chunk_count,
+                                       std::string_view      claim_token,
                                        postgres::UnitOfWork& uow)
 {
+    // Ownership-gated:
+    //   * empty claim_token -> bypass (test/legacy path)
+    //   * non-empty claim_token -> require match. If the polling
+    //     fallback reset our processing claim and another worker took
+    //     over, our token no longer matches and this UPDATE matches 0
+    //     rows. The caller (use case) detects via the returned bool
+    //     and propagates as OwnershipLost outcome.
+    //
+    // ATOMICALLY clears ingest_claim_token AND ingest_job_payload as
+    // part of the terminal flip. Doing the payload-clear here (token-
+    // gated) instead of in a separate post-commit UPDATE prevents a
+    // stale worker from clearing a re-triggered version's recovery
+    // state via an unconditional UPDATE.
     constexpr auto kSql = R"(
         UPDATE document_versions
-        SET    ingest_status = 'done',
-               completed_at  = COALESCE(completed_at, now()),
-               chunk_count   = $3
-        WHERE  company_id = $1::uuid AND id = $2::uuid
+        SET    ingest_status      = 'done',
+               completed_at       = COALESCE(completed_at, now()),
+               chunk_count        = $3,
+               ingest_claim_token = NULL,
+               ingest_job_payload = NULL
+        WHERE  company_id = $1::uuid
+          AND  id         = $2::uuid
+          AND  ($4 = '' OR ingest_claim_token::text = $4)
+        RETURNING id
     )";
 
     try {
-        co_await uow.exec(kSql,
+        auto rows = co_await uow.exec(std::string(kSql),
             std::string(company_id),
             std::string(document_version_id),
-            chunk_count);
+            chunk_count,
+            std::string(claim_token));
+        co_return rows.size() == 1;
     } catch (const drogon::orm::DrogonDbException& ex) {
         co_return std::unexpected(postgres::map_db_exception(ex));
     }
-    co_return Result<void>{};
 }
 
 } // namespace wikore::ingest

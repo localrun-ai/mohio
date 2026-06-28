@@ -12,6 +12,13 @@ drogon::Task<UnitOfWork> UnitOfWork::begin(drogon::orm::DbClientPtr db) {
 drogon::Task<void> UnitOfWork::commit() {
     // Use setCommitCallback to get a signal when PG acknowledges COMMIT.
     // Build a coroutine-friendly awaitable around the callback.
+    //
+    // NOTE: COMMIT can fail (e.g. deferred constraint violation, network
+    // hiccup mid-acknowledge). On failure we throw so the caller's catch
+    // (which we already have everywhere) maps to a typed error -- as
+    // opposed to silently returning success and letting the worker LREM
+    // the proc entry / clear the payload on data that was never actually
+    // committed.
     struct CommitAwaiter {
         TxPtr tx;
         bool committed_ok = false;
@@ -29,8 +36,13 @@ drogon::Task<void> UnitOfWork::commit() {
         bool await_resume() const noexcept { return committed_ok; }
     };
 
+    const bool ok = co_await CommitAwaiter{std::move(tx_)};
+    if (!ok) {
+        spdlog::error("[uow] COMMIT was rejected by PostgreSQL");
+        throw drogon::orm::Failure(
+            "wikore::postgres::UnitOfWork: COMMIT was rejected by PostgreSQL");
+    }
     committed_ = true;
-    co_await CommitAwaiter{std::move(tx_)};
 }
 
 UnitOfWork::~UnitOfWork() {

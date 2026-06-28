@@ -32,17 +32,26 @@ public:
     static drogon::Task<UnitOfWork> begin(drogon::orm::DbClientPtr db);
 
     // Execute a parameterized SQL statement inside this transaction.
+    // Args are DECAYED (taken by value into the coroutine frame) to
+    // avoid the Drogon-lazy-Task forwarding-reference dangle bug: a
+    // caller writing `co_await uow.exec("...", std::string(x))` would
+    // bind the temporary string to a forwarding reference, which is
+    // destroyed at the end of the call expression -- but Drogon
+    // suspends BEFORE the body runs, so the body would read a freed
+    // string. Decaying to values stores owned copies in the frame.
+    //
     // Throws drogon::orm::DrogonDbException on error; caller wraps with
     // postgres::map_db_exception() for typed error values.
     template<typename... Args>
     drogon::Task<drogon::orm::Result>
-    exec(std::string sql, Args&&... args) {
+    exec(std::string sql, Args... args) {
         co_return co_await tx_->execSqlCoro(
-            std::move(sql), std::forward<Args>(args)...);
+            std::move(sql), std::move(args)...);
     }
 
-    // Await PG COMMIT acknowledgment before returning. Safe to call from
-    // within a coroutine; the event loop is not blocked.
+    // Await PG COMMIT acknowledgment. THROWS drogon::orm::DrogonDbException
+    // (synthetic via setCommitCallback ok=false) when COMMIT fails so the
+    // caller can map the error rather than seeing a silent partial-success.
     drogon::Task<void> commit();
 
     // Explicitly roll back and release the connection.

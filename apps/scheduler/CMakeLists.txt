@@ -1,6 +1,8 @@
 add_executable(wikore_scheduler main.cpp)
 
 target_link_libraries(wikore_scheduler PRIVATE
+    wikore_scheduler_lib
+    wikore_rag
     wikore_core
     wikore_app
     wikore_warnings

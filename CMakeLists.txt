@@ -131,16 +131,26 @@ add_library(wikore_rag STATIC
 target_link_libraries(wikore_rag PUBLIC wikore_core)
 
 # ---------------------------------------------------------------------------
-# wikore_ingest: parser, chunker, document repo, ingest types
+# wikore_ingest: parser, chunker, document repo, ingest types, worker
 # ---------------------------------------------------------------------------
 add_library(wikore_ingest_lib STATIC
     src/ingest/types.cpp
     src/ingest/chunker.cpp
     src/ingest/parser.cpp
     src/ingest/document_repo.cpp
+    src/ingest/worker.cpp
     src/application/ingest_document_version.cpp
 )
 target_link_libraries(wikore_ingest_lib PUBLIC wikore_rag)
+
+# ---------------------------------------------------------------------------
+# wikore_scheduler_lib: outbox drainer + polling fallback
+# ---------------------------------------------------------------------------
+add_library(wikore_scheduler_lib STATIC
+    src/scheduler/outbox_worker.cpp
+    src/scheduler/polling_fallback.cpp
+)
+target_link_libraries(wikore_scheduler_lib PUBLIC wikore_rag wikore_infra)
 
 # ---------------------------------------------------------------------------
 # wikore_wiki: wiki store + ops (DB-backed, org-scoped)

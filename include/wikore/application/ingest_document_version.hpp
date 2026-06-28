@@ -24,6 +24,15 @@ struct IngestDocumentVersionCmd {
     std::string document_version_id;
     std::string file_path;       // absolute path on shared storage
     std::string embed_model_id;  // e.g. "bge-m3"
+
+    // Optional: the original IngestJob JSON payload as it appeared on
+    // the Redis queue. When set, execute() uses an atomic CAS UPDATE
+    // (pending -> processing AND persist payload in one statement) so
+    // duplicate delivery from the polling fallback's orphan reaper is
+    // safely absorbed without resurrecting terminal rows. When empty,
+    // execute() falls back to the unconditional set_ingest_status flip
+    // (used by tests that call the use case directly).
+    std::string ingest_job_payload;
 };
 
 // ---------------------------------------------------------------------------
@@ -52,6 +61,30 @@ struct IngestDocumentVersionCmd {
 // and returns the error. The caller (worker loop) decides whether to retry.
 // ---------------------------------------------------------------------------
 
+// IngestDispatchOutcome: result type for IngestDocumentVersionUseCase::execute.
+//
+// Distinguishes:
+//   * Processed         - we won the CAS, ran the pipeline, mark_done succeeded
+//   * TerminalError     - we won the CAS, pipeline failed, row is now 'error'
+//                         (terminal: caller should LREM, clear payload, NOT retry)
+//   * DuplicateSkipped  - we lost the CAS at claim time (row was not pending);
+//                         caller LREMs proc entry without touching the row
+//   * OwnershipLost     - we won the claim CAS but lost the row before
+//                         mark_done/mark_error (polling fallback reset us;
+//                         another worker now owns the row). Caller LREMs proc
+//                         entry; the new owner handles the row's lifecycle.
+//
+// The Err return path is reserved for INFRA failures that happen BEFORE the
+// CAS can win (e.g. DB connectivity, deadline exceeded). The worker
+// distinguishes Err from TerminalError when deciding whether to transfer
+// the proc entry back to the source queue.
+enum class IngestDispatchOutcome {
+    Processed,
+    TerminalError,
+    DuplicateSkipped,
+    OwnershipLost,
+};
+
 class IngestDocumentVersionUseCase {
 public:
     IngestDocumentVersionUseCase(
@@ -68,7 +101,17 @@ public:
     // By-value RequestContext + cmd: Drogon coroutines suspend before the
     // first line (initial_suspend = suspend_always); references to caller
     // temporaries dangle by the time the body runs.
-    drogon::Task<Result<void>>
+    //
+    // Returns:
+    //   Ok(Processed)        - claim won; pipeline succeeded or fail'd
+    //                          internally; row is now 'done' or 'error'.
+    //   Ok(DuplicateSkipped) - claim lost; row was not 'pending'; this
+    //                          worker did NOT modify document_versions or
+    //                          any outbox state. Caller should LREM the
+    //                          proc entry without touching the row.
+    //   Err(e)               - real failure (DB connectivity, etc.);
+    //                          caller handles per its policy.
+    drogon::Task<Result<IngestDispatchOutcome>>
     execute(RequestContext ctx, IngestDocumentVersionCmd cmd);
 
 private:

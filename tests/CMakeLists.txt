@@ -9,9 +9,11 @@ add_executable(wikore_tests
     test_chunker.cpp
     test_parser.cpp
     test_ingest_use_case.cpp
+    test_iter1_worker.cpp
 )
 target_link_libraries(wikore_tests PRIVATE
     wikore_ingest_lib
+    wikore_scheduler_lib
     wikore_core
     wikore_app
     wikore_infra

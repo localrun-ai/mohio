@@ -176,4 +176,187 @@ void Redis::del(std::string_view key) {
     if (r) freeReplyObject(r);
 }
 
+// ---------------------------------------------------------------------------
+// List + scan operations (added for the iter-1 ingest queue).
+// ---------------------------------------------------------------------------
+
+long long Redis::lpush(std::string_view key, std::string_view value) {
+    auto* slot = pick_slot();
+    if (!slot) return -1;
+    long long n = -1;
+    auto* r = slot_exec(*slot, [&](redisContext* c) {
+        return static_cast<redisReply*>(
+            redisCommand(c, "LPUSH %b %b",
+                         key.data(), key.size(),
+                         value.data(), value.size()));
+    });
+    if (r) {
+        if (r->type == REDIS_REPLY_INTEGER) n = r->integer;
+        freeReplyObject(r);
+    }
+    return n;
+}
+
+std::optional<std::string> Redis::rpop(std::string_view key) {
+    auto* slot = pick_slot();
+    if (!slot) return std::nullopt;
+    auto* r = slot_exec(*slot, [&](redisContext* c) {
+        return static_cast<redisReply*>(
+            redisCommand(c, "RPOP %b", key.data(), key.size()));
+    });
+    if (!r) return std::nullopt;
+    std::optional<std::string> result;
+    if (r->type == REDIS_REPLY_STRING)
+        result = std::string(r->str, static_cast<size_t>(r->len));
+    freeReplyObject(r);
+    return result;
+}
+
+std::optional<std::string>
+Redis::lmove_right_left(std::string_view src, std::string_view dst) {
+    auto* slot = pick_slot();
+    if (!slot) return std::nullopt;
+    auto* r = slot_exec(*slot, [&](redisContext* c) {
+        return static_cast<redisReply*>(
+            redisCommand(c, "LMOVE %b %b RIGHT LEFT",
+                         src.data(), src.size(),
+                         dst.data(), dst.size()));
+    });
+    if (!r) return std::nullopt;
+    std::optional<std::string> result;
+    if (r->type == REDIS_REPLY_STRING)
+        result = std::string(r->str, static_cast<size_t>(r->len));
+    freeReplyObject(r);
+    return result;
+}
+
+long long Redis::lrem(std::string_view key, long long count,
+                       std::string_view value) {
+    auto* slot = pick_slot();
+    if (!slot) return -1;
+    long long removed = -1;
+    auto* r = slot_exec(*slot, [&](redisContext* c) {
+        return static_cast<redisReply*>(
+            redisCommand(c, "LREM %b %lld %b",
+                         key.data(), key.size(),
+                         count,
+                         value.data(), value.size()));
+    });
+    if (r) {
+        if (r->type == REDIS_REPLY_INTEGER) removed = r->integer;
+        freeReplyObject(r);
+    }
+    return removed;
+}
+
+std::vector<std::string>
+Redis::lrange(std::string_view key, long long start, long long stop) {
+    std::vector<std::string> out;
+    auto* slot = pick_slot();
+    if (!slot) return out;
+    auto* r = slot_exec(*slot, [&](redisContext* c) {
+        return static_cast<redisReply*>(
+            redisCommand(c, "LRANGE %b %lld %lld",
+                         key.data(), key.size(), start, stop));
+    });
+    if (!r) return out;
+    if (r->type == REDIS_REPLY_ARRAY) {
+        out.reserve(r->elements);
+        for (size_t i = 0; i < r->elements; ++i) {
+            auto* e = r->element[i];
+            if (e && e->type == REDIS_REPLY_STRING)
+                out.emplace_back(e->str, static_cast<size_t>(e->len));
+        }
+    }
+    freeReplyObject(r);
+    return out;
+}
+
+int Redis::exists(std::string_view key) {
+    auto* slot = pick_slot();
+    if (!slot) return -1;
+    int present = -1;
+    auto* r = slot_exec(*slot, [&](redisContext* c) {
+        return static_cast<redisReply*>(
+            redisCommand(c, "EXISTS %b", key.data(), key.size()));
+    });
+    if (r) {
+        if (r->type == REDIS_REPLY_INTEGER)
+            present = static_cast<int>(r->integer);
+        freeReplyObject(r);
+    }
+    return present;
+}
+
+int Redis::transfer_proc_to_source(std::string_view src,
+                                    std::string_view dst,
+                                    std::string_view payload)
+{
+    // Atomic LREM-then-conditional-LPUSH. Only the caller whose LREM
+    // observes count > 0 performs the LPUSH; concurrent invocations
+    // therefore cannot both push the same payload to `dst`. This is
+    // the only safe way to coordinate the LMOVE-window recovery across
+    // multiple scheduler instances without holding a Postgres
+    // transaction lock through Redis I/O.
+    static constexpr const char* kScript =
+        "local removed = redis.call('LREM', KEYS[1], 1, ARGV[1])\n"
+        "if removed > 0 then\n"
+        "  redis.call('LPUSH', KEYS[2], ARGV[1])\n"
+        "  return 1\n"
+        "else\n"
+        "  return 0\n"
+        "end\n";
+
+    auto* slot = pick_slot();
+    if (!slot) return -1;
+    int outcome = -1;
+    auto* r = slot_exec(*slot, [&](redisContext* c) {
+        return static_cast<redisReply*>(
+            redisCommand(c, "EVAL %s 2 %b %b %b",
+                         kScript,
+                         src.data(),     src.size(),
+                         dst.data(),     dst.size(),
+                         payload.data(), payload.size()));
+    });
+    if (r) {
+        if (r->type == REDIS_REPLY_INTEGER)
+            outcome = static_cast<int>(r->integer);
+        freeReplyObject(r);
+    }
+    return outcome;
+}
+
+std::vector<std::string> Redis::scan_keys(std::string_view pattern, size_t limit) {
+    std::vector<std::string> keys;
+    auto* slot = pick_slot();
+    if (!slot) return keys;
+
+    long long cursor = 0;
+    do {
+        // Use a per-iteration COUNT of 256; Redis treats this as a hint.
+        auto* r = slot_exec(*slot, [&](redisContext* c) {
+            return static_cast<redisReply*>(
+                redisCommand(c, "SCAN %lld MATCH %b COUNT 256",
+                             cursor,
+                             pattern.data(), pattern.size()));
+        });
+        if (!r) break;
+        if (r->type != REDIS_REPLY_ARRAY || r->elements < 2) {
+            freeReplyObject(r);
+            break;
+        }
+        // r->element[0] = next cursor (as string), r->element[1] = array of keys.
+        cursor = std::stoll(r->element[0]->str);
+        redisReply* arr = r->element[1];
+        for (size_t i = 0; i < arr->elements && keys.size() < limit; ++i) {
+            redisReply* kr = arr->element[i];
+            if (kr->type == REDIS_REPLY_STRING)
+                keys.emplace_back(kr->str, static_cast<size_t>(kr->len));
+        }
+        freeReplyObject(r);
+    } while (cursor != 0 && keys.size() < limit);
+
+    return keys;
+}
+
 } // namespace wikore
