@@ -149,6 +149,7 @@ target_link_libraries(wikore_ingest_lib PUBLIC wikore_rag)
 add_library(wikore_scheduler_lib STATIC
     src/scheduler/outbox_worker.cpp
     src/scheduler/polling_fallback.cpp
+    src/scheduler/partition_maintainer.cpp
 )
 target_link_libraries(wikore_scheduler_lib PUBLIC wikore_rag wikore_infra)
 

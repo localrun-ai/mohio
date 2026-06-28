@@ -4,6 +4,7 @@
 #include "wikore/rag/vector_store.hpp"
 #include "wikore/redis.hpp"
 #include "wikore/scheduler/outbox_worker.hpp"
+#include "wikore/scheduler/partition_maintainer.hpp"
 #include "wikore/scheduler/polling_fallback.hpp"
 #include <drogon/drogon.h>
 #include <spdlog/spdlog.h>
@@ -12,15 +13,18 @@
 #include <format>
 
 // ---------------------------------------------------------------------------
-// wikore-scheduler: outbox drainer + polling fallback (Iteration 1).
+// wikore-scheduler: outbox drainer + polling fallback + partition maintainer.
 //
-// Two long-running coroutines on the event loop:
+// Three long-running coroutines on the event loop:
 //   * OutboxWorker drains qdrant_upsert_chunk_payload events from V015's
 //     outbox_events table (FOR UPDATE SKIP LOCKED), embeds each chunk
 //     batch via llama-server, upserts to Qdrant, and writes document_chunk_vectors.
 //   * PollingFallback advisory-locks per-call, finds document_versions
 //     rows stuck in 'pending' or 'processing' beyond 15 minutes, and
 //     promotes them to 'error' (or requeues, per V029).
+//   * PartitionMaintainer runs daily, pre-creates quarterly audit_log and
+//     monthly usage_events partitions 1 year ahead, and alerts on overflow
+//     into the catch-all DEFAULT partitions.
 //
 // SIGTERM/SIGINT are routed through drogon's signal-handler API (NOT
 // std::signal, which drogon overwrites in run()). Each handler flips
@@ -39,9 +43,8 @@ namespace {
 std::atomic<bool> g_shutdown{false};
 std::atomic<bool> g_fatal_exit{false};
 
-// Both workers must finish their drain path before drogon exits, otherwise
-// release_my_claims() / the polling xact_lock release won't run.
-std::atomic<int>  g_workers_remaining{2};
+// All workers must finish their drain path before drogon exits.
+std::atomic<int>  g_workers_remaining{3};
 
 void on_worker_exit(std::string_view name)
 {
@@ -149,6 +152,9 @@ int main()
             static wikore::scheduler::PollingFallback polling(
                 db, shutdown,
                 wikore::scheduler::PollingFallback::Options{});
+            static wikore::scheduler::PartitionMaintainer partitions(
+                db, shutdown,
+                wikore::scheduler::PartitionMaintainer::Options{});
 
             // Ensure the registry-resolved Qdrant collection exists
             // before any upsert runs. Failure here is fatal: a brief
@@ -170,6 +176,10 @@ int main()
             drogon::async_run([]() -> drogon::Task<void> {
                 co_await polling.run();
                 on_worker_exit("polling-fallback");
+            });
+            drogon::async_run([]() -> drogon::Task<void> {
+                co_await partitions.run();
+                on_worker_exit("partition-maintainer");
             });
         });
     });
