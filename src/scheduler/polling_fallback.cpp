@@ -118,7 +118,8 @@ drogon::Task<int> PollingFallback::sweep_once()
         co_return reaped;
     }
     if (!got_lock) {
-        co_await uow.commit();   // releases the connection cleanly
+        if (auto r = co_await uow.commit(); !r)
+            spdlog::warn("[polling-fallback] no-lock commit failed: {}", r.error().message);
         co_return reaped;
     }
 
@@ -291,10 +292,14 @@ drogon::Task<int> PollingFallback::sweep_once()
             }
         }
 
-        co_await uow.commit();
     } catch (const drogon::orm::DrogonDbException& ex) {
         spdlog::error("[polling-fallback] sweep failed: {}", ex.base().what());
         uow.rollback();
+        co_return 0;
+    }
+
+    if (auto r = co_await uow.commit(); !r) {
+        spdlog::error("[polling-fallback] sweep commit failed: {}", r.error().message);
         co_return 0;
     }
 
