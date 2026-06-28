@@ -38,10 +38,22 @@ std::string sha256_hex(std::string_view s)
 // ---------------------------------------------------------------------------
 // PostgresDocumentRepo::fetch_access_scopes
 //
-// Returns the owner org_unit_id of the document plus all org_unit_ids that
-// have at least one resource_grant with permission >= 'read' on this doc.
-// V002's resource_grants schema (the one on main) uses principal_id rather
-// than grantee_org_unit_id and permission rather than grant_type.
+// Computes access_scope_ids for a document's chunks at ingest time.
+// Three UNION arms (query-time complement: effective_read_orgs in access.cpp):
+//
+//   1. Owner: the document's owning org_unit always grants itself read.
+//   2. Doc-level grants: org_units with an explicit grant on this document.
+//      principal_applies_to is resolved query-side via the ancestor walk in
+//      effective_read_orgs -- we store the grant root (principal_id), not the
+//      expanded descendant subtree.
+//   3. Org-unit-level grants: grants where this document's owner sits within
+//      the resource subtree implied by resource_applies_to:
+//        self_only            -> exact owner match    (depth = 0)
+//        self_and_descendants -> owner is a descendant (depth >= 0)
+//
+// Cross-check: for the MatchAny intersection to work for every
+// principal_applies_to shape, effective_read_orgs must include all ancestors
+// of the user's effective membership org_units. See access.cpp.
 // ---------------------------------------------------------------------------
 
 drogon::Task<Result<std::vector<std::string>>>
@@ -49,21 +61,37 @@ PostgresDocumentRepo::fetch_access_scopes(std::string_view company_id,
                                            std::string_view document_id)
 {
     constexpr auto kSql = R"(
-        SELECT org_unit_id
-        FROM (
-            SELECT owner_org_unit_id AS org_unit_id
+        WITH doc AS (
+            SELECT owner_org_unit_id
             FROM   documents
             WHERE  company_id = $1::uuid AND id = $2::uuid
-            UNION
-            SELECT rg.principal_id
-            FROM   resource_grants rg
-            WHERE  rg.company_id     = $1::uuid
-              AND  rg.resource_type  = 'document'
-              AND  rg.resource_id    = $2::uuid
-              AND  rg.principal_type = 'org_unit'
-              AND  rg.permission IN ('read','write','admin')
-              AND  (rg.expires_at IS NULL OR rg.expires_at > now())
-        ) t
+        )
+        SELECT owner_org_unit_id::text AS org_unit_id FROM doc
+        UNION
+        SELECT rg.principal_id::text
+        FROM   resource_grants rg
+        WHERE  rg.company_id     = $1::uuid
+          AND  rg.resource_type  = 'document'
+          AND  rg.resource_id    = $2::uuid
+          AND  rg.principal_type = 'org_unit'
+          AND  rg.permission IN ('read','write','admin')
+          AND  (rg.expires_at IS NULL OR rg.expires_at > now())
+        UNION
+        SELECT rg.principal_id::text
+        FROM   resource_grants rg
+        JOIN   org_unit_closure c
+            ON c.company_id    = $1::uuid
+           AND c.ancestor_id   = rg.resource_id
+           AND c.descendant_id = (SELECT owner_org_unit_id FROM doc)
+        WHERE  rg.company_id     = $1::uuid
+          AND  rg.resource_type  = 'org_unit'
+          AND  rg.principal_type = 'org_unit'
+          AND  rg.permission IN ('read','write','admin')
+          AND  (rg.expires_at IS NULL OR rg.expires_at > now())
+          AND  (
+              rg.resource_applies_to = 'self_and_descendants'
+           OR (rg.resource_applies_to = 'self_only' AND c.depth = 0)
+          )
     )";
 
     try {
