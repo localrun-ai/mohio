@@ -27,53 +27,72 @@ AccessService::AccessService(drogon::orm::DbClientPtr db) : _db(std::move(db)) {
 // ---------------------------------------------------------------------------
 // effective_read_orgs
 //
-// Returns the set of org_unit IDs to use as the Qdrant MatchAny filter for
-// a user. The set is intersected with each chunk's access_scope_ids.
+// Returns the set of org_unit IDs to pass as the Qdrant MatchAny filter.
+// This set is intersected with each chunk's access_scope_ids at query time.
 //
-// Set-algebra contract (see also fetch_access_scopes in document_repo.cpp):
+// SET-ALGEBRA CONTRACT (see fetch_access_scopes in document_repo.cpp):
+//   access_scope_ids stores a RESOLVED set (ingest-time expansion):
+//     - self_only grants store only the grant principal.
+//     - self_and_descendants grants store principal + all its descendants.
+//   Therefore effective_read_orgs does NOT need an ancestor walk.
+//   It returns only the org_units the user is EFFECTIVELY A MEMBER OF:
+//     - direct memberships (any applies_to)
+//     - membership org_unit + all descendants when applies_to='self_and_descendants'
+//     - same for group-derived memberships
+//   Result is then constrained to descendants-or-self of org_unit_id so that
+//   a multi-membership user scoped to one branch cannot retrieve content
+//   accessible only via a sibling branch membership.
 //
-//   access_scope_ids stores GRANT ROOTS: owner org_unit + explicit grant
-//   principals. For a user to match grant root G in MatchAny, G must be in
-//   this set.
-//
-//   Two-join expansion:
-//     sub: expand memberships with applies_to='self_and_descendants' into the
-//          full descendant subtree. A user in a PARENT org_unit also "acts as"
-//          all child org_units (matching owner-entry access_scope_ids for docs
-//          owned by descendants).
-//     anc: walk UP from each effective org_unit to include all ancestors. A
-//          grant root G stored for a principal_applies_to='self_and_descendants'
-//          grant is reachable by members of G's descendants.
-//
-// Example: doc-level grant with principal=Legal, principal_applies_to='self_and_descendants'.
-//   access_scope_ids = {Legal}.
-//   User in Legal-Subteam: anc gives {Legal-Subteam, Legal, ...}.
-//   MatchAny fires on Legal -> access granted.
+// Example: doc grant principal=Legal, principal_applies_to='self_and_descendants'.
+//   access_scope_ids at ingest = {Legal, LegalSub}.
+//   User in LegalSub: effective_read_orgs(scope=Legal) = {Legal, LegalSub}.
+//   MatchAny: LegalSub in both -> access granted.
+//   User in HR (sibling, not in Legal scope): effective_read_orgs(scope=Legal) = {}.
+//   MatchAny: empty -> no results (fail-closed).
 // ---------------------------------------------------------------------------
 
 drogon::Task<std::vector<std::string>>
 AccessService::effective_read_orgs(std::string_view company_id,
                                    std::string_view user_id,
-                                   std::string_view /*org_unit_id*/)
+                                   std::string_view org_unit_id)
 {
     constexpr auto kSql = R"(
-        SELECT DISTINCT anc.ancestor_id::text AS org_unit_id
-        FROM   memberships m
-        JOIN   org_unit_closure sub
+        SELECT DISTINCT sub.descendant_id::text AS org_unit_id
+        FROM (
+            -- Direct user memberships
+            SELECT m.org_unit_id, m.applies_to
+            FROM   memberships m
+            WHERE  m.company_id = $1::uuid
+              AND  m.user_id    = $2::uuid
+              AND  (m.expires_at IS NULL OR m.expires_at > now())
+            UNION
+            -- Group-derived memberships
+            SELECT m.org_unit_id, m.applies_to
+            FROM   group_members gm
+            JOIN   memberships m
+                ON m.company_id = gm.company_id
+               AND m.group_id   = gm.group_id
+            WHERE  gm.company_id = $1::uuid
+              AND  gm.user_id    = $2::uuid
+              AND  (m.expires_at IS NULL OR m.expires_at > now())
+        ) base
+        -- Expand self_and_descendants into subtree; self_only stays at depth 0
+        JOIN org_unit_closure sub
             ON sub.company_id  = $1::uuid
-           AND sub.ancestor_id = m.org_unit_id
-           AND (m.applies_to = 'self_and_descendants' OR sub.depth = 0)
-        JOIN   org_unit_closure anc
-            ON anc.company_id    = $1::uuid
-           AND anc.descendant_id = sub.descendant_id
-        WHERE  m.company_id = $1::uuid
-          AND  m.user_id    = $2::uuid
-          AND  (m.expires_at IS NULL OR m.expires_at > now())
+           AND sub.ancestor_id = base.org_unit_id
+           AND (base.applies_to = 'self_and_descendants' OR sub.depth = 0)
+        -- Constrain to the requested org_unit_id scope (descendants-or-self)
+        JOIN org_unit_closure scope
+            ON scope.company_id    = $1::uuid
+           AND scope.ancestor_id   = $3::uuid
+           AND scope.descendant_id = sub.descendant_id
     )";
 
     try {
         auto rows = co_await _db->execSqlCoro(kSql,
-            std::string(company_id), std::string(user_id));
+            std::string(company_id),
+            std::string(user_id),
+            std::string(org_unit_id));
         std::vector<std::string> result;
         result.reserve(rows.size());
         for (const auto& row : rows)
@@ -90,8 +109,8 @@ AccessService::effective_read_orgs(std::string_view company_id,
 // has_role
 //
 // Returns true if the user holds at least `required` on org_unit_id.
-// Checks direct membership AND ancestor memberships with
-// applies_to='self_and_descendants' (which extends role to all descendants).
+// Checks direct and group-derived memberships, both direct (any applies_to)
+// and ancestral memberships with applies_to='self_and_descendants'.
 // ---------------------------------------------------------------------------
 
 drogon::Task<bool>
@@ -102,22 +121,33 @@ AccessService::has_role(std::string_view user_id,
     constexpr auto kSql = R"(
         SELECT EXISTS (
             SELECT 1
-            FROM   memberships m
-            JOIN   org_unit_closure c
-                ON c.company_id    = m.company_id
-               AND c.ancestor_id   = m.org_unit_id
+            FROM (
+                SELECT m.org_unit_id, m.applies_to, m.role, m.company_id
+                FROM   memberships m
+                WHERE  m.user_id = $1::uuid
+                  AND  (m.expires_at IS NULL OR m.expires_at > now())
+                UNION ALL
+                SELECT m.org_unit_id, m.applies_to, m.role, m.company_id
+                FROM   group_members gm
+                JOIN   memberships m
+                    ON m.company_id = gm.company_id
+                   AND m.group_id   = gm.group_id
+                WHERE  gm.user_id = $1::uuid
+                  AND  (m.expires_at IS NULL OR m.expires_at > now())
+            ) base
+            JOIN org_unit_closure c
+                ON c.company_id    = base.company_id
+               AND c.ancestor_id   = base.org_unit_id
                AND c.descendant_id = $2::uuid
-            WHERE  m.user_id   = $1::uuid
-              AND  (m.expires_at IS NULL OR m.expires_at > now())
-              AND  (m.applies_to = 'self_and_descendants' OR c.depth = 0)
-              AND  m.role = ANY(
-                       CASE $3::text
-                           WHEN 'viewer' THEN ARRAY['viewer','editor','admin']
-                           WHEN 'editor' THEN ARRAY['editor','admin']
-                           WHEN 'admin'  THEN ARRAY['admin']
-                           ELSE ARRAY[]::text[]
-                       END
-                   )
+            WHERE (base.applies_to = 'self_and_descendants' OR c.depth = 0)
+              AND base.role = ANY(
+                      CASE $3::text
+                          WHEN 'viewer' THEN ARRAY['viewer','editor','admin']
+                          WHEN 'editor' THEN ARRAY['editor','admin']
+                          WHEN 'admin'  THEN ARRAY['admin']
+                          ELSE ARRAY[]::text[]
+                      END
+                  )
         ) AS has_access
     )";
 
@@ -147,6 +177,12 @@ AccessService::invalidate_cache(std::string_view, std::string_view, std::string_
 
 // ---------------------------------------------------------------------------
 // Membership and grant CRUD (stubs - API layer, Iteration 2)
+//
+// TODO(resync): each mutation that changes memberships, grants, org-unit
+// ownership, or the org tree must enqueue an outbox event to re-run
+// fetch_access_scopes over all affected document_chunks and push updated
+// Qdrant payloads. Until this resync worker is implemented, revocations and
+// grant additions do not take effect until documents are re-ingested.
 // ---------------------------------------------------------------------------
 
 drogon::Task<void>

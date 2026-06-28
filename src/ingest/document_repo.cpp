@@ -38,22 +38,37 @@ std::string sha256_hex(std::string_view s)
 // ---------------------------------------------------------------------------
 // PostgresDocumentRepo::fetch_access_scopes
 //
-// Computes access_scope_ids for a document's chunks at ingest time.
-// Three UNION arms (query-time complement: effective_read_orgs in access.cpp):
+// Computes the access_scope_ids snapshot for a document's chunks at ingest.
+// Query-time complement: effective_read_orgs() in access.cpp.
 //
-//   1. Owner: the document's owning org_unit always grants itself read.
-//   2. Doc-level grants: org_units with an explicit grant on this document.
-//      principal_applies_to is resolved query-side via the ancestor walk in
-//      effective_read_orgs -- we store the grant root (principal_id), not the
-//      expanded descendant subtree.
-//   3. Org-unit-level grants: grants where this document's owner sits within
-//      the resource subtree implied by resource_applies_to:
-//        self_only            -> exact owner match    (depth = 0)
-//        self_and_descendants -> owner is a descendant (depth >= 0)
+// SET-ALGEBRA CONTRACT:
+//   access_scope_ids stores a RESOLVED set of org_unit IDs. A user may
+//   retrieve the chunk if and only if their effective_read_orgs (the set of
+//   org_units they are directly a member of, plus descendants via
+//   applies_to='self_and_descendants') intersects this set via MatchAny.
 //
-// Cross-check: for the MatchAny intersection to work for every
-// principal_applies_to shape, effective_read_orgs must include all ancestors
-// of the user's effective membership org_units. See access.cpp.
+//   principal_applies_to is handled HERE (ingest side), not query-side:
+//     self_only:            store principal_id alone.
+//     self_and_descendants: store principal_id + all its descendants via
+//                           org_unit_closure so that subtree members match
+//                           without any ancestor walk at query time.
+//
+//   This means effective_read_orgs does NOT walk ancestors -- it only
+//   returns org_units the user is effectively a member of. The two sides
+//   are consistent: the ingest side expands "who can see" into the stored
+//   set; the query side expands "who the user is" into the filter set.
+//
+// FOUR UNION ARMS:
+//   1. Owner:                     owner_org_unit_id.
+//   2a. Doc grant self_only:      grant principal_id only.
+//   2b. Doc grant s_and_d:        principal_id + all its descendants.
+//   3a. Org-unit grant self_only: principal_id, resource subtree check (depth=0).
+//   3b. Org-unit grant s_and_d:   principal subtree, resource subtree check.
+//
+// RESYNC NOTE: this snapshot is computed once at ingest. Grant revocation,
+// expiry, owner changes, and org-tree moves leave existing snapshots stale.
+// A resync worker that re-runs fetch_access_scopes + Qdrant payload update
+// must be triggered by AccessService mutation operations (tracked separately).
 // ---------------------------------------------------------------------------
 
 drogon::Task<Result<std::vector<std::string>>>
@@ -66,31 +81,71 @@ PostgresDocumentRepo::fetch_access_scopes(std::string_view company_id,
             FROM   documents
             WHERE  company_id = $1::uuid AND id = $2::uuid
         )
+        -- 1. Owner
         SELECT owner_org_unit_id::text AS org_unit_id FROM doc
         UNION
+        -- 2a. Document-level grant, principal self_only
         SELECT rg.principal_id::text
         FROM   resource_grants rg
-        WHERE  rg.company_id     = $1::uuid
-          AND  rg.resource_type  = 'document'
-          AND  rg.resource_id    = $2::uuid
-          AND  rg.principal_type = 'org_unit'
+        WHERE  rg.company_id           = $1::uuid
+          AND  rg.resource_type        = 'document'
+          AND  rg.resource_id          = $2::uuid
+          AND  rg.principal_type       = 'org_unit'
+          AND  rg.principal_applies_to = 'self_only'
           AND  rg.permission IN ('read','write','admin')
           AND  (rg.expires_at IS NULL OR rg.expires_at > now())
         UNION
+        -- 2b. Document-level grant, principal self_and_descendants: expand subtree
+        SELECT pc.descendant_id::text
+        FROM   resource_grants rg
+        JOIN   org_unit_closure pc
+            ON pc.company_id  = $1::uuid
+           AND pc.ancestor_id = rg.principal_id
+        WHERE  rg.company_id           = $1::uuid
+          AND  rg.resource_type        = 'document'
+          AND  rg.resource_id          = $2::uuid
+          AND  rg.principal_type       = 'org_unit'
+          AND  rg.principal_applies_to = 'self_and_descendants'
+          AND  rg.permission IN ('read','write','admin')
+          AND  (rg.expires_at IS NULL OR rg.expires_at > now())
+        UNION
+        -- 3a. Org-unit-level grant, principal self_only, resource subtree check
         SELECT rg.principal_id::text
         FROM   resource_grants rg
-        JOIN   org_unit_closure c
-            ON c.company_id    = $1::uuid
-           AND c.ancestor_id   = rg.resource_id
-           AND c.descendant_id = (SELECT owner_org_unit_id FROM doc)
-        WHERE  rg.company_id     = $1::uuid
-          AND  rg.resource_type  = 'org_unit'
-          AND  rg.principal_type = 'org_unit'
+        JOIN   org_unit_closure rc
+            ON rc.company_id    = $1::uuid
+           AND rc.ancestor_id   = rg.resource_id
+           AND rc.descendant_id = (SELECT owner_org_unit_id FROM doc)
+        WHERE  rg.company_id           = $1::uuid
+          AND  rg.resource_type        = 'org_unit'
+          AND  rg.principal_type       = 'org_unit'
+          AND  rg.principal_applies_to = 'self_only'
           AND  rg.permission IN ('read','write','admin')
           AND  (rg.expires_at IS NULL OR rg.expires_at > now())
           AND  (
               rg.resource_applies_to = 'self_and_descendants'
-           OR (rg.resource_applies_to = 'self_only' AND c.depth = 0)
+           OR (rg.resource_applies_to = 'self_only' AND rc.depth = 0)
+          )
+        UNION
+        -- 3b. Org-unit-level grant, principal self_and_descendants: expand subtree
+        SELECT pc.descendant_id::text
+        FROM   resource_grants rg
+        JOIN   org_unit_closure rc
+            ON rc.company_id    = $1::uuid
+           AND rc.ancestor_id   = rg.resource_id
+           AND rc.descendant_id = (SELECT owner_org_unit_id FROM doc)
+        JOIN   org_unit_closure pc
+            ON pc.company_id  = $1::uuid
+           AND pc.ancestor_id = rg.principal_id
+        WHERE  rg.company_id           = $1::uuid
+          AND  rg.resource_type        = 'org_unit'
+          AND  rg.principal_type       = 'org_unit'
+          AND  rg.principal_applies_to = 'self_and_descendants'
+          AND  rg.permission IN ('read','write','admin')
+          AND  (rg.expires_at IS NULL OR rg.expires_at > now())
+          AND  (
+              rg.resource_applies_to = 'self_and_descendants'
+           OR (rg.resource_applies_to = 'self_only' AND rc.depth = 0)
           )
     )";
 
