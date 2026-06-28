@@ -1,5 +1,7 @@
 #pragma once
 #include <string>
+#include <string_view>
+#include <vector>
 #include <optional>
 #include <chrono>
 #include "wikore/config.hpp"
@@ -26,6 +28,58 @@ struct Redis {
                     std::chrono::seconds ttl = {});
 
     static void del(std::string_view key);
+
+    // --- List operations for the per-tenant ingest queue ---------------------
+
+    // Push to the left (head) of `key`. Returns the new list length, or
+    // -1 on error / no pool.
+    static long long lpush(std::string_view key, std::string_view value);
+
+    // Pop from the right (tail) of `key`. Returns std::nullopt if the list
+    // is empty, the key is missing, or Redis is unavailable.
+    static std::optional<std::string> rpop(std::string_view key);
+
+    // Atomically move the tail of `src` to the head of `dst` and return
+    // the moved value. The per-worker processing-list pattern uses this
+    // so a crashed worker leaves the in-flight job on `dst` for the
+    // sweep reaper to requeue. Returns std::nullopt if `src` was empty.
+    static std::optional<std::string>
+    lmove_right_left(std::string_view src, std::string_view dst);
+
+    // Remove the first `count` occurrences of `value` from `key`. Returns
+    // the number removed, or -1 on error / no pool. Called by a worker on
+    // successful processing to drop the entry from its processing list.
+    static long long lrem(std::string_view key, long long count,
+                          std::string_view value);
+
+    // Atomically remove `payload` from `src` (LREM count=1) and, if and
+    // only if the LREM removed something, LPUSH it to `dst`. Implemented
+    // via EVAL so concurrent schedulers cannot both LPUSH the same item:
+    // only the scheduler whose LREM observes count=1 LPUSHes.
+    //
+    // Returns:
+    //   * 1  -> transfer succeeded
+    //   * 0  -> entry was not present on `src` (another sweeper got it)
+    //   * -1 -> Redis error / no pool
+    static int transfer_proc_to_source(std::string_view src,
+                                       std::string_view dst,
+                                       std::string_view payload);
+
+    // Return the contents of `key` in [start, stop]. Stop = -1 means end.
+    // Used by the sweep reaper to inspect orphaned processing lists.
+    static std::vector<std::string> lrange(std::string_view key,
+                                           long long start, long long stop);
+
+    // EXISTS check (1 if key exists, 0 otherwise; -1 on error / no pool).
+    // Used by the sweep reaper to detect crashed workers via missing
+    // heartbeat keys.
+    static int exists(std::string_view key);
+
+    // Cursor-paged scan returning keys matching `pattern`. Bounded `limit`
+    // caps the number of keys returned to keep the function predictable.
+    // Uses SCAN MATCH (NOT KEYS) so the call is production-safe.
+    static std::vector<std::string> scan_keys(std::string_view pattern,
+                                              size_t limit = 1024);
 };
 
 } // namespace wikore

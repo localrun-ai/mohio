@@ -3,6 +3,7 @@
 #include "wikore/adapters/postgres/error_mapper.hpp"
 #include "wikore/application/promote_document_version.hpp"
 #include "wikore/db.hpp"
+#include "wikore/redis.hpp"
 #include "wikore/config.hpp"
 #include <drogon/drogon.h>
 #include <drogon/utils/coroutine.h>
@@ -63,7 +64,13 @@ struct DrogonLoop {
         if (!db_available()) return;
         wikore::Config cfg;
         cfg.database_url = std::getenv("DATABASE_URL");
+        if (const char* r = std::getenv("REDIS_URL")) cfg.redis_url = r;
         wikore::Db::init(cfg, /*pool_size=*/8);
+        // Initialise Redis too so integration tests that need queues
+        // (iter-1 ingest worker) share the same loop and pool. Safe to
+        // call even when REDIS_URL is unset -- Redis::init warns and
+        // disables itself in that case.
+        wikore::Redis::init(cfg);
         t = std::thread([this] {
             drogon::app()
                 .setThreadNum(4)

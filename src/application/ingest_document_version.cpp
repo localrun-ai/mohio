@@ -8,7 +8,7 @@
 
 namespace wikore::application {
 
-drogon::Task<Result<void>>
+drogon::Task<Result<IngestDispatchOutcome>>
 IngestDocumentVersionUseCase::execute(RequestContext ctx,
                                        IngestDocumentVersionCmd cmd)
 {
@@ -28,25 +28,72 @@ IngestDocumentVersionUseCase::execute(RequestContext ctx,
                  ctx.span.trace_id);
 
     // -----------------------------------------------------------------------
-    // 1. Mark 'processing' outside any UoW.
-    //    If the rest of the pipeline fails, the row remains in 'processing'
-    //    long enough for the scheduler's polling fallback to find it (per
-    //    development_plan.md iter-1 "stuck ingest re-enqueue").
+    // 1. Claim the row for processing.
+    //
+    //    Always via claim_for_processing: a CAS that flips pending ->
+    //    processing AND persists the IngestJob payload AND generates a
+    //    per-claim ownership token (UUID) in one atomic statement.
+    //    We pass the cmd's payload (empty allowed -- the column stores
+    //    NULL for tests that bypass the worker).
+    //
+    //    Returns:
+    //      * std::nullopt -> CAS lost (row already processing/done/error,
+    //        or row is archived). Treat as DuplicateSkipped no-op.
+    //      * non-empty UUID -> we own the claim. Carry the token to
+    //        every terminal mutation (mark_ingest_done / set_ingest_error)
+    //        so a worker whose claim is later reset by the polling
+    //        fallback cannot overwrite a newer worker's terminal state.
+    //
+    //    Stays outside any UoW so a failure in steps 2+ leaves the row in
+    //    'processing' long enough for the scheduler's polling fallback to
+    //    find it (per development_plan.md iter-1 "stuck ingest re-enqueue").
     // -----------------------------------------------------------------------
-    if (auto r = co_await repo_->set_ingest_status(
-            cmd.company_id, cmd.document_version_id,
-            ingest::IngestStatus::processing, db_);
-        !r)
+    std::string claim_token;
     {
-        co_return std::unexpected(r.error());
+        auto claim = co_await repo_->claim_for_processing(
+            cmd.company_id, cmd.document_version_id,
+            cmd.ingest_job_payload, db_);
+        if (!claim)
+            co_return std::unexpected(claim.error());
+        if (!claim->has_value()) {
+            spdlog::info("[ingest] duplicate delivery for version {}; "
+                         "row is not claimable (likely already processing, "
+                         "done, error, or archived). Treating as no-op.",
+                         cmd.document_version_id);
+            co_return IngestDispatchOutcome::DuplicateSkipped;
+        }
+        claim_token = std::move(**claim);
     }
 
-    // Helper: mark 'error' then propagate the original error.
-    auto fail = [&](Error e) -> drogon::Task<Result<void>> {
-        co_await repo_->set_ingest_status(
+    // Helper: terminal-error path. Sets ingest_status='error' (gated by
+    // claim_token so we never resurrect another worker's done/error
+    // state) and returns either TerminalError (we owned, row is now
+    // 'error') or OwnershipLost (the polling fallback reset our claim
+    // while we were working).
+    auto fail = [&, this](Error e)
+        -> drogon::Task<Result<IngestDispatchOutcome>>
+    {
+        auto r = co_await repo_->set_ingest_status(
             cmd.company_id, cmd.document_version_id,
-            ingest::IngestStatus::error, db_, e.message);
-        co_return std::unexpected(std::move(e));
+            ingest::IngestStatus::error, claim_token, e.message, db_);
+        if (!r) {
+            // The set_ingest_status DB call itself failed. We don't know
+            // whether the row is in 'error' or not. Propagate as Err so
+            // the worker leaves the proc entry in place (transferred
+            // back) for recovery on the next dispatch.
+            spdlog::error("[ingest] fail(): set_ingest_status('error') "
+                          "failed: {}; original error was: {}",
+                          r.error().message, e.message);
+            co_return std::unexpected(std::move(e));
+        }
+        if (!*r) {
+            spdlog::warn("[ingest] fail(): ownership lost for version {} "
+                         "(claim token no longer matches; polling "
+                         "fallback reset us). Original error was: {}",
+                         cmd.document_version_id, e.message);
+            co_return IngestDispatchOutcome::OwnershipLost;
+        }
+        co_return IngestDispatchOutcome::TerminalError;
     };
 
     // -----------------------------------------------------------------------
@@ -199,21 +246,56 @@ IngestDocumentVersionUseCase::execute(RequestContext ctx,
 
     // Mark done inside the UoW. document_versions_done_state_chk requires
     // completed_at AND chunk_count to be non-NULL; mark_ingest_done sets
-    // both atomically.
-    if (auto r = co_await repo_->mark_ingest_done(
+    // both atomically. Ownership-gated by claim_token so a worker that
+    // was reset by the polling fallback cannot overwrite a newer
+    // worker's terminal state.
+    auto done = co_await repo_->mark_ingest_done(
             cmd.company_id, cmd.document_version_id,
-            static_cast<int>(chunks.size()), uow);
-        !r)
-    {
+            static_cast<int>(chunks.size()), claim_token, uow);
+    if (!done) {
         uow.rollback();
-        co_return co_await fail(r.error());
+        co_return co_await fail(done.error());
+    }
+    if (!*done) {
+        // OwnershipLost: the polling fallback reset our claim while we
+        // were processing, and a newer worker now owns this row.
+        // Rollback our (now-stale) UoW so we don't pollute chunks/
+        // outbox with our work; the new worker will write its own.
+        uow.rollback();
+        spdlog::warn("[ingest] mark_ingest_done: ownership lost for "
+                     "version {}; rolling back UoW. The new owner is "
+                     "responsible for the row's terminal transition.",
+                     cmd.document_version_id);
+        co_return IngestDispatchOutcome::OwnershipLost;
     }
 
-    co_await uow.commit();
+    // COMMIT can throw (e.g. deferred constraint violation, server
+    // disconnect mid-acknowledge). Catch so the worker's run-loop
+    // doesn't terminate with the periodic heartbeat timer still
+    // running. On exception we return Err -> the worker's transfer-
+    // back-to-source-queue path runs and a later dispatch retries.
+    //
+    // The row state when COMMIT fails is well-defined: PG rolled back
+    // the transaction, so document_versions remains in 'processing'
+    // (with our claim_token still set). Sweep #2 will eventually
+    // reset and requeue if no worker picks it up.
+    try {
+        co_await uow.commit();
+    } catch (const drogon::orm::DrogonDbException& ex) {
+        spdlog::error("[ingest] uow.commit() failed for version {}: {}; "
+                      "row remains 'processing' (PG rolled back)",
+                      cmd.document_version_id, ex.base().what());
+        co_return std::unexpected(postgres::map_db_exception(ex));
+    } catch (const std::exception& ex) {
+        spdlog::error("[ingest] uow.commit() threw {} for version {}",
+                      ex.what(), cmd.document_version_id);
+        co_return std::unexpected(Error::database_error(
+            std::format("commit failed: {}", ex.what())));
+    }
 
     spdlog::info("[ingest] done company={} version={} chunks={}",
                  cmd.company_id, cmd.document_version_id, chunks.size());
-    co_return Result<void>{};
+    co_return IngestDispatchOutcome::Processed;
 }
 
 } // namespace wikore::application

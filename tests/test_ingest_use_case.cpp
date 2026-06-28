@@ -266,7 +266,7 @@ TEST_CASE("IngestDocumentVersion: re-ingest is idempotent (no duplicate chunks)"
     CHECK(std::stoi(outbox[0]["n"].c_str()) == 1);
 }
 
-TEST_CASE("IngestDocumentVersion: missing file marks version 'error'",
+TEST_CASE("IngestDocumentVersion: missing file marks version 'error' (returns TerminalError)",
           "[integration][ingest]")
 {
     if (!db_available()) SKIP("DATABASE_URL not set");
@@ -281,7 +281,11 @@ TEST_CASE("IngestDocumentVersion: missing file marks version 'error'",
          .document_version_id = VERSION,
          .file_path           = "/nonexistent/path/to/missing.md",
          .embed_model_id      = "bge-m3"}));
-    REQUIRE_FALSE(result.has_value());
+    // Post-CAS terminal failures (the pipeline ran past claim_for_processing
+    // and then hit a business error like missing file) return Ok(TerminalError);
+    // pre-CAS infra failures return Err. The row is in 'error' either way.
+    REQUIRE(result.has_value());
+    CHECK(*result == wikore::application::IngestDispatchOutcome::TerminalError);
 
     auto v = exec_sync(db,
         "SELECT ingest_status FROM document_versions WHERE id=$1::uuid",
@@ -309,8 +313,11 @@ TEST_CASE("IngestDocumentVersion: rejected input marks version 'error'",
          .document_version_id = VERSION,
          .file_path           = path.string(),
          .embed_model_id      = "bge-m3"}));
-    REQUIRE_FALSE(result.has_value());
-    CHECK(result.error().message == "ingest.empty_file");
+    // Post-CAS terminal failure (parser rejected the empty file after
+    // claim_for_processing won) -> returns Ok(TerminalError); row is
+    // 'error' with error_msg persisted by the token-gated set_status.
+    REQUIRE(result.has_value());
+    CHECK(*result == wikore::application::IngestDispatchOutcome::TerminalError);
 
     auto v = exec_sync(db,
         "SELECT ingest_status, error_msg FROM document_versions WHERE id=$1::uuid",
@@ -350,8 +357,13 @@ TEST_CASE("PostgresDocumentRepo::mark_ingest_done sets completed_at and chunk_co
     drogon::sync_wait([&db]() -> drogon::Task<void> {
         wikore::ingest::PostgresDocumentRepo repo{db};
         auto uow = co_await wikore::postgres::UnitOfWork::begin(db);
-        auto r = co_await repo.mark_ingest_done(CO, VERSION, /*chunk_count=*/7, uow);
+        // No claim_token: tests bypass claim_for_processing for direct
+        // mark_done verification. Empty token disables the ownership
+        // check (test/legacy path).
+        auto r = co_await repo.mark_ingest_done(
+            CO, VERSION, /*chunk_count=*/7, /*claim_token=*/"", uow);
         REQUIRE(r.has_value());
+        REQUIRE(*r == true);
         co_await uow.commit();
     }());
 
@@ -372,10 +384,11 @@ TEST_CASE("PostgresDocumentRepo::set_ingest_status rejects 'done' (use mark_inge
     seed_ingest_fixtures(db);
 
     auto result = drogon::sync_wait(
-        [&db]() -> drogon::Task<wikore::Result<void>> {
+        [&db]() -> drogon::Task<wikore::Result<bool>> {
             wikore::ingest::PostgresDocumentRepo repo{db};
             co_return co_await repo.set_ingest_status(
-                CO, VERSION, wikore::ingest::IngestStatus::done, db);
+                CO, VERSION, wikore::ingest::IngestStatus::done,
+                /*claim_token=*/"", /*error_msg=*/"", db);
         }());
     REQUIRE_FALSE(result.has_value());
     CHECK(result.error().kind == wikore::Error::Kind::InvalidState);
