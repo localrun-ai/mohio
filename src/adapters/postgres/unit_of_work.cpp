@@ -9,7 +9,7 @@ drogon::Task<UnitOfWork> UnitOfWork::begin(drogon::orm::DbClientPtr db) {
     co_return UnitOfWork{std::move(tx)};
 }
 
-drogon::Task<void> UnitOfWork::commit() {
+drogon::Task<Result<void>> UnitOfWork::commit() {
     // Use setCommitCallback to get a signal when PG acknowledges COMMIT.
     // Build a coroutine-friendly awaitable around the callback.
     //
@@ -39,10 +39,10 @@ drogon::Task<void> UnitOfWork::commit() {
     const bool ok = co_await CommitAwaiter{std::move(tx_)};
     if (!ok) {
         spdlog::error("[uow] COMMIT was rejected by PostgreSQL");
-        throw drogon::orm::Failure(
-            "wikore::postgres::UnitOfWork: COMMIT was rejected by PostgreSQL");
+        co_return std::unexpected(Error::database_error("uow.commit_failed"));
     }
     committed_ = true;
+    co_return Result<void>{};
 }
 
 UnitOfWork::~UnitOfWork() {
