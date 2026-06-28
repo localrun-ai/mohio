@@ -25,7 +25,7 @@ constexpr auto GRP = "a05e0000-0000-0000-0000-000000000090"; // group with LEGAL
 constexpr auto DOC1 = "a05e0000-0000-0000-0000-000000000020";
 // DOC2: owned by HR_SUB, ou grant (principal=LEGAL s_only, resource=HR s_and_d)
 constexpr auto DOC2 = "a05e0000-0000-0000-0000-000000000021";
-// DOC3: owned by HR_SUB, ou grant (principal=LEGAL s_only, resource=HR s_only) -- must NOT match
+// DOC3: owned by HR_SUB, ou grant (principal=LEGAL_SUB s_only, resource=HR s_only) -- must NOT match
 constexpr auto DOC3 = "a05e0000-0000-0000-0000-000000000022";
 // DOC4: owned by HR_SUB, ou grant (principal=LEGAL s_only, resource=HR_SUB s_only) -- exact match
 constexpr auto DOC4 = "a05e0000-0000-0000-0000-000000000023";
@@ -88,7 +88,7 @@ void seed_access_fixtures(drogon::orm::DbClientPtr db)
 
     // Group with LEGAL membership
     exec_sync(db,
-        "INSERT INTO groups (id, company_id, name, slug) VALUES ($1::uuid, $2::uuid, 'LegalGroup', 'legalgroup')",
+        "INSERT INTO groups (id, company_id, name) VALUES ($1::uuid, $2::uuid, 'LegalGroup')",
         std::string(GRP), std::string(CO));
     exec_sync(db,
         "INSERT INTO memberships (company_id, group_id, org_unit_id, role, applies_to) "
@@ -127,33 +127,6 @@ void seed_access_fixtures(drogon::orm::DbClientPtr db)
             std::string(doc_id), std::string(CO), g_hr_sub);
     };
     ins_doc(DOC1); ins_doc(DOC2); ins_doc(DOC3); ins_doc(DOC4); ins_doc(DOC5);
-
-    auto grant = [&](const std::string& resource_id, const char* res_applies,
-                     const std::string& principal_id, const char* pri_applies,
-                     const char* rtype = "org_unit") {
-        exec_sync(db,
-            "INSERT INTO resource_grants "
-            "(company_id, resource_type, resource_id, resource_applies_to, "
-            " principal_type, principal_id, principal_applies_to, permission, granted_by) "
-            "VALUES ($1::uuid,$2,$3::uuid,$4,'org_unit',$5::uuid,$6,'read',$7::uuid)",
-            std::string(CO), std::string(rtype),
-            resource_id, std::string(res_applies),
-            principal_id, std::string(pri_applies), std::string(UA));
-    };
-
-    // DOC2: ou grant, resource=HR s_and_d, principal=LEGAL s_only
-    grant(g_hr, "self_and_descendants", g_legal, "self_only");
-    // DOC3: ou grant, resource=HR self_only -- HR_SUB is depth>0, must NOT apply
-    grant(g_hr, "self_only", g_legal, "self_only");
-    // DOC4: ou grant, resource=HR_SUB self_only -- exact match, must apply
-    grant(g_hr_sub, "self_only", g_legal, "self_only");
-    // DOC5: doc-level grant, principal=LEGAL s_and_d -- LEGAL_SUB also stored
-    exec_sync(db,
-        "INSERT INTO resource_grants "
-        "(company_id, resource_type, resource_id, resource_applies_to, "
-        " principal_type, principal_id, principal_applies_to, permission, granted_by) "
-        "VALUES ($1::uuid,'document',$2::uuid,'self_only','org_unit',$3::uuid,'self_and_descendants','read',$4::uuid)",
-        std::string(CO), std::string(DOC5), g_legal, std::string(UA));
 }
 
 bool contains(const std::vector<std::string>& v, const std::string& s)
@@ -207,6 +180,7 @@ TEST_CASE("effective_read_orgs: self_only membership, scoped to HR_SUB",
 {
     if (!db_available()) SKIP("DATABASE_URL not set");
     auto db = wikore::Db::get();
+    seed_access_fixtures(db);
 
     // UB: viewer in HR_SUB (self_only), scoped to HR_SUB.
     // Expected: HR_SUB only. No subtree expansion, no ancestor walk.
@@ -225,6 +199,7 @@ TEST_CASE("effective_read_orgs: self_only scoped to HR includes HR_SUB",
 {
     if (!db_available()) SKIP("DATABASE_URL not set");
     auto db = wikore::Db::get();
+    seed_access_fixtures(db);
 
     // UB is a member of HR_SUB (self_only). When browsing HR context,
     // HR_SUB is a descendant of HR so it passes the scope filter.
@@ -240,6 +215,7 @@ TEST_CASE("effective_read_orgs: multi-branch user scoped to Legal excludes HR br
 {
     if (!db_available()) SKIP("DATABASE_URL not set");
     auto db = wikore::Db::get();
+    seed_access_fixtures(db);
 
     // UC: member of both LEGAL and HR (self_and_descendants).
     // Scoped to LEGAL: should only include Legal subtree.
@@ -257,6 +233,7 @@ TEST_CASE("effective_read_orgs: group-derived membership works",
 {
     if (!db_available()) SKIP("DATABASE_URL not set");
     auto db = wikore::Db::get();
+    seed_access_fixtures(db);
 
     // UG is a member of GRP which has LEGAL (self_and_descendants) membership.
     // Scoped to LEGAL: should include LEGAL and LEGAL_SUB.
@@ -277,6 +254,7 @@ TEST_CASE("has_role: self_and_descendants propagates to descendants",
 {
     if (!db_available()) SKIP("DATABASE_URL not set");
     auto db = wikore::Db::get();
+    seed_access_fixtures(db);
 
     wikore::AccessService svc{db};
     auto r1 = drogon::sync_wait(svc.has_role(UA, g_legal,     wikore::Role::admin));
@@ -294,6 +272,7 @@ TEST_CASE("has_role: self_only does not propagate to descendants",
 {
     if (!db_available()) SKIP("DATABASE_URL not set");
     auto db = wikore::Db::get();
+    seed_access_fixtures(db);
 
     wikore::AccessService svc{db};
     auto r1 = drogon::sync_wait(svc.has_role(UB, g_hr_sub, wikore::Role::viewer));
@@ -307,6 +286,7 @@ TEST_CASE("has_role: group-derived membership grants role",
 {
     if (!db_available()) SKIP("DATABASE_URL not set");
     auto db = wikore::Db::get();
+    seed_access_fixtures(db);
 
     wikore::AccessService svc{db};
     // UG is in GRP which has editor in LEGAL (self_and_descendants)
@@ -327,6 +307,7 @@ TEST_CASE("fetch_access_scopes: no grants -> owner only",
 {
     if (!db_available()) SKIP("DATABASE_URL not set");
     auto db = wikore::Db::get();
+    seed_access_fixtures(db);
 
     wikore::ingest::PostgresDocumentRepo repo{db};
     auto result = drogon::sync_wait(repo.fetch_access_scopes(CO, DOC1));
@@ -341,9 +322,16 @@ TEST_CASE("fetch_access_scopes: ou grant self_and_descendants on resource ancest
 {
     if (!db_available()) SKIP("DATABASE_URL not set");
     auto db = wikore::Db::get();
-
+    seed_access_fixtures(db);
     // DOC2: grant resource=HR (s_and_d), principal=LEGAL (s_only).
     // HR_SUB is a descendant of HR -> grant applies; LEGAL in access_scope_ids.
+    exec_sync(db,
+        "INSERT INTO resource_grants "
+        "(company_id, resource_type, resource_id, resource_applies_to, "
+        " principal_type, principal_id, principal_applies_to, permission, granted_by) "
+        "VALUES ($1::uuid,'org_unit',$2::uuid,'self_and_descendants','org_unit',$3::uuid,'self_only','read',$4::uuid)",
+        std::string(CO), g_hr, g_legal, std::string(UA));
+
     wikore::ingest::PostgresDocumentRepo repo{db};
     auto result = drogon::sync_wait(repo.fetch_access_scopes(CO, DOC2));
     REQUIRE(result.has_value());
@@ -358,14 +346,23 @@ TEST_CASE("fetch_access_scopes: ou grant self_only on resource ancestor does not
 {
     if (!db_available()) SKIP("DATABASE_URL not set");
     auto db = wikore::Db::get();
-
-    // DOC3: grant resource=HR (self_only), principal=LEGAL (s_only).
+    seed_access_fixtures(db);
+    // DOC3: grant resource=HR (self_only), principal=LEGAL_SUB (s_only).
     // HR_SUB is at depth>0 from HR -> self_only resource does not cover DOC3.
+    // Using LEGAL_SUB as principal to avoid unique-key conflict with the s_and_d case.
+    exec_sync(db,
+        "INSERT INTO resource_grants "
+        "(company_id, resource_type, resource_id, resource_applies_to, "
+        " principal_type, principal_id, principal_applies_to, permission, granted_by) "
+        "VALUES ($1::uuid,'org_unit',$2::uuid,'self_only','org_unit',$3::uuid,'self_only','read',$4::uuid)",
+        std::string(CO), g_hr, g_legal_sub, std::string(UA));
+
     wikore::ingest::PostgresDocumentRepo repo{db};
     auto result = drogon::sync_wait(repo.fetch_access_scopes(CO, DOC3));
     REQUIRE(result.has_value());
 
     CHECK(contains(*result, g_hr_sub));
+    CHECK_FALSE(contains(*result, g_legal_sub));  // grant resource HR self_only does not cover HR_SUB
     CHECK_FALSE(contains(*result, g_legal));
 }
 
@@ -374,9 +371,16 @@ TEST_CASE("fetch_access_scopes: ou grant self_only on exact owner applies",
 {
     if (!db_available()) SKIP("DATABASE_URL not set");
     auto db = wikore::Db::get();
-
+    seed_access_fixtures(db);
     // DOC4: grant resource=HR_SUB (self_only), principal=LEGAL (s_only).
     // HR_SUB IS at depth=0 from HR_SUB -> applies; LEGAL in access_scope_ids.
+    exec_sync(db,
+        "INSERT INTO resource_grants "
+        "(company_id, resource_type, resource_id, resource_applies_to, "
+        " principal_type, principal_id, principal_applies_to, permission, granted_by) "
+        "VALUES ($1::uuid,'org_unit',$2::uuid,'self_only','org_unit',$3::uuid,'self_only','read',$4::uuid)",
+        std::string(CO), g_hr_sub, g_legal, std::string(UA));
+
     wikore::ingest::PostgresDocumentRepo repo{db};
     auto result = drogon::sync_wait(repo.fetch_access_scopes(CO, DOC4));
     REQUIRE(result.has_value());
@@ -390,10 +394,17 @@ TEST_CASE("fetch_access_scopes: doc grant self_and_descendants expands principal
 {
     if (!db_available()) SKIP("DATABASE_URL not set");
     auto db = wikore::Db::get();
-
+    seed_access_fixtures(db);
     // DOC5: doc-level grant to LEGAL with principal_applies_to=self_and_descendants.
     // access_scope_ids must include LEGAL_SUB so a LegalSub member can retrieve it
     // without any ancestor walk at query time.
+    exec_sync(db,
+        "INSERT INTO resource_grants "
+        "(company_id, resource_type, resource_id, resource_applies_to, "
+        " principal_type, principal_id, principal_applies_to, permission, granted_by) "
+        "VALUES ($1::uuid,'document',$2::uuid,'self_only','org_unit',$3::uuid,'self_and_descendants','read',$4::uuid)",
+        std::string(CO), std::string(DOC5), g_legal, std::string(UA));
+
     wikore::ingest::PostgresDocumentRepo repo{db};
     auto result = drogon::sync_wait(repo.fetch_access_scopes(CO, DOC5));
     REQUIRE(result.has_value());
