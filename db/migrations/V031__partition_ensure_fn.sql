@@ -15,22 +15,13 @@
 --      attached partition of the expected parent, not just any same-named table.
 --   5. REVOKE EXECUTE FROM PUBLIC appears immediately after each CREATE so the
 --      migration-owner privilege is closed before the selective GRANT below.
---   6. wikore_app is created here (idempotent) so grants are always applied and
---      the scheduler never gets "permission denied" due to provisioning order.
-
--- ---------------------------------------------------------------------------
--- Provision the runtime role idempotently so GRANT below is unconditional.
--- If the DBA pre-created the role the EXCEPTION block is a no-op.
--- If the migration user lacks CREATE ROLE the DO block will raise, failing
--- the migration loudly rather than silently skipping grants.
--- ---------------------------------------------------------------------------
-
-DO $role$
-BEGIN
-    CREATE ROLE wikore_app;
-EXCEPTION WHEN duplicate_object THEN NULL;
-END
-$role$;
+--
+-- Deployment order: wikore_app must be created before this migration runs.
+-- In CI this is done by the "Provision runtime roles" workflow step.
+-- In production, provision the role before applying migrations:
+--   CREATE ROLE wikore_app NOLOGIN;
+--   CREATE ROLE wikore_app_login NOSUPERUSER INHERIT LOGIN PASSWORD '...';
+--   GRANT wikore_app TO wikore_app_login;
 
 -- ---------------------------------------------------------------------------
 -- wikore_ensure_audit_log_partition(year_val INT, quarter_val INT)

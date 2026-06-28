@@ -149,7 +149,9 @@ drogon::Task<void> PartitionMaintainer::run_once()
 
         {
             std::vector<std::string> created_names;
-            auto [year, month] = utc_year_month();
+            auto [year, month] = opts_.now_utc_year_month
+                ? opts_.now_utc_year_month()
+                : utc_year_month();
 
             // audit_log: quarterly
             const int quarter = (month - 1) / 3 + 1;

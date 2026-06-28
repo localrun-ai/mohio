@@ -48,6 +48,11 @@ until docker exec "$CONTAINER" psql -U postgres -c '\q' 2>/dev/null; do sleep 1;
 psql() { docker exec "$CONTAINER" psql -U postgres -At "$@"; }
 sql()  { psql -c "$1"; }
 
+echo "-- Provisioning runtime roles..."
+sql "CREATE ROLE wikore_app NOLOGIN"
+sql "CREATE ROLE wikore_app_login NOSUPERUSER INHERIT LOGIN PASSWORD 'wikore_app'"
+sql "GRANT wikore_app TO wikore_app_login"
+
 echo "-- Loading migrations..."
 # Migrations are auto-discovered (sorted lexicographically = sequential
 # numeric order) so adding a new V0NN__*.sql file is purely additive

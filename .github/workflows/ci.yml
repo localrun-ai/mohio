@@ -159,6 +159,16 @@ jobs:
       - name: Make binary executable
         run: chmod +x build-ci/tests/wikore_tests
 
+      - name: Provision runtime roles
+        env:
+          PGPASSWORD: wikore
+        run: |
+          psql -h localhost -U wikore -d wikore -c "
+            CREATE ROLE wikore_app NOLOGIN;
+            CREATE ROLE wikore_app_login NOSUPERUSER INHERIT LOGIN PASSWORD 'wikore_app';
+            GRANT wikore_app TO wikore_app_login;
+          "
+
       - name: Load schema migrations
         env:
           PGPASSWORD: wikore
@@ -169,6 +179,7 @@ jobs:
       - name: Integration tests
         env:
           DATABASE_URL: postgresql://wikore:wikore@localhost:5432/wikore
+          DATABASE_URL_APP: postgresql://wikore_app_login:wikore_app@localhost:5432/wikore
           REDIS_URL: redis://localhost:6379/0
         run: |
           build-ci/tests/wikore_tests "[integration]"

@@ -4,6 +4,7 @@
 #include <atomic>
 #include <chrono>
 #include <functional>
+#include <utility>
 
 namespace wikore::scheduler {
 
@@ -33,6 +34,9 @@ public:
         std::chrono::hours interval               = std::chrono::hours(24);
         int                audit_log_lookahead    = 4;   // quarters
         int                usage_events_lookahead = 12;  // months
+        // Override the reference date for sweeps. Null = use UTC system clock.
+        // Tests inject a fixed pair<year,month> to make assertions time-independent.
+        std::function<std::pair<int,int>()> now_utc_year_month;
     };
 
     PartitionMaintainer(drogon::orm::DbClientPtr db,
