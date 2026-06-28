@@ -35,8 +35,6 @@ std::pair<int,int> utc_year_month()
 }
 
 constexpr std::string_view kAdvisoryLockName = "wikore-partition-maintainer";
-// Wake every 30s during the inter-sweep sleep to check shutdown_.
-constexpr auto kSleepChunk = std::chrono::seconds(30);
 
 } // namespace
 
@@ -67,9 +65,7 @@ drogon::Task<void> PartitionMaintainer::interruptible_sleep()
         if (now >= deadline) break;
         const auto remaining =
             std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now);
-        const auto chunk =
-            std::min(remaining,
-                     std::chrono::duration_cast<std::chrono::milliseconds>(kSleepChunk));
+        const auto chunk = std::min(remaining, opts_.sleep_chunk);
         co_await co_sleep_ms(chunk);
     }
 }

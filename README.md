@@ -138,9 +138,13 @@ Useful CMake options:
 ## Database Setup
 
 Wikore requires PostgreSQL 17. It does not yet include an application-level
-migration runner, so apply the SQL migrations before starting the binaries:
+migration runner, so provision runtime roles then apply migrations:
 
 ```sh
+# 1. Provision runtime roles (run once as superuser; idempotent)
+psql -h localhost -U postgres -d wikore -f db/provision_roles.sql
+
+# 2. Apply schema migrations
 export DATABASE_URL=postgresql://wikore:wikore@localhost:5432/wikore
 ls db/migrations/V*.sql | sort | xargs cat \
   | psql "$DATABASE_URL" -v ON_ERROR_STOP=1

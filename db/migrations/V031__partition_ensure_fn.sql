@@ -9,24 +9,24 @@
 --   1. Each function only touches its named parent table; no generic parent arg.
 --   2. Partition name and date bounds are DERIVED from typed (INT) inputs so
 --      there is no path to arbitrary DDL names or ranges.
---   3. Bounds are constructed with make_timestamptz(...,'UTC') to prevent
---      session-timezone drift from creating shifted or overlapping partitions.
+--   3. Bounds use make_timestamptz(...,'UTC') + SET timezone='UTC' on the
+--      function so both creation and existence checks are timezone-independent.
 --   4. Existence check uses pg_inherits to verify the table is actually an
 --      attached partition of the expected parent, not just any same-named table.
+--      If the attached partition's bounds do not match the expected period the
+--      function raises immediately rather than silently returning FALSE.
 --   5. REVOKE EXECUTE FROM PUBLIC appears immediately after each CREATE so the
 --      migration-owner privilege is closed before the selective GRANT below.
 --
 -- Deployment order: wikore_app must be created before this migration runs.
--- In CI this is done by the "Provision runtime roles" workflow step.
--- In production, provision the role before applying migrations:
---   CREATE ROLE wikore_app NOLOGIN;
---   CREATE ROLE wikore_app_login NOSUPERUSER INHERIT LOGIN PASSWORD '...';
---   GRANT wikore_app TO wikore_app_login;
+-- Run db/provision_roles.sql as superuser before applying migrations.
 
 -- ---------------------------------------------------------------------------
 -- wikore_ensure_audit_log_partition(year_val INT, quarter_val INT)
 --   Returns TRUE if a new quarterly partition was created, FALSE if an
---   attached partition for that period already exists.
+--   attached partition for that period already exists with correct bounds.
+--   Raises if a relation with the expected name exists but is not an attached
+--   partition, or if an attached partition has mismatched bounds.
 -- ---------------------------------------------------------------------------
 
 CREATE OR REPLACE FUNCTION wikore_ensure_audit_log_partition(
@@ -36,15 +36,18 @@ CREATE OR REPLACE FUNCTION wikore_ensure_audit_log_partition(
 LANGUAGE plpgsql
 SECURITY DEFINER
 SET search_path = pg_catalog, pg_temp
+SET timezone    = 'UTC'
 AS $$
 DECLARE
-    partition_name TEXT;
-    start_month    INT;
-    end_month      INT;
-    end_year       INT;
-    from_ts        TIMESTAMPTZ;
-    to_ts          TIMESTAMPTZ;
-    already_exists BOOLEAN;
+    partition_name  TEXT;
+    start_month     INT;
+    end_month       INT;
+    end_year        INT;
+    from_ts         TIMESTAMPTZ;
+    to_ts           TIMESTAMPTZ;
+    already_exists  BOOLEAN;
+    expected_bound  TEXT;
+    actual_bound    TEXT;
 BEGIN
     IF quarter_val NOT BETWEEN 1 AND 4 THEN
         RAISE EXCEPTION 'wikore_ensure_audit_log_partition: quarter % not in 1-4', quarter_val;
@@ -62,12 +65,12 @@ BEGIN
         end_year  := end_year  + 1;
     END IF;
 
-    -- Build UTC-pinned timestamptz bounds so session timezone cannot shift them.
+    -- UTC-pinned bounds (SET timezone='UTC' on function ensures ::text renders
+    -- identically to pg_get_expr output for the comparison below).
     from_ts := make_timestamptz(year_val, start_month, 1, 0, 0, 0.0, 'UTC');
     to_ts   := make_timestamptz(end_year,  end_month,  1, 0, 0, 0.0, 'UTC');
 
-    -- Verify via pg_inherits that an ATTACHED partition for this period exists,
-    -- not just any relation that happens to share the name.
+    -- Verify via pg_inherits that an ATTACHED partition exists.
     SELECT EXISTS (
         SELECT 1
         FROM   pg_class      c
@@ -78,7 +81,30 @@ BEGIN
         WHERE  c.relname  = partition_name AND n.nspname  = 'public'
           AND  p.relname  = 'audit_log'    AND pn.nspname = 'public'
     ) INTO already_exists;
-    IF already_exists THEN RETURN FALSE; END IF;
+
+    IF already_exists THEN
+        -- Verify the existing partition's bounds match the expected period.
+        -- Both pg_get_expr and ::text use the function's SET timezone='UTC',
+        -- so the text comparison is stable regardless of caller timezone.
+        expected_bound := format(
+            'FOR VALUES FROM (''%s'') TO (''%s'')',
+            from_ts::text, to_ts::text);
+
+        SELECT pg_get_expr(c.relpartbound, c.oid)
+        FROM   pg_class     c
+        JOIN   pg_namespace n ON n.oid = c.relnamespace
+        WHERE  c.relname = partition_name AND n.nspname = 'public'
+        INTO   actual_bound;
+
+        IF actual_bound IS DISTINCT FROM expected_bound THEN
+            RAISE EXCEPTION
+                'wikore_ensure_audit_log_partition: % is attached but has '
+                'wrong bounds (expected %, got %)',
+                partition_name, expected_bound, actual_bound;
+        END IF;
+
+        RETURN FALSE;
+    END IF;
 
     EXECUTE format(
         'CREATE TABLE public.%I PARTITION OF public.audit_log '
@@ -95,7 +121,7 @@ GRANT  EXECUTE ON FUNCTION wikore_ensure_audit_log_partition(INT, INT) TO   wiko
 -- ---------------------------------------------------------------------------
 -- wikore_ensure_usage_events_partition(year_val INT, month_val INT)
 --   Returns TRUE if a new monthly partition was created, FALSE if an
---   attached partition for that period already exists.
+--   attached partition for that period already exists with correct bounds.
 -- ---------------------------------------------------------------------------
 
 CREATE OR REPLACE FUNCTION wikore_ensure_usage_events_partition(
@@ -105,14 +131,17 @@ CREATE OR REPLACE FUNCTION wikore_ensure_usage_events_partition(
 LANGUAGE plpgsql
 SECURITY DEFINER
 SET search_path = pg_catalog, pg_temp
+SET timezone    = 'UTC'
 AS $$
 DECLARE
-    partition_name TEXT;
-    next_month     INT;
-    next_year      INT;
-    from_ts        TIMESTAMPTZ;
-    to_ts          TIMESTAMPTZ;
-    already_exists BOOLEAN;
+    partition_name  TEXT;
+    next_month      INT;
+    next_year       INT;
+    from_ts         TIMESTAMPTZ;
+    to_ts           TIMESTAMPTZ;
+    already_exists  BOOLEAN;
+    expected_bound  TEXT;
+    actual_bound    TEXT;
 BEGIN
     IF month_val NOT BETWEEN 1 AND 12 THEN
         RAISE EXCEPTION 'wikore_ensure_usage_events_partition: month % not in 1-12', month_val;
@@ -142,7 +171,27 @@ BEGIN
         WHERE  c.relname  = partition_name   AND n.nspname  = 'public'
           AND  p.relname  = 'usage_events'   AND pn.nspname = 'public'
     ) INTO already_exists;
-    IF already_exists THEN RETURN FALSE; END IF;
+
+    IF already_exists THEN
+        expected_bound := format(
+            'FOR VALUES FROM (''%s'') TO (''%s'')',
+            from_ts::text, to_ts::text);
+
+        SELECT pg_get_expr(c.relpartbound, c.oid)
+        FROM   pg_class     c
+        JOIN   pg_namespace n ON n.oid = c.relnamespace
+        WHERE  c.relname = partition_name AND n.nspname = 'public'
+        INTO   actual_bound;
+
+        IF actual_bound IS DISTINCT FROM expected_bound THEN
+            RAISE EXCEPTION
+                'wikore_ensure_usage_events_partition: % is attached but has '
+                'wrong bounds (expected %, got %)',
+                partition_name, expected_bound, actual_bound;
+        END IF;
+
+        RETURN FALSE;
+    END IF;
 
     EXECUTE format(
         'CREATE TABLE public.%I PARTITION OF public.usage_events '

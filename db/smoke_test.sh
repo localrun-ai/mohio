@@ -49,9 +49,8 @@ psql() { docker exec "$CONTAINER" psql -U postgres -At "$@"; }
 sql()  { psql -c "$1"; }
 
 echo "-- Provisioning runtime roles..."
-sql "CREATE ROLE wikore_app NOLOGIN"
-sql "CREATE ROLE wikore_app_login NOSUPERUSER INHERIT LOGIN PASSWORD 'wikore_app'"
-sql "GRANT wikore_app TO wikore_app_login"
+ls db/provision_roles.sql | xargs cat \
+  | docker exec -i "$CONTAINER" psql -U postgres
 
 echo "-- Loading migrations..."
 # Migrations are auto-discovered (sorted lexicographically = sequential

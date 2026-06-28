@@ -31,9 +31,13 @@ public:
     using ShutdownPredicate = std::function<bool()>;
 
     struct Options {
-        std::chrono::hours interval               = std::chrono::hours(24);
-        int                audit_log_lookahead    = 4;   // quarters
-        int                usage_events_lookahead = 12;  // months
+        std::chrono::hours        interval               = std::chrono::hours(24);
+        int                       audit_log_lookahead    = 4;    // quarters
+        int                       usage_events_lookahead = 12;   // months
+        // Wake interval during the inter-sweep sleep. Shorter values let the
+        // process respond to shutdown sooner (at the cost of more timer events).
+        // Tests use 100ms so the shutdown test completes in under 1 second.
+        std::chrono::milliseconds sleep_chunk            = std::chrono::seconds(30);
         // Override the reference date for sweeps. Null = use UTC system clock.
         // Tests inject a fixed pair<year,month> to make assertions time-independent.
         std::function<std::pair<int,int>()> now_utc_year_month;
