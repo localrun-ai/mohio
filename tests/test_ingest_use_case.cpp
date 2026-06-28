@@ -364,7 +364,7 @@ TEST_CASE("PostgresDocumentRepo::mark_ingest_done sets completed_at and chunk_co
             CO, VERSION, /*chunk_count=*/7, /*claim_token=*/"", uow);
         REQUIRE(r.has_value());
         REQUIRE(*r == true);
-        co_await uow.commit();
+        REQUIRE((co_await uow.commit()).has_value());
     }());
 
     auto v = exec_sync(db,

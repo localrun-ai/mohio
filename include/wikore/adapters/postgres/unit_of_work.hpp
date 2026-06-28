@@ -49,10 +49,10 @@ public:
             std::move(sql), std::move(args)...);
     }
 
-    // Await PG COMMIT acknowledgment. THROWS drogon::orm::DrogonDbException
-    // (synthetic via setCommitCallback ok=false) when COMMIT fails so the
-    // caller can map the error rather than seeing a silent partial-success.
-    drogon::Task<void> commit();
+    // Await PG COMMIT acknowledgment before returning. Returns an error if PG
+    // rejects the COMMIT (serialization failure, deferred constraint, etc.).
+    // committed_ is set only on success so the destructor does not double-roll.
+    drogon::Task<Result<void>> commit();
 
     // Explicitly roll back and release the connection.
     void rollback() {

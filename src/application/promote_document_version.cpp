@@ -81,8 +81,8 @@ PromoteDocumentVersionUseCase::execute(
         co_return std::unexpected(postgres::map_db_exception(ex));
     }
 
-    // Commit: await PG acknowledgment so callers see committed data immediately.
-    co_await uow.commit();
+    if (auto r = co_await uow.commit(); !r)
+        co_return std::unexpected(r.error());
 
     spdlog::info("[promote_version] company={} doc={} version={} promoted by user={}",
                  ctx.tenant.company_id, cmd.document_id, cmd.version_id,

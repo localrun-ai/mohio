@@ -269,28 +269,15 @@ IngestDocumentVersionUseCase::execute(RequestContext ctx,
         co_return IngestDispatchOutcome::OwnershipLost;
     }
 
-    // COMMIT can throw (e.g. deferred constraint violation, server
-    // disconnect mid-acknowledge). Catch so the worker's run-loop
-    // doesn't terminate with the periodic heartbeat timer still
-    // running. On exception we return Err -> the worker's transfer-
-    // back-to-source-queue path runs and a later dispatch retries.
-    //
-    // The row state when COMMIT fails is well-defined: PG rolled back
-    // the transaction, so document_versions remains in 'processing'
-    // (with our claim_token still set). Sweep #2 will eventually
-    // reset and requeue if no worker picks it up.
-    try {
-        co_await uow.commit();
-    } catch (const drogon::orm::DrogonDbException& ex) {
+    // COMMIT can fail (e.g. deferred constraint, server disconnect). When it
+    // does, PG rolled back -- document_versions stays 'processing' with our
+    // claim_token intact. Sweep #2 will reset and requeue if no worker picks
+    // it up. Return Err so the worker's transfer-back path runs.
+    if (auto r = co_await uow.commit(); !r) {
         spdlog::error("[ingest] uow.commit() failed for version {}: {}; "
                       "row remains 'processing' (PG rolled back)",
-                      cmd.document_version_id, ex.base().what());
-        co_return std::unexpected(postgres::map_db_exception(ex));
-    } catch (const std::exception& ex) {
-        spdlog::error("[ingest] uow.commit() threw {} for version {}",
-                      ex.what(), cmd.document_version_id);
-        co_return std::unexpected(Error::database_error(
-            std::format("commit failed: {}", ex.what())));
+                      cmd.document_version_id, r.error().message);
+        co_return std::unexpected(r.error());
     }
 
     spdlog::info("[ingest] done company={} version={} chunks={}",
