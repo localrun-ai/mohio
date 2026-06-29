@@ -451,6 +451,32 @@ TEST_CASE("V031 overflow check: detects rows in audit_log_default", "[integratio
 // C++ PartitionMaintainer - uses partition_db() throughout
 // ---------------------------------------------------------------------------
 
+TEST_CASE("PartitionMaintainer: ctor rejects non-positive interval, non-positive sleep_chunk, and negative lookahead", "[partition]") {
+    // No DB needed: ctor validates Options before touching the client. Using a
+    // null DbClientPtr keeps this test runnable in the unit-test job (no
+    // DATABASE_URL) and avoids touching DrogonLoop globals.
+    drogon::orm::DbClientPtr null_db;
+    auto shutdown = [] { return false; };
+
+    using PM = wikore::scheduler::PartitionMaintainer;
+
+    PM::Options bad_chunk;
+    bad_chunk.sleep_chunk = std::chrono::milliseconds::zero();
+    REQUIRE_THROWS_AS(PM(null_db, shutdown, bad_chunk), std::invalid_argument);
+
+    PM::Options bad_interval;
+    bad_interval.interval = std::chrono::hours::zero();
+    REQUIRE_THROWS_AS(PM(null_db, shutdown, bad_interval), std::invalid_argument);
+
+    PM::Options bad_audit_lookahead;
+    bad_audit_lookahead.audit_log_lookahead = -1;
+    REQUIRE_THROWS_AS(PM(null_db, shutdown, bad_audit_lookahead), std::invalid_argument);
+
+    PM::Options bad_usage_lookahead;
+    bad_usage_lookahead.usage_events_lookahead = -1;
+    REQUIRE_THROWS_AS(PM(null_db, shutdown, bad_usage_lookahead), std::invalid_argument);
+}
+
 TEST_CASE("PartitionMaintainer::run_once: creates exactly one partition (fixed clock)", "[integration][partition]") {
     if (!db_available()) SKIP("DATABASE_URL / PARTITION_DATABASE_URL not set");
     auto adb = partition_db();

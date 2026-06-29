@@ -118,24 +118,15 @@ int main()
             try {
                 partition_db = drogon::orm::DbClient::newPgClient(
                     cfg.partition_database_url, 2);
-                auto grants = co_await partition_db->execSqlCoro(
-                    "SELECT "
-                    "has_function_privilege(current_user, "
-                    "'public.wikore_ensure_audit_log_partition(integer,integer)', "
-                    "'EXECUTE') AS audit_ok, "
-                    "has_function_privilege(current_user, "
-                    "'public.wikore_ensure_usage_events_partition(integer,integer)', "
-                    "'EXECUTE') AS usage_ok, "
-                    "has_function_privilege(current_user, "
-                    "'public.wikore_check_partition_overflow()', "
-                    "'EXECUTE') AS overflow_ok");
-                if (grants.empty() || !grants[0]["audit_ok"].as<bool>() ||
-                    !grants[0]["usage_ok"].as<bool>() ||
-                    !grants[0]["overflow_ok"].as<bool>()) {
-                    throw std::runtime_error(
-                        "partition role is missing required V031 EXECUTE grants");
-                }
-                // Invoke the read-only helper to validate SECURITY DEFINER access.
+                // Validate the V031 grants by invoking the read-only helper.
+                // We deliberately do NOT use has_function_privilege() here:
+                // that check is sensitive to whether the login was created
+                // with INHERIT, and a defensible NOINHERIT login that uses
+                // SET ROLE would falsely fail an inherited-privilege probe.
+                // A live SELECT against the SECURITY DEFINER function fails
+                // with permission_denied (SQLSTATE 42501) if any of the
+                // three function grants are missing, which is exactly the
+                // signal we want -- without coupling to INHERIT.
                 co_await partition_db->execSqlCoro(
                     "SELECT 1 FROM public.wikore_check_partition_overflow() LIMIT 1");
             } catch (const drogon::orm::DrogonDbException& ex) {

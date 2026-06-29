@@ -164,13 +164,25 @@ jobs:
           PGPASSWORD: wikore
         run: |
           PARTITION_PASSWORD=$(openssl rand -hex 16)
+          # Mask the random password BEFORE any subsequent step prints anything
+          # that might include it (Drogon connection failures echo the URL,
+          # psql error traces can repeat the command, etc). GitHub Actions only
+          # auto-masks values that came from secrets.* -- locally-generated
+          # secrets must be registered explicitly.
+          echo "::add-mask::$PARTITION_PASSWORD"
+
           psql -h localhost -U wikore -d wikore \
             -v ON_ERROR_STOP=1 -f db/provision_roles.sql
-          psql -h localhost -U wikore -d wikore -v ON_ERROR_STOP=1 -c "
-            CREATE ROLE wikore_partition_test_login
-              NOSUPERUSER NOCREATEDB NOCREATEROLE LOGIN PASSWORD '$PARTITION_PASSWORD';
-            GRANT wikore_partition_maintainer TO wikore_partition_test_login;
-          "
+
+          # Feed CREATE ROLE via stdin heredoc so the password literal is only
+          # ever in psql's memory -- never in argv (which is exposed via
+          # /proc/<pid>/cmdline while the command runs) nor in any -c echo.
+          psql -h localhost -U wikore -d wikore -v ON_ERROR_STOP=1 <<EOF
+          CREATE ROLE wikore_partition_test_login
+            NOSUPERUSER NOCREATEDB NOCREATEROLE LOGIN PASSWORD '$PARTITION_PASSWORD';
+          GRANT wikore_partition_maintainer TO wikore_partition_test_login;
+          EOF
+
           echo "PARTITION_DATABASE_URL=postgresql://wikore_partition_test_login:${PARTITION_PASSWORD}@localhost:5432/wikore" \
             >> "$GITHUB_ENV"
 

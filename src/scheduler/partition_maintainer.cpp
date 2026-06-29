@@ -63,6 +63,12 @@ PartitionMaintainer::PartitionMaintainer(drogon::orm::DbClientPtr db,
     if (opts_.sleep_chunk <= std::chrono::milliseconds::zero()) {
         throw std::invalid_argument("PartitionMaintainer sleep_chunk must be positive");
     }
+    if (opts_.interval <= std::chrono::hours::zero()) {
+        throw std::invalid_argument("PartitionMaintainer interval must be positive");
+    }
+    if (opts_.audit_log_lookahead < 0 || opts_.usage_events_lookahead < 0) {
+        throw std::invalid_argument("PartitionMaintainer lookahead must be non-negative");
+    }
 }
 
 // ---------------------------------------------------------------------------

@@ -17,6 +17,10 @@
 --      function raises immediately rather than silently returning FALSE.
 --   5. REVOKE EXECUTE FROM PUBLIC appears immediately after each CREATE so the
 --      migration-owner privilege is closed before the selective GRANT below.
+--   6. Each function pins lock_timeout/statement_timeout so a held ACCESS
+--      EXCLUSIVE on a default partition (pg_repack, manual DETACH/ATTACH)
+--      cannot stall the maintainer indefinitely; the sweep fails fast and the
+--      next daily cycle retries.
 --
 -- Deployment order: wikore_partition_maintainer must be created before this
 -- migration runs.
@@ -43,8 +47,10 @@ CREATE OR REPLACE FUNCTION wikore_ensure_audit_log_partition(
 ) RETURNS BOOLEAN
 LANGUAGE plpgsql
 SECURITY DEFINER
-SET search_path = pg_catalog, pg_temp
-SET timezone    = 'UTC'
+SET search_path     = pg_catalog, pg_temp
+SET timezone        = 'UTC'
+SET lock_timeout    = '5s'
+SET statement_timeout = '60s'
 AS $$
 DECLARE
     partition_name  TEXT;
@@ -139,8 +145,10 @@ CREATE OR REPLACE FUNCTION wikore_ensure_usage_events_partition(
 ) RETURNS BOOLEAN
 LANGUAGE plpgsql
 SECURITY DEFINER
-SET search_path = pg_catalog, pg_temp
-SET timezone    = 'UTC'
+SET search_path     = pg_catalog, pg_temp
+SET timezone        = 'UTC'
+SET lock_timeout    = '5s'
+SET statement_timeout = '60s'
 AS $$
 DECLARE
     partition_name  TEXT;
@@ -225,7 +233,9 @@ CREATE OR REPLACE FUNCTION wikore_check_partition_overflow()
 RETURNS TABLE(partition_table TEXT, has_rows BOOLEAN)
 LANGUAGE plpgsql
 SECURITY DEFINER
-SET search_path = pg_catalog, pg_temp
+SET search_path     = pg_catalog, pg_temp
+SET lock_timeout    = '5s'
+SET statement_timeout = '30s'
 AS $$
 BEGIN
     RETURN QUERY VALUES
