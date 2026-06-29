@@ -286,3 +286,31 @@ TEST_CASE("NullVectorStore: search filters out chunks whose sensitivity_label is
     REQUIRE(r->size() == 1);
     CHECK((*r)[0].payload.sensitivity_label == "internal");
 }
+
+TEST_CASE("uuid_v5: deterministic and version/variant bits are RFC 4122 v5", "[uuid_v5]")
+{
+    // Same input always produces the same v5 UUID (this property is what
+    // makes Qdrant upserts naturally idempotent on chunk_id+model).
+    auto a = uuid_v5("chunk-1:bge-m3");
+    auto b = uuid_v5("chunk-1:bge-m3");
+    REQUIRE(a.has_value());
+    REQUIRE(b.has_value());
+    CHECK(*a == *b);
+
+    // Different input produces a different UUID.
+    auto c = uuid_v5("chunk-2:bge-m3");
+    REQUIRE(c.has_value());
+    CHECK(*a != *c);
+
+    // Format: 8-4-4-4-12 hex with version=5 in the third group and
+    // variant 10xx in the fourth group's first nibble.
+    REQUIRE(a->size() == 36);
+    CHECK((*a)[8]  == '-');
+    CHECK((*a)[13] == '-');
+    CHECK((*a)[18] == '-');
+    CHECK((*a)[23] == '-');
+    CHECK((*a)[14] == '5');                          // version nibble
+    const char variant = (*a)[19];
+    CHECK((variant == '8' || variant == '9' ||
+           variant == 'a' || variant == 'b'));       // variant 10xx
+}

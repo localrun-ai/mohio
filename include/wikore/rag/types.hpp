@@ -19,15 +19,16 @@ using Embedding = std::vector<float>;
 // Point ID = uuid_v5(url_namespace, chunk_id + ":" + embed_model_id)
 // This means: same chunk + same model = same point ID across re-ingests,
 // which makes upsert naturally idempotent.
+//
+// Returns std::nullopt on any OpenSSL failure (allocation or digest). The
+// previous version returned the all-zero UUID sentinel, which silently
+// collided every chunk in a batch onto a single point id -- all but one
+// would vanish from Qdrant on upsert with no error surfaced. Returning
+// nullopt forces the caller to handle the failure (typically by failing
+// the outbox event so the next retry sees a healthy allocator).
 // ---------------------------------------------------------------------------
 
-// Returns the canonical hyphenated string on success.
-// On any OpenSSL failure (allocation or digest), returns the all-zero UUID
-// "00000000-0000-0000-0000-000000000000". Callers that need to fail-fast on
-// this case can test against that sentinel; in practice the only realistic
-// failure mode is OOM during EVP_MD_CTX_new(), in which case the surrounding
-// allocator is already in trouble.
-inline std::string uuid_v5(std::string_view name) {
+inline std::optional<std::string> uuid_v5(std::string_view name) {
     // RFC 4122 URL namespace: 6ba7b811-9dad-11d1-80b4-00c04fd430c8
     static constexpr uint8_t kNs[16] = {
         0x6b, 0xa7, 0xb8, 0x11, 0x9d, 0xad, 0x11, 0xd1,
@@ -39,7 +40,7 @@ inline std::string uuid_v5(std::string_view name) {
     // Use EVP API (OpenSSL 3.0+; SHA-1 low-level API is deprecated).
     EVP_MD_CTX* ctx = EVP_MD_CTX_new();
     if (!ctx)
-        return "00000000-0000-0000-0000-000000000000";
+        return std::nullopt;
 
     bool ok =
            EVP_DigestInit_ex(ctx, EVP_sha1(), nullptr) == 1
@@ -48,7 +49,7 @@ inline std::string uuid_v5(std::string_view name) {
         && EVP_DigestFinal_ex(ctx, hash, &hash_len)    == 1;
     EVP_MD_CTX_free(ctx);
     if (!ok)
-        return "00000000-0000-0000-0000-000000000000";
+        return std::nullopt;
 
     // Set version=5 and RFC 4122 variant bits.
     hash[6] = (hash[6] & 0x0f) | 0x50;
