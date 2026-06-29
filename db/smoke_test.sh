@@ -48,6 +48,13 @@ until docker exec "$CONTAINER" psql -U postgres -c '\q' 2>/dev/null; do sleep 1;
 psql() { docker exec "$CONTAINER" psql -U postgres -At "$@"; }
 sql()  { psql -c "$1"; }
 
+echo "-- Provisioning runtime roles..."
+docker exec -i "$CONTAINER" psql -U postgres -v ON_ERROR_STOP=1 \
+  < db/provision_roles.sql
+# A second run must converge cleanly; deployments may reapply provisioning.
+docker exec -i "$CONTAINER" psql -U postgres -v ON_ERROR_STOP=1 \
+  < db/provision_roles.sql
+
 echo "-- Loading migrations..."
 # Migrations are auto-discovered (sorted lexicographically = sequential
 # numeric order) so adding a new V0NN__*.sql file is purely additive

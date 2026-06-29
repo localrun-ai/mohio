@@ -138,12 +138,32 @@ Useful CMake options:
 ## Database Setup
 
 Wikore requires PostgreSQL 17. It does not yet include an application-level
-migration runner, so apply the SQL migrations before starting the binaries:
+migration runner. Provision the NOLOGIN partition-maintenance grant role before
+applying migrations:
 
 ```sh
+# 1. Provision the grant role (run as CREATEROLE; idempotent, no credentials)
+psql -h localhost -U postgres -d wikore \
+  -v ON_ERROR_STOP=1 -f db/provision_roles.sql
+
+# 2. Apply schema migrations
 export DATABASE_URL=postgresql://wikore:wikore@localhost:5432/wikore
 ls db/migrations/V*.sql | sort | xargs cat \
   | psql "$DATABASE_URL" -v ON_ERROR_STOP=1
+```
+
+Create a separate non-superuser login through your normal secret-management or
+DBA workflow and grant it only the partition-maintenance role:
+
+```sql
+GRANT wikore_partition_maintainer TO your_partition_login;
+```
+
+The repository intentionally does not create that login or store a default
+password. Configure the scheduler with its connection URL:
+
+```sh
+export PARTITION_DATABASE_URL=postgresql://your_partition_login:${PASSWORD}@localhost:5432/wikore
 ```
 
 The scheduler also requires an enabled embedding-model registry row whose name
@@ -173,6 +193,7 @@ Configuration is read from environment variables. The checked-in
 | Variable | Default | Used for |
 | --- | --- | --- |
 | `DATABASE_URL` | `postgresql://wikore:wikore@localhost:5432/wikore` | PostgreSQL connection |
+| `PARTITION_DATABASE_URL` | required by scheduler | Restricted partition-maintenance connection |
 | `REDIS_URL` | `redis://127.0.0.1:6379/0` | Queues, heartbeats, and caches |
 | `QDRANT_URL` | `http://localhost:6333` | Vector index |
 | `EMBED_BASE_URL` | `http://localhost:8081/v1` | OpenAI-compatible embeddings endpoint |

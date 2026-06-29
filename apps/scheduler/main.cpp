@@ -4,23 +4,28 @@
 #include "wikore/rag/vector_store.hpp"
 #include "wikore/redis.hpp"
 #include "wikore/scheduler/outbox_worker.hpp"
+#include "wikore/scheduler/partition_maintainer.hpp"
 #include "wikore/scheduler/polling_fallback.hpp"
 #include <drogon/drogon.h>
 #include <spdlog/spdlog.h>
 #include <atomic>
 #include <cstdlib>
 #include <format>
+#include <stdexcept>
 
 // ---------------------------------------------------------------------------
-// wikore-scheduler: outbox drainer + polling fallback (Iteration 1).
+// wikore-scheduler: outbox drainer + polling fallback + partition maintainer.
 //
-// Two long-running coroutines on the event loop:
+// Three long-running coroutines on the event loop:
 //   * OutboxWorker drains qdrant_upsert_chunk_payload events from V015's
 //     outbox_events table (FOR UPDATE SKIP LOCKED), embeds each chunk
 //     batch via llama-server, upserts to Qdrant, and writes document_chunk_vectors.
 //   * PollingFallback advisory-locks per-call, finds document_versions
 //     rows stuck in 'pending' or 'processing' beyond 15 minutes, and
 //     promotes them to 'error' (or requeues, per V029).
+//   * PartitionMaintainer runs daily, pre-creates quarterly audit_log and
+//     monthly usage_events partitions 1 year ahead, and alerts on overflow
+//     into the catch-all DEFAULT partitions.
 //
 // SIGTERM/SIGINT are routed through drogon's signal-handler API (NOT
 // std::signal, which drogon overwrites in run()). Each handler flips
@@ -39,9 +44,8 @@ namespace {
 std::atomic<bool> g_shutdown{false};
 std::atomic<bool> g_fatal_exit{false};
 
-// Both workers must finish their drain path before drogon exits, otherwise
-// release_my_claims() / the polling xact_lock release won't run.
-std::atomic<int>  g_workers_remaining{2};
+// All workers must finish their drain path before drogon exits.
+std::atomic<int>  g_workers_remaining{3};
 
 void on_worker_exit(std::string_view name)
 {
@@ -65,6 +69,13 @@ void fail_startup(std::string_view reason)
 int main()
 {
     const auto cfg = wikore::Config::from_env();
+
+    if (cfg.partition_database_url.empty()) {
+        spdlog::critical(
+            "[wikore-scheduler] PARTITION_DATABASE_URL is required for the "
+            "restricted partition-maintenance connection");
+        return EXIT_FAILURE;
+    }
 
     spdlog::info("[wikore-scheduler] version: " WIKORE_GIT_HASH);
     spdlog::info("[wikore-scheduler] db:      {}", cfg.database_url);
@@ -102,6 +113,31 @@ int main()
             // requires the drogon framework to be running.
             // -----------------------------------------------------------
             auto db = wikore::Db::get();
+
+            drogon::orm::DbClientPtr partition_db;
+            try {
+                partition_db = drogon::orm::DbClient::newPgClient(
+                    cfg.partition_database_url, 2);
+                // Validate the V031 grants by invoking the read-only helper.
+                // We deliberately do NOT use has_function_privilege() here:
+                // that check is sensitive to whether the login was created
+                // with INHERIT, and a defensible NOINHERIT login that uses
+                // SET ROLE would falsely fail an inherited-privilege probe.
+                // A live SELECT against the SECURITY DEFINER function fails
+                // with permission_denied (SQLSTATE 42501) if any of the
+                // three function grants are missing, which is exactly the
+                // signal we want -- without coupling to INHERIT.
+                co_await partition_db->execSqlCoro(
+                    "SELECT 1 FROM public.wikore_check_partition_overflow() LIMIT 1");
+            } catch (const drogon::orm::DrogonDbException& ex) {
+                fail_startup(std::format(
+                    "partition database validation failed: {}", ex.base().what()));
+                co_return;
+            } catch (const std::exception& ex) {
+                fail_startup(std::format(
+                    "partition database configuration failed: {}", ex.what()));
+                co_return;
+            }
 
             std::string qdrant_collection;
             int         registered_dim = 0;
@@ -149,6 +185,9 @@ int main()
             static wikore::scheduler::PollingFallback polling(
                 db, shutdown,
                 wikore::scheduler::PollingFallback::Options{});
+            static wikore::scheduler::PartitionMaintainer partitions(
+                partition_db, shutdown,
+                wikore::scheduler::PartitionMaintainer::Options{});
 
             // Ensure the registry-resolved Qdrant collection exists
             // before any upsert runs. Failure here is fatal: a brief
@@ -170,6 +209,10 @@ int main()
             drogon::async_run([]() -> drogon::Task<void> {
                 co_await polling.run();
                 on_worker_exit("polling-fallback");
+            });
+            drogon::async_run([]() -> drogon::Task<void> {
+                co_await partitions.run();
+                on_worker_exit("partition-maintainer");
             });
         });
     });
