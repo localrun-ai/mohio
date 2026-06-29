@@ -316,6 +316,20 @@ PlainTextParser::parse(const std::string& content,
     bool           has_headings = false;
 
     while (std::getline(stream, line)) {
+        // std::getline strips the line-terminating '\n' but leaves the '\r'
+        // from CRLF terminators. Without this, every heading and body line
+        // from a Windows-style file would carry a trailing '\r', polluting
+        // heading_path (used for the section path string), chunk text, and
+        // any downstream consumer that does substring comparison on
+        // headings (e.g. authoritative-quote matching in reranking).
+        //
+        // Use `while` not `if`: some double-conversion toolchains (a
+        // Windows tool re-emitting a CRLF file in text mode) produce
+        // \r\r\n terminators; getline leaves \r\r, and a single pop_back
+        // would still surface a stray \r downstream.
+        while (!line.empty() && line.back() == '\r')
+            line.pop_back();
+
         // Detect ATX heading: 1-6 '#' then a space
         int hashes = 0;
         while (hashes < static_cast<int>(line.size()) && line[hashes] == '#')

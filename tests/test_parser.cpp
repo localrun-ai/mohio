@@ -54,6 +54,120 @@ TEST_CASE("PlainTextParser: markdown with ATX headings", "[parser]")
     CHECK(doc.sections[1].children.empty());
 }
 
+TEST_CASE("PlainTextParser: CRLF line terminators leave no trailing carriage return", "[parser]")
+{
+    // std::getline strips the '\n' but leaves the '\r' from CRLF terminators
+    // (Windows / RFC-style HTTP-uploaded files). A surviving '\r' would
+    // pollute heading text, the section path string, and downstream
+    // string comparisons (e.g. authoritative-quote matching in reranking).
+    //
+    // Includes a pre-heading preamble line so the body-accumulation path
+    // BEFORE has_headings flips is exercised as well as the post-heading
+    // path; a regression that moved the \r strip inside the heading branch
+    // would otherwise pass.
+    PlainTextParser p;
+    std::string content =
+        "Preamble before first heading.\r\n"
+        "# Heading One\r\n"
+        "Body line one.\r\n"
+        "Body line two.\r\n"
+        "## Subheading\r\n"
+        "Sub body.\r\n";
+
+    auto result = p.parse(content, "crlf.md", "text/markdown");
+    REQUIRE(result.has_value());
+    const auto& doc = *result;
+
+    // Walk the section tree depth-first and assert no '\r' survives in
+    // any heading or any body text, regardless of how the assembler
+    // chose to nest the preamble relative to the first heading.
+    auto check_no_cr = [](auto&& self, const ParsedSection& s) -> void {
+        CHECK(s.heading.find('\r') == std::string::npos);
+        CHECK(s.text.find('\r')    == std::string::npos);
+        for (const auto& c : s.children)
+            self(self, c);
+    };
+    for (const auto& s : doc.sections) check_no_cr(check_no_cr, s);
+
+    CHECK(doc.full_text.find('\r') == std::string::npos);
+    CHECK(doc.full_text.find("Preamble")  != std::string::npos);
+    CHECK(doc.full_text.find("Body line") != std::string::npos);
+    CHECK(doc.full_text.find("Sub body")  != std::string::npos);
+}
+
+TEST_CASE("PlainTextParser: text/plain CRLF input has no trailing carriage return", "[parser]")
+{
+    // The \r strip in the parser loop is unconditional and applies to any
+    // line-based path. This test pins that contract for the text/plain
+    // path -- the previous test exercises text/markdown, which routes
+    // through strip_markdown_html first; a refactor that accidentally
+    // wrapped the strip in the markdown branch would still pass that
+    // test but break here.
+    PlainTextParser p;
+    std::string content =
+        "Line one.\r\n"
+        "Line two.\r\n"
+        "Line three.\r\n";
+
+    auto result = p.parse(content, "test.txt", "text/plain");
+    REQUIRE(result.has_value());
+    const auto& doc = *result;
+
+    REQUIRE(doc.sections.size() == 1);
+    CHECK(doc.sections[0].heading.empty());
+    CHECK(doc.sections[0].text.find('\r') == std::string::npos);
+    CHECK(doc.sections[0].text.find("Line one")   != std::string::npos);
+    CHECK(doc.sections[0].text.find("Line three") != std::string::npos);
+    CHECK(doc.full_text.find('\r') == std::string::npos);
+}
+
+TEST_CASE("PlainTextParser: \\r\\r\\n double-CR terminators are fully stripped", "[parser]")
+{
+    // Some Windows toolchains re-emit a CRLF file in text mode and produce
+    // \r\r\n terminators; std::getline strips the \n and leaves \r\r. A
+    // single-pop strip would still leave one stray \r at the line end.
+    PlainTextParser p;
+    std::string content =
+        "# Heading\r\r\n"
+        "Body line.\r\r\n";
+
+    auto result = p.parse(content, "doublecr.md", "text/markdown");
+    REQUIRE(result.has_value());
+    const auto& doc = *result;
+
+    REQUIRE(doc.sections.size() == 1);
+    CHECK(doc.sections[0].heading == "Heading");
+    CHECK(doc.sections[0].heading.find('\r') == std::string::npos);
+    CHECK(doc.sections[0].text.find('\r')    == std::string::npos);
+}
+
+TEST_CASE("PlainTextParser: mixed LF / CRLF lines normalize consistently", "[parser]")
+{
+    // Some tools (git, certain editors) emit mixed line endings in the same
+    // file. The parser must strip '\r' line-by-line, not assume a uniform
+    // terminator across the document.
+    //
+    // Labels are intentionally neutral; the relevant property is "no '\r'
+    // survives", regardless of which line had which terminator.
+    PlainTextParser p;
+    std::string content =
+        "# Heading\n"
+        "line-a\r\n"
+        "line-b\n"
+        "line-c\r\n";
+
+    auto result = p.parse(content, "mixed.md", "text/markdown");
+    REQUIRE(result.has_value());
+    const auto& doc = *result;
+
+    REQUIRE(doc.sections.size() == 1);
+    const auto& body = doc.sections[0].text;
+    CHECK(body.find('\r') == std::string::npos);
+    CHECK(body.find("line-a") != std::string::npos);
+    CHECK(body.find("line-b") != std::string::npos);
+    CHECK(body.find("line-c") != std::string::npos);
+}
+
 TEST_CASE("PlainTextParser: full_text concatenates all section bodies", "[parser]")
 {
     PlainTextParser p;
