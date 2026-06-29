@@ -89,6 +89,7 @@ TEST_CASE("NullVectorStore: search respects company_id filter", "[vector_store]"
     QdrantFilter f;
     f.company_id       = "co1";
     f.access_scope_ids = {"org-1"};
+    f.sensitivity_labels = {"internal"};
     f.lifecycle_status = "active";
 
     auto r = drogon::sync_wait(vs.search(*q, f, 10));
@@ -109,6 +110,7 @@ TEST_CASE("NullVectorStore: search respects lifecycle_status filter", "[vector_s
     QdrantFilter f;
     f.company_id       = "co1";
     f.access_scope_ids = {"org-1"};
+    f.sensitivity_labels = {"internal"};
     f.lifecycle_status = "active";
 
     auto r = drogon::sync_wait(vs.search(*q, f, 10));
@@ -131,6 +133,7 @@ TEST_CASE("NullVectorStore: search respects access_scope_ids filter", "[vector_s
     QdrantFilter f;
     f.company_id       = "co1";
     f.access_scope_ids = {"org-A"};
+    f.sensitivity_labels = {"internal"};
     f.lifecycle_status = "active";
 
     auto r = drogon::sync_wait(vs.search(*q, f, 10));
@@ -156,6 +159,7 @@ TEST_CASE("NullVectorStore: search respects limit", "[vector_store]")
     QdrantFilter f;
     f.company_id       = "co1";
     f.access_scope_ids = {"org-1"};
+    f.sensitivity_labels = {"internal"};
     f.lifecycle_status = "active";
 
     auto r = drogon::sync_wait(vs.search(*q, f, 3));
@@ -192,6 +196,7 @@ TEST_CASE("NullVectorStore: search returns results sorted by score", "[vector_st
     QdrantFilter f;
     f.company_id       = "co1";
     f.access_scope_ids = {"org-1"};
+    f.sensitivity_labels = {"internal"};
     f.lifecycle_status = "active";
 
     auto r = drogon::sync_wait(vs.search(*q, f, 10));
@@ -222,9 +227,62 @@ TEST_CASE("NullVectorStore: empty access_scope_ids returns nothing", "[vector_st
     QdrantFilter f;
     f.company_id       = "co1";
     f.access_scope_ids = {};   // empty -> match nothing
+    f.sensitivity_labels = {"internal"};
     f.lifecycle_status = "active";
 
     auto r = drogon::sync_wait(vs.search(*q, f, 10));
     REQUIRE(r.has_value());
     CHECK(r->empty());
+}
+
+TEST_CASE("NullVectorStore: empty sensitivity_labels returns nothing (fail-closed)", "[vector_store]")
+{
+    // Sensitivity_labels mirrors access_scope_ids: an unset / empty MatchAny
+    // matches no points. V014 requires that a caller without a resolved
+    // clearance set MUST NOT see any evidence. If a future orchestrator
+    // forgets to populate sensitivity_labels, no chunks reach the LLM
+    // rather than the safer-looking-but-actually-wrong "everything".
+    NullVectorStore vs;
+    auto p = make_point("p1", "co1", "v1", "c1", "active", {"org-A"});
+    p.payload.sensitivity_label = "internal";
+    drogon::sync_wait(vs.upsert({p}));
+
+    NullEmbedder emb(4);
+    auto q = drogon::sync_wait(emb.embed("query"));
+
+    QdrantFilter f;
+    f.company_id          = "co1";
+    f.access_scope_ids    = {"org-A"};
+    f.sensitivity_labels  = {};    // empty -> match nothing
+    f.lifecycle_status    = "active";
+
+    auto r = drogon::sync_wait(vs.search(*q, f, 10));
+    REQUIRE(r.has_value());
+    CHECK(r->empty());
+}
+
+TEST_CASE("NullVectorStore: search filters out chunks whose sensitivity_label is not in the allowed set", "[vector_store]")
+{
+    NullVectorStore vs;
+    auto p_internal     = make_point("p1", "co1", "v1", "c1", "active", {"org-A"});
+    p_internal.payload.sensitivity_label = "internal";
+    auto p_confidential = make_point("p2", "co1", "v2", "c2", "active", {"org-A"});
+    p_confidential.payload.sensitivity_label = "confidential";
+    auto p_restricted   = make_point("p3", "co1", "v3", "c3", "active", {"org-A"});
+    p_restricted.payload.sensitivity_label = "restricted";
+    drogon::sync_wait(vs.upsert({p_internal, p_confidential, p_restricted}));
+
+    NullEmbedder emb(4);
+    auto q = drogon::sync_wait(emb.embed("query"));
+
+    QdrantFilter f;
+    f.company_id         = "co1";
+    f.access_scope_ids   = {"org-A"};
+    f.sensitivity_labels = {"public", "internal"};   // guest-class session
+    f.lifecycle_status   = "active";
+
+    auto r = drogon::sync_wait(vs.search(*q, f, 10));
+    REQUIRE(r.has_value());
+    REQUIRE(r->size() == 1);
+    CHECK((*r)[0].payload.sensitivity_label == "internal");
 }
