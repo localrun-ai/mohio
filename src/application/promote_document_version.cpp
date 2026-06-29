@@ -54,11 +54,17 @@ PromoteDocumentVersionUseCase::execute(
     }
 
     // Step 3: write outbox event for Qdrant payload resync in the same transaction.
-    // Idempotency key includes trace_id so: (a) retries of the same HTTP request are
-    // idempotent, and (b) a genuine re-promotion (new request, new trace_id) always
-    // creates a fresh outbox entry even if the version was previously promoted.
-    const auto idempotency_key = std::format("promote:{}:{}:{}",
-        cmd.document_id, cmd.version_id, ctx.span.trace_id);
+    // The idempotency key is keyed on (doc_id, version_id, new_status) ONLY,
+    // NOT on trace_id. The job is "resync this version to status X"; it
+    // does not matter how many distinct HTTP requests asked for it. Including
+    // trace_id (Opus finding H) defeated cross-request dedup: two genuinely
+    // distinct requests that both promoted the same version produced two
+    // outbox rows and the worker resynced twice. The duplicate work was
+    // harmless (the resync is idempotent in Qdrant) but the duplicate event
+    // still costs a round-trip per chunk. trace_id stays in the payload so
+    // the worker's log line can be stitched back to the originating span.
+    const auto idempotency_key = std::format("promote:{}:{}:active",
+        cmd.document_id, cmd.version_id);
     try {
         co_await uow.exec(
             R"(INSERT INTO outbox_events
@@ -67,15 +73,17 @@ PromoteDocumentVersionUseCase::execute(
                        jsonb_build_object(
                            'document_id',  $3::text,
                            'version_id',   $4::text,
-                           'new_status',   'active'
+                           'new_status',   'active',
+                           'trace_id',     $5::text
                        ),
-                       $5)
+                       $6)
                ON CONFLICT (company_id, job_type, idempotency_key) DO NOTHING)",
             ctx.tenant.company_id,
             cmd.version_id,   // $2 as uuid (aggregate_id)
             cmd.document_id,  // $3
             cmd.version_id,   // $4 as text inside jsonb
-            idempotency_key); // $5
+            ctx.span.trace_id,// $5
+            idempotency_key); // $6
     } catch (const drogon::orm::DrogonDbException& ex) {
         uow.rollback();
         co_return std::unexpected(postgres::map_db_exception(ex));

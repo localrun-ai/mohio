@@ -376,6 +376,82 @@ TEST_CASE("IngestDocumentVersion: re-ingest with a SHRUNK document removes orpha
     CHECK(orphan_sections.empty());
 }
 
+TEST_CASE("IngestDocumentVersion: outbox dedups across DIFFERENT trace_ids (idempotency key drops trace_id)",
+          "[integration][ingest]")
+{
+    // Opus finding H: with trace_id baked into the idempotency_key, two
+    // genuinely distinct HTTP requests for the same (version, model) wrote
+    // two outbox_events rows and the worker ran the embed/upsert twice.
+    // The new key omits trace_id, so the same (version, model) produces
+    // exactly one outbox row regardless of how many requests asked for it.
+    if (!db_available()) SKIP("DATABASE_URL not set");
+    auto db = wikore::Db::get();
+    seed_ingest_fixtures(db);
+
+    const auto file_path = write_temp_doc();
+    auto uc = make_use_case(db);
+
+    auto ctx_with_trace = [](const char* trace) {
+        return wikore::RequestContext{
+            .tenant    = {.company_id = CO},
+            .principal = {.user_id = USR, .email = "ingest@test.com"},
+            .span      = {.trace_id = trace, .span_id = "s"},
+            .deadline  = std::chrono::steady_clock::now() + std::chrono::seconds(30),
+        };
+    };
+
+    // First request, trace A.
+    REQUIRE(drogon::sync_wait(uc.execute(
+        ctx_with_trace("trace-A"),
+        {.company_id = CO, .document_id = DOC, .document_version_id = VERSION,
+         .file_path = file_path, .embed_model_id = "bge-m3"})).has_value());
+
+    // Reset to pending so the use case allows the second request to claim
+    // the row again (claim_for_processing CAS gates on pending/processing).
+    exec_sync(db,
+        "UPDATE document_versions SET ingest_status='pending', "
+        "completed_at=NULL, chunk_count=NULL "
+        "WHERE id=$1::uuid", std::string(VERSION));
+
+    // Second request, trace B (completely distinct trace_id).
+    REQUIRE(drogon::sync_wait(uc.execute(
+        ctx_with_trace("trace-B-totally-different"),
+        {.company_id = CO, .document_id = DOC, .document_version_id = VERSION,
+         .file_path = file_path, .embed_model_id = "bge-m3"})).has_value());
+
+    // The outbox table should hold exactly ONE qdrant_upsert row for this
+    // (company, version, model). Different model would key differently.
+    auto outbox = exec_sync(db,
+        "SELECT COUNT(*) AS n FROM outbox_events "
+        "WHERE company_id=$1::uuid AND aggregate_id=$2::uuid "
+        "  AND job_type='qdrant_upsert_chunk_payload'",
+        std::string(CO), std::string(VERSION));
+    CHECK(std::stoi(outbox[0]["n"].c_str()) == 1);
+
+    // Confirm the idempotency_key itself contains neither trace value, so
+    // future writers cannot reintroduce a trace component without it being
+    // visible in the row.
+    auto keys = exec_sync(db,
+        "SELECT idempotency_key FROM outbox_events "
+        "WHERE company_id=$1::uuid AND aggregate_id=$2::uuid "
+        "  AND job_type='qdrant_upsert_chunk_payload'",
+        std::string(CO), std::string(VERSION));
+    REQUIRE(keys.size() == 1);
+    const auto key = std::string(keys[0]["idempotency_key"].c_str());
+    CHECK(key.find("trace-A") == std::string::npos);
+    CHECK(key.find("trace-B") == std::string::npos);
+
+    // But the payload DOES carry trace_id for observability (the first
+    // writer's trace, since the second was deduped).
+    auto payload = exec_sync(db,
+        "SELECT payload->>'trace_id' AS trace_id FROM outbox_events "
+        "WHERE company_id=$1::uuid AND aggregate_id=$2::uuid "
+        "  AND job_type='qdrant_upsert_chunk_payload'",
+        std::string(CO), std::string(VERSION));
+    REQUIRE(payload.size() == 1);
+    CHECK(std::string(payload[0]["trace_id"].c_str()) == "trace-A");
+}
+
 TEST_CASE("IngestDocumentVersion: missing file marks version 'error' (returns TerminalError)",
           "[integration][ingest]")
 {
