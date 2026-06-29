@@ -244,6 +244,8 @@ drogon::Task<Result<void>> OutboxWorker::process(const ClaimedEvent& ev)
         std::string                lifecycle_status;
         std::optional<std::string> activated_at;
         std::optional<std::string> superseded_at;
+        std::string                owner_org_unit_id;   // documents.owner_org_unit_id
+        int                        authority_level = 50; // documents.authority_level
     };
     std::vector<DbChunk> chunks;
     try {
@@ -252,6 +254,8 @@ drogon::Task<Result<void>> OutboxWorker::process(const ClaimedEvent& ev)
         //                       content, access_scope_ids, section_id).
         // V014: document_versions(sensitivity_label, lifecycle_status,
         //                          activated_at, superseded_at).
+        // V003: documents(owner_org_unit_id, authority_level): reranker
+        //       weight + canonical owning OU for the payload contract.
         auto rows = co_await db_->execSqlCoro(R"(
             SELECT  dc.id::text                              AS chunk_id,
                     dc.chunk_index                           AS chunk_index,
@@ -262,9 +266,12 @@ drogon::Task<Result<void>> OutboxWorker::process(const ClaimedEvent& ev)
                     dv.sensitivity_label                     AS sensitivity_label,
                     dv.lifecycle_status                      AS lifecycle_status,
                     dv.activated_at                          AS activated_at,
-                    dv.superseded_at                         AS superseded_at
+                    dv.superseded_at                         AS superseded_at,
+                    d.owner_org_unit_id::text                AS owner_org_unit_id,
+                    d.authority_level                        AS authority_level
             FROM    document_chunks  dc
             JOIN    document_versions dv ON dv.id = dc.document_version_id
+            JOIN    documents         d  ON d.id  = dv.document_id
             LEFT JOIN document_sections ds ON ds.id = dc.section_id
             WHERE   dc.document_version_id = $1::uuid
               AND   dc.company_id          = $2::uuid
@@ -279,6 +286,8 @@ drogon::Task<Result<void>> OutboxWorker::process(const ClaimedEvent& ev)
             c.content            = r["content"].as<std::string>();
             c.sensitivity_label  = r["sensitivity_label"].as<std::string>();
             c.lifecycle_status   = r["lifecycle_status"].as<std::string>();
+            c.owner_org_unit_id  = r["owner_org_unit_id"].as<std::string>();
+            c.authority_level    = r["authority_level"].as<int>();
             if (!r["section_id"].isNull())
                 c.section_id = r["section_id"].as<std::string>();
             if (!r["section_heading"].isNull())
@@ -334,8 +343,10 @@ drogon::Task<Result<void>> OutboxWorker::process(const ClaimedEvent& ev)
                 .company_id          = ev.company_id,
                 .document_id         = ev.document_id,
                 .document_version_id = ev.aggregate_id,
+                .owner_org_unit_id   = chunk.owner_org_unit_id,
                 .chunk_id            = chunk.chunk_id,
                 .chunk_index         = chunk.chunk_index,
+                .authority_level     = chunk.authority_level,
                 .access_scope_ids    = chunk.access_scope_ids,
                 .sensitivity_label   = chunk.sensitivity_label,
                 .lifecycle_status    = chunk.lifecycle_status,

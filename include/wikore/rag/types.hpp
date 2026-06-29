@@ -69,16 +69,35 @@ inline std::string uuid_v5(std::string_view name) {
 // All fields are queryable as Qdrant filters without touching Postgres.
 // Bump kSchemaVersion when adding/removing fields; the resync worker uses
 // this to identify stale points that need payload refresh.
+//
+// V003 contract: the canonical names are document_id (struct) and
+// owner_org_unit_id (the document's home OU). authority_level (0..100)
+// comes from documents.authority_level and is consumed by the reranker
+// to weight high-authority chunks (policy, mandate) above informational
+// ones (notes, drafts). Both fields are written at ingest time and never
+// mutated for an existing point id; if a document changes owner, ingest
+// produces a new document_version and a new point id.
 // ---------------------------------------------------------------------------
 
 struct ChunkPayload {
-    static constexpr int kSchemaVersion = 1;
+    static constexpr int kSchemaVersion = 2;
 
     std::string              company_id;
     std::string              document_id;
     std::string              document_version_id;
+    // Optional because schema-v1 points written before this field existed
+    // have no owner_org_unit_id key in their Qdrant payload; glaze deserializes
+    // a missing string field as "" by default, and "" passed to a PostgreSQL
+    // UUID parameter (e.g. the reranker's WHERE d.id = $1::uuid) raises
+    // ERROR: invalid input syntax for type uuid. std::optional + glaze's
+    // skip_null_members write path keeps round-trips faithful: v1 points
+    // round-trip as nullopt, v2+ writes the real value. The resync worker
+    // (deferred) is the long-term fix; this keeps the system safe in the
+    // meantime. Same rationale as section_id / section_heading.
+    std::optional<std::string> owner_org_unit_id;
     std::string              chunk_id;
     int                      chunk_index         = 0;
+    int                      authority_level     = 50;   // documents.authority_level; default matches V003
     // All org_unit_ids whose members may retrieve this chunk:
     //   owner_org_unit_id + org_units with a resource_grant giving read access.
     // Used as the MatchAny filter in Qdrant queries.
@@ -124,11 +143,22 @@ struct AllowedCandidate {
 //
 // QdrantFilterBuilder (Iteration 2) translates AccessScope + Principal
 // into this struct. Used directly by VectorStorePort::search().
+//
+// sensitivity_labels is REQUIRED (no default). The retrieval-orchestrator is
+// responsible for deriving the set of labels the requesting session may see
+// (e.g. guest -> {public, internal}; member -> {public, internal,
+// confidential}; clearance-bearing member -> {..., restricted}). Leaving it
+// empty short-circuits the search to zero results -- the same fail-closed
+// posture as an empty access_scope_ids. V014 is explicit that restricted
+// content must never appear in generated answers, and the only way to enforce
+// that at the index is to push the label set down as a filter; PG
+// re-validation is defense-in-depth, not the primary gate.
 // ---------------------------------------------------------------------------
 
 struct QdrantFilter {
     std::string              company_id;
-    std::vector<std::string> access_scope_ids;   // MatchAny on payload field
+    std::vector<std::string> access_scope_ids;     // MatchAny on payload field
+    std::vector<std::string> sensitivity_labels;   // MatchAny on payload field
     std::string              lifecycle_status = "active";
 };
 

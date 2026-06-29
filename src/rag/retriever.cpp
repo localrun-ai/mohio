@@ -123,23 +123,29 @@ static std::string build_search_body(const Embedding&    query,
     }
     vec_json += ']';
 
-    // Build access_scope_ids array
-    std::string scope_json = "[";
-    for (size_t i = 0; i < filter.access_scope_ids.size(); ++i) {
-        if (i) scope_json += ',';
-        scope_json += std::format(R"("{}")", json_escape(filter.access_scope_ids[i]));
-    }
-    scope_json += ']';
+    auto build_string_array = [](const std::vector<std::string>& xs) {
+        std::string out = "[";
+        for (size_t i = 0; i < xs.size(); ++i) {
+            if (i) out += ',';
+            out += std::format(R"("{}")", json_escape(xs[i]));
+        }
+        out += ']';
+        return out;
+    };
+
+    const std::string scope_json       = build_string_array(filter.access_scope_ids);
+    const std::string sensitivity_json = build_string_array(filter.sensitivity_labels);
 
     return std::format(
         R"({{"vector":{},"limit":{},"with_payload":true,)"
         R"("filter":{{"must":[)"
         R"({{"key":"company_id","match":{{"value":"{}"}}}},)"
         R"({{"key":"access_scope_ids","match":{{"any":{}}}}},)"
+        R"({{"key":"sensitivity_label","match":{{"any":{}}}}},)"
         R"({{"key":"lifecycle_status","match":{{"value":"{}"}}}})"
         R"(]}}}})",
         vec_json, limit,
-        json_escape(filter.company_id), scope_json,
+        json_escape(filter.company_id), scope_json, sensitivity_json,
         json_escape(filter.lifecycle_status));
 }
 
@@ -271,6 +277,23 @@ QdrantVectorStore::search(const Embedding&    query,
                            const QdrantFilter& filter,
                            int                 limit)
 {
+    // Fail-closed before the network call. Qdrant currently treats an empty
+    // MatchAny array as "match nothing", but relying on a remote system's
+    // interpretation of an empty filter for a security-critical invariant
+    // is fragile: a future server version or a misconfigured proxy that
+    // strips the empty clause would silently widen visibility. Short-
+    // circuiting here makes the contract local and explicit, and matches
+    // NullVectorStore's behaviour so the two implementations agree byte-
+    // for-byte from the caller's perspective.
+    //
+    // - empty access_scope_ids   -> caller has no resolved read scope.
+    // - empty sensitivity_labels -> caller has no resolved clearance set.
+    // Either case must return zero candidates. V014 requires that
+    // restricted content never reach the LLM, which we cannot guarantee
+    // if the filter that gates it can be silently dropped.
+    if (filter.access_scope_ids.empty() || filter.sensitivity_labels.empty())
+        co_return std::vector<ChunkCandidate>{};
+
     auto body = build_search_body(query, filter, limit);
     drogon::HttpResponsePtr resp;
     try {
@@ -346,7 +369,11 @@ NullVectorStore::search(const Embedding&    query,
     //     so an empty filter returns zero candidates. This is the same
     //     behaviour the production QdrantVectorStore produces, and it is the
     //     safe default: a caller with no scope must not see any evidence.
-    if (filter.access_scope_ids.empty())
+    //   * an empty sensitivity_labels MatchAny is treated the same way; the
+    //     orchestrator is required to set the labels the session may see.
+    //     V014: restricted content must never reach the LLM, and forgetting
+    //     to populate the labels must not silently widen visibility.
+    if (filter.access_scope_ids.empty() || filter.sensitivity_labels.empty())
         co_return std::vector<ChunkCandidate>{};
 
     std::vector<std::pair<float, const UpsertPoint*>> scored;
@@ -355,6 +382,9 @@ NullVectorStore::search(const Embedding&    query,
     for (const auto& p : _points) {
         if (p.payload.company_id       != filter.company_id)        continue;
         if (p.payload.lifecycle_status != filter.lifecycle_status)  continue;
+        if (std::ranges::find(filter.sensitivity_labels,
+                              p.payload.sensitivity_label)
+            == filter.sensitivity_labels.end()) continue;
         bool in_scope = false;
         for (const auto& sid : filter.access_scope_ids) {
             if (std::ranges::find(p.payload.access_scope_ids, sid)
