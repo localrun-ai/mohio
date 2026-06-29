@@ -163,7 +163,13 @@ jobs:
         env:
           PGPASSWORD: wikore
         run: |
-          psql -h localhost -U wikore -d wikore -f db/provision_roles.sql
+          psql -h localhost -U wikore -d wikore \
+            -v ON_ERROR_STOP=1 -f db/provision_roles.sql
+          psql -h localhost -U wikore -d wikore -v ON_ERROR_STOP=1 -c "
+            CREATE ROLE wikore_partition_test_login
+              NOSUPERUSER NOCREATEDB NOCREATEROLE LOGIN PASSWORD 'test-only';
+            GRANT wikore_partition_maintainer TO wikore_partition_test_login;
+          "
 
       - name: Load schema migrations
         env:
@@ -175,7 +181,7 @@ jobs:
       - name: Integration tests
         env:
           DATABASE_URL: postgresql://wikore:wikore@localhost:5432/wikore
-          DATABASE_URL_APP: postgresql://wikore_app_login:wikore_app@localhost:5432/wikore
+          PARTITION_DATABASE_URL: postgresql://wikore_partition_test_login:test-only@localhost:5432/wikore
           REDIS_URL: redis://localhost:6379/0
         run: |
           build-ci/tests/wikore_tests "[integration]"

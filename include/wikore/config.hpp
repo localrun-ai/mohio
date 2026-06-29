@@ -7,6 +7,7 @@ namespace wikore {
 struct Config {
     // PostgreSQL
     std::string database_url   = "postgresql://wikore:wikore@localhost:5432/wikore";
+    std::string partition_database_url;
 
     // Redis
     std::string redis_url      = "redis://127.0.0.1:6379/0";
@@ -50,6 +51,7 @@ struct Config {
             if (const char* s = std::getenv(k)) v = std::stoi(s);
         };
         e("DATABASE_URL",      c.database_url);
+        e("PARTITION_DATABASE_URL", c.partition_database_url);
         e("REDIS_URL",         c.redis_url);
         e("QDRANT_URL",        c.qdrant_url);
         e("LLM_BASE_URL",      c.llm_base_url);

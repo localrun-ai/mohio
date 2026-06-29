@@ -1,9 +1,9 @@
 -- V031: SECURITY DEFINER helpers for runtime partition maintenance.
 --
 -- PartitionMaintainer (wikore-scheduler) pre-creates quarterly audit_log and
--- monthly usage_events partitions. The runtime role (wikore_app) holds DML
--- on these tables but not CREATE TABLE; these SECURITY DEFINER functions run
--- under the owner's (migration role's) CREATE privilege.
+-- monthly usage_events partitions. Its dedicated runtime role has EXECUTE only;
+-- these SECURITY DEFINER functions perform the narrowly scoped catalog access
+-- and DDL under the migration owner's privilege.
 --
 -- Security properties:
 --   1. Each function only touches its named parent table; no generic parent arg.
@@ -18,8 +18,12 @@
 --   5. REVOKE EXECUTE FROM PUBLIC appears immediately after each CREATE so the
 --      migration-owner privilege is closed before the selective GRANT below.
 --
--- Deployment order: wikore_app must be created before this migration runs.
+-- Deployment order: wikore_partition_maintainer must be created before this
+-- migration runs.
 -- Run db/provision_roles.sql as superuser before applying migrations.
+
+-- Required to resolve the functions when PUBLIC schema access is hardened.
+GRANT USAGE ON SCHEMA public TO wikore_partition_maintainer;
 
 -- ---------------------------------------------------------------------------
 -- wikore_ensure_audit_log_partition(year_val INT, quarter_val INT)
@@ -116,7 +120,8 @@ END;
 $$;
 
 REVOKE EXECUTE ON FUNCTION wikore_ensure_audit_log_partition(INT, INT) FROM PUBLIC;
-GRANT  EXECUTE ON FUNCTION wikore_ensure_audit_log_partition(INT, INT) TO   wikore_app;
+GRANT  EXECUTE ON FUNCTION wikore_ensure_audit_log_partition(INT, INT)
+    TO wikore_partition_maintainer;
 
 -- ---------------------------------------------------------------------------
 -- wikore_ensure_usage_events_partition(year_val INT, month_val INT)
@@ -203,7 +208,8 @@ END;
 $$;
 
 REVOKE EXECUTE ON FUNCTION wikore_ensure_usage_events_partition(INT, INT) FROM PUBLIC;
-GRANT  EXECUTE ON FUNCTION wikore_ensure_usage_events_partition(INT, INT) TO   wikore_app;
+GRANT  EXECUTE ON FUNCTION wikore_ensure_usage_events_partition(INT, INT)
+    TO wikore_partition_maintainer;
 
 -- ---------------------------------------------------------------------------
 -- wikore_check_partition_overflow()
@@ -227,4 +233,5 @@ END;
 $$;
 
 REVOKE EXECUTE ON FUNCTION wikore_check_partition_overflow() FROM PUBLIC;
-GRANT  EXECUTE ON FUNCTION wikore_check_partition_overflow() TO   wikore_app;
+GRANT  EXECUTE ON FUNCTION wikore_check_partition_overflow()
+    TO wikore_partition_maintainer;

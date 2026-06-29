@@ -8,6 +8,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstdlib>
+#include <future>
 #include <string>
 #include <thread>
 #include <utility>
@@ -18,35 +19,33 @@
 //
 // Required env vars:
 //   DATABASE_URL     - superuser/migration-owner connection (wikore)
-//   DATABASE_URL_APP - non-superuser runtime connection (wikore_app_login)
+//   PARTITION_DATABASE_URL - restricted partition-maintenance connection
 //
 // Invariants verified:
-//   - wikore_app_login (NOSUPERUSER, inherits from wikore_app) can call the
-//     functions over a direct non-privileged connection.
+//   - The restricted login can call the functions but cannot read tables or
+//     issue DDL directly.
 //   - Bounds are UTC-pinned: the caller session timezone is set to Auckland
 //     (UTC+12/13) BEFORE partition creation so the entire code path under test
 //     runs with a non-UTC local clock.  Rows at UTC midnight land in the named
 //     partition, proving make_timestamptz pinning works.
 //   - pg_inherits + bounds check: an attached partition with mismatched range
 //     raises an exception rather than silently returning FALSE.
-//   - C++ PartitionMaintainer tests use app_db() (non-superuser runtime role).
-//   - Shutdown-during-sleep: a background thread signals shutdown after
-//     run_once() completes; run() exits within sleep_chunk (100ms in tests),
-//     not after the full 24-hour interval.
+//   - C++ PartitionMaintainer tests use partition_db() throughout.
+//   - A timer-armed hook makes the shutdown-during-sleep test deterministic.
 
 namespace {
 
 bool db_available() {
-    return std::getenv("DATABASE_URL") && std::getenv("DATABASE_URL_APP");
+    return std::getenv("DATABASE_URL") && std::getenv("PARTITION_DATABASE_URL");
 }
 
 // Superuser connection (wikore) - used for schema DDL and cleanup.
 drogon::orm::DbClientPtr admin_db() { return wikore::Db::get(); }
 
-// Non-superuser connection (wikore_app_login inherits EXECUTE from wikore_app).
+// Non-superuser connection with only the V031 maintenance-function grants.
 // Created once; the event loop is already running when tests start.
-drogon::orm::DbClientPtr app_db() {
-    const char* url = std::getenv("DATABASE_URL_APP");
+drogon::orm::DbClientPtr partition_db() {
+    const char* url = std::getenv("PARTITION_DATABASE_URL");
     if (!url) return nullptr;
     static auto client = drogon::orm::DbClient::newPgClient(url, 4);
     return client;
@@ -88,7 +87,7 @@ wikore::scheduler::PartitionMaintainer::Options fixed_opts(
 // ---------------------------------------------------------------------------
 
 TEST_CASE("V031 audit_log: creates new quarterly partition", "[integration][partition]") {
-    if (!db_available()) SKIP("DATABASE_URL / DATABASE_URL_APP not set");
+    if (!db_available()) SKIP("DATABASE_URL / PARTITION_DATABASE_URL not set");
     auto db = admin_db();
 
     drogon::sync_wait([&db]() -> drogon::Task<void> {
@@ -102,7 +101,7 @@ TEST_CASE("V031 audit_log: creates new quarterly partition", "[integration][part
 }
 
 TEST_CASE("V031 audit_log: idempotent - second call in same txn returns FALSE", "[integration][partition]") {
-    if (!db_available()) SKIP("DATABASE_URL / DATABASE_URL_APP not set");
+    if (!db_available()) SKIP("DATABASE_URL / PARTITION_DATABASE_URL not set");
     auto db = admin_db();
 
     drogon::sync_wait([&db]() -> drogon::Task<void> {
@@ -120,7 +119,7 @@ TEST_CASE("V031 audit_log: idempotent - second call in same txn returns FALSE", 
 }
 
 TEST_CASE("V031 audit_log: UTC bounds hold under Auckland caller timezone", "[integration][partition]") {
-    if (!db_available()) SKIP("DATABASE_URL / DATABASE_URL_APP not set");
+    if (!db_available()) SKIP("DATABASE_URL / PARTITION_DATABASE_URL not set");
     auto db = admin_db();
 
     // Set the session timezone to Auckland (UTC+12/+13) BEFORE creating the
@@ -151,7 +150,7 @@ TEST_CASE("V031 audit_log: UTC bounds hold under Auckland caller timezone", "[in
 }
 
 TEST_CASE("V031 audit_log: UTC bounds hold for Q4 year rollover", "[integration][partition]") {
-    if (!db_available()) SKIP("DATABASE_URL / DATABASE_URL_APP not set");
+    if (!db_available()) SKIP("DATABASE_URL / PARTITION_DATABASE_URL not set");
     auto db = admin_db();
 
     drogon::sync_wait([&db]() -> drogon::Task<void> {
@@ -177,7 +176,7 @@ TEST_CASE("V031 audit_log: UTC bounds hold for Q4 year rollover", "[integration]
 }
 
 TEST_CASE("V031 audit_log: attached partition with wrong bounds raises", "[integration][partition]") {
-    if (!db_available()) SKIP("DATABASE_URL / DATABASE_URL_APP not set");
+    if (!db_available()) SKIP("DATABASE_URL / PARTITION_DATABASE_URL not set");
     auto db = admin_db();
 
     bool threw = false;
@@ -204,7 +203,7 @@ TEST_CASE("V031 audit_log: attached partition with wrong bounds raises", "[integ
 }
 
 TEST_CASE("V031 audit_log: conflict with non-partition table raises", "[integration][partition]") {
-    if (!db_available()) SKIP("DATABASE_URL / DATABASE_URL_APP not set");
+    if (!db_available()) SKIP("DATABASE_URL / PARTITION_DATABASE_URL not set");
     auto db = admin_db();
 
     bool threw = false;
@@ -221,7 +220,7 @@ TEST_CASE("V031 audit_log: conflict with non-partition table raises", "[integrat
 }
 
 TEST_CASE("V031 audit_log: invalid quarter raises exception", "[integration][partition]") {
-    if (!db_available()) SKIP("DATABASE_URL / DATABASE_URL_APP not set");
+    if (!db_available()) SKIP("DATABASE_URL / PARTITION_DATABASE_URL not set");
     bool threw = false;
     try {
         exec_sync(admin_db(),
@@ -231,7 +230,7 @@ TEST_CASE("V031 audit_log: invalid quarter raises exception", "[integration][par
 }
 
 TEST_CASE("V031 audit_log: out-of-range year raises exception", "[integration][partition]") {
-    if (!db_available()) SKIP("DATABASE_URL / DATABASE_URL_APP not set");
+    if (!db_available()) SKIP("DATABASE_URL / PARTITION_DATABASE_URL not set");
     bool threw = false;
     try {
         exec_sync(admin_db(),
@@ -245,7 +244,7 @@ TEST_CASE("V031 audit_log: out-of-range year raises exception", "[integration][p
 // ---------------------------------------------------------------------------
 
 TEST_CASE("V031 usage_events: creates new monthly partition", "[integration][partition]") {
-    if (!db_available()) SKIP("DATABASE_URL / DATABASE_URL_APP not set");
+    if (!db_available()) SKIP("DATABASE_URL / PARTITION_DATABASE_URL not set");
     auto db = admin_db();
 
     drogon::sync_wait([&db]() -> drogon::Task<void> {
@@ -259,7 +258,7 @@ TEST_CASE("V031 usage_events: creates new monthly partition", "[integration][par
 }
 
 TEST_CASE("V031 usage_events: idempotent - second call returns FALSE", "[integration][partition]") {
-    if (!db_available()) SKIP("DATABASE_URL / DATABASE_URL_APP not set");
+    if (!db_available()) SKIP("DATABASE_URL / PARTITION_DATABASE_URL not set");
     auto db = admin_db();
 
     drogon::sync_wait([&db]() -> drogon::Task<void> {
@@ -277,7 +276,7 @@ TEST_CASE("V031 usage_events: idempotent - second call returns FALSE", "[integra
 }
 
 TEST_CASE("V031 usage_events: UTC bounds hold under Auckland caller timezone", "[integration][partition]") {
-    if (!db_available()) SKIP("DATABASE_URL / DATABASE_URL_APP not set");
+    if (!db_available()) SKIP("DATABASE_URL / PARTITION_DATABASE_URL not set");
     auto db = admin_db();
 
     drogon::sync_wait([&db]() -> drogon::Task<void> {
@@ -304,7 +303,7 @@ TEST_CASE("V031 usage_events: UTC bounds hold under Auckland caller timezone", "
 }
 
 TEST_CASE("V031 usage_events: invalid month raises exception", "[integration][partition]") {
-    if (!db_available()) SKIP("DATABASE_URL / DATABASE_URL_APP not set");
+    if (!db_available()) SKIP("DATABASE_URL / PARTITION_DATABASE_URL not set");
     bool threw = false;
     try {
         exec_sync(admin_db(),
@@ -314,17 +313,16 @@ TEST_CASE("V031 usage_events: invalid month raises exception", "[integration][pa
 }
 
 // ---------------------------------------------------------------------------
-// Role / privilege: non-superuser connection via DATABASE_URL_APP
+// Role / privilege: non-superuser connection via PARTITION_DATABASE_URL
 // ---------------------------------------------------------------------------
 
-TEST_CASE("V031 wikore_app_login: can execute partition functions", "[integration][partition]") {
-    if (!db_available()) SKIP("DATABASE_URL / DATABASE_URL_APP not set");
-    auto adb = app_db();
+TEST_CASE("V031 wikore_partition_test_login: can execute partition functions", "[integration][partition]") {
+    if (!db_available()) SKIP("DATABASE_URL / PARTITION_DATABASE_URL not set");
+    auto adb = partition_db();
     REQUIRE(adb != nullptr);
 
-    // wikore_app_login is NOSUPERUSER; EXECUTE on the functions is inherited
-    // from wikore_app.  This test uses a direct non-privileged connection, not
-    // SET ROLE from a superuser session.
+    // EXECUTE is inherited only from wikore_partition_maintainer, not from the
+    // application or migration role.
     drogon::sync_wait([&adb]() -> drogon::Task<void> {
         auto uow = co_await wikore::postgres::UnitOfWork::begin(adb);
         auto r = co_await uow.exec(
@@ -335,9 +333,9 @@ TEST_CASE("V031 wikore_app_login: can execute partition functions", "[integratio
     }());
 }
 
-TEST_CASE("V031 wikore_app_login: can call overflow check", "[integration][partition]") {
-    if (!db_available()) SKIP("DATABASE_URL / DATABASE_URL_APP not set");
-    auto adb = app_db();
+TEST_CASE("V031 wikore_partition_test_login: can call overflow check", "[integration][partition]") {
+    if (!db_available()) SKIP("DATABASE_URL / PARTITION_DATABASE_URL not set");
+    auto adb = partition_db();
     REQUIRE(adb != nullptr);
 
     drogon::sync_wait([&adb]() -> drogon::Task<void> {
@@ -350,8 +348,36 @@ TEST_CASE("V031 wikore_app_login: can call overflow check", "[integration][parti
     }());
 }
 
+TEST_CASE("V031 partition login: cannot read tables or issue DDL directly", "[integration][partition]") {
+    if (!db_available()) SKIP("DATABASE_URL / PARTITION_DATABASE_URL not set");
+    auto db = partition_db();
+
+    bool select_denied = false;
+    try {
+        exec_sync(db, "SELECT 1 FROM public.audit_log_default LIMIT 1");
+    } catch (const drogon::orm::DrogonDbException& ex) {
+        select_denied = std::string(ex.base().what()).find("permission denied") !=
+                        std::string::npos;
+    }
+
+    bool ddl_denied = false;
+    try {
+        exec_sync(db, "CREATE TABLE public.partition_privilege_escape(id INT)");
+    } catch (const drogon::orm::DrogonDbException& ex) {
+        ddl_denied = std::string(ex.base().what()).find("permission denied") !=
+                     std::string::npos;
+    }
+    if (!ddl_denied) {
+        exec_sync(admin_db(),
+                  "DROP TABLE IF EXISTS public.partition_privilege_escape");
+    }
+
+    REQUIRE(select_denied);
+    REQUIRE(ddl_denied);
+}
+
 TEST_CASE("V031 unauthorized role: cannot call partition functions", "[integration][partition]") {
-    if (!db_available()) SKIP("DATABASE_URL / DATABASE_URL_APP not set");
+    if (!db_available()) SKIP("DATABASE_URL / PARTITION_DATABASE_URL not set");
     auto db = admin_db();
 
     try { exec_sync(db, "CREATE ROLE wikore_partition_test_noaccess NOLOGIN"); }
@@ -380,7 +406,7 @@ TEST_CASE("V031 unauthorized role: cannot call partition functions", "[integrati
 // ---------------------------------------------------------------------------
 
 TEST_CASE("V031 overflow check: clean state - default partitions are empty", "[integration][partition]") {
-    if (!db_available()) SKIP("DATABASE_URL / DATABASE_URL_APP not set");
+    if (!db_available()) SKIP("DATABASE_URL / PARTITION_DATABASE_URL not set");
 
     auto rows = exec_sync(admin_db(),
         "SELECT partition_table, has_rows "
@@ -391,7 +417,7 @@ TEST_CASE("V031 overflow check: clean state - default partitions are empty", "[i
 }
 
 TEST_CASE("V031 overflow check: detects rows in audit_log_default", "[integration][partition]") {
-    if (!db_available()) SKIP("DATABASE_URL / DATABASE_URL_APP not set");
+    if (!db_available()) SKIP("DATABASE_URL / PARTITION_DATABASE_URL not set");
     auto db = admin_db();
 
     drogon::sync_wait([&db]() -> drogon::Task<void> {
@@ -416,12 +442,12 @@ TEST_CASE("V031 overflow check: detects rows in audit_log_default", "[integratio
 }
 
 // ---------------------------------------------------------------------------
-// C++ PartitionMaintainer - uses app_db() throughout
+// C++ PartitionMaintainer - uses partition_db() throughout
 // ---------------------------------------------------------------------------
 
 TEST_CASE("PartitionMaintainer::run_once: creates exactly one partition (fixed clock)", "[integration][partition]") {
-    if (!db_available()) SKIP("DATABASE_URL / DATABASE_URL_APP not set");
-    auto adb = app_db();
+    if (!db_available()) SKIP("DATABASE_URL / PARTITION_DATABASE_URL not set");
+    auto adb = partition_db();
 
     wikore::scheduler::PartitionMaintainer pm(
         adb, [] { return false; },
@@ -439,8 +465,8 @@ TEST_CASE("PartitionMaintainer::run_once: creates exactly one partition (fixed c
 }
 
 TEST_CASE("PartitionMaintainer::run_once: second run is idempotent (counter unchanged)", "[integration][partition]") {
-    if (!db_available()) SKIP("DATABASE_URL / DATABASE_URL_APP not set");
-    auto adb = app_db();
+    if (!db_available()) SKIP("DATABASE_URL / PARTITION_DATABASE_URL not set");
+    auto adb = partition_db();
 
     wikore::scheduler::PartitionMaintainer pm(
         adb, [] { return false; },
@@ -459,8 +485,8 @@ TEST_CASE("PartitionMaintainer::run_once: second run is idempotent (counter unch
 }
 
 TEST_CASE("PartitionMaintainer::run_once: SQL failure keeps counter at zero", "[integration][partition]") {
-    if (!db_available()) SKIP("DATABASE_URL / DATABASE_URL_APP not set");
-    auto adb = app_db();
+    if (!db_available()) SKIP("DATABASE_URL / PARTITION_DATABASE_URL not set");
+    auto adb = partition_db();
 
     // A standalone table blocks the SECURITY DEFINER function; the outer catch
     // must absorb the error without incrementing the counter.
@@ -479,11 +505,11 @@ TEST_CASE("PartitionMaintainer::run_once: SQL failure keeps counter at zero", "[
 }
 
 TEST_CASE("PartitionMaintainer::run_once: skips DDL when advisory lock is held", "[integration][partition]") {
-    if (!db_available()) SKIP("DATABASE_URL / DATABASE_URL_APP not set");
-    auto adb = app_db();
+    if (!db_available()) SKIP("DATABASE_URL / PARTITION_DATABASE_URL not set");
+    auto adb = partition_db();
 
     // Hold the xact-scoped advisory lock on one connection (admin_db).
-    // run_once() on app_db() will see the lock held, skip DDL, and count 0.
+    // run_once() on partition_db() will see the lock held, skip DDL, and count 0.
     drogon::sync_wait([&adb]() -> drogon::Task<void> {
         auto lock_tx = co_await admin_db()->newTransactionCoro();
         co_await lock_tx->execSqlCoro(
@@ -501,10 +527,14 @@ TEST_CASE("PartitionMaintainer::run_once: skips DDL when advisory lock is held",
 }
 
 TEST_CASE("PartitionMaintainer::run: shutdown during sleep exits within sleep_chunk", "[integration][partition]") {
-    if (!db_available()) SKIP("DATABASE_URL / DATABASE_URL_APP not set");
-    auto adb = app_db();
+    if (!db_available()) SKIP("DATABASE_URL / PARTITION_DATABASE_URL not set");
+    auto adb = partition_db();
 
     std::atomic<bool> g_shutdown{false};
+    std::atomic<bool> sleep_was_armed{false};
+    std::atomic_flag reported = ATOMIC_FLAG_INIT;
+    std::promise<void> armed_promise;
+    auto armed = armed_promise.get_future();
     wikore::scheduler::PartitionMaintainer pm(
         adb,
         [&g_shutdown] { return g_shutdown.load(); },
@@ -513,14 +543,17 @@ TEST_CASE("PartitionMaintainer::run: shutdown during sleep exits within sleep_ch
             .audit_log_lookahead    = 0,   // run_once() completes near-instantly
             .usage_events_lookahead = 0,
             .sleep_chunk            = std::chrono::milliseconds(100),
+            .on_sleep_armed          = [&] {
+                if (!reported.test_and_set()) armed_promise.set_value();
+            },
             .now_utc_year_month     = [] { return std::pair{2026, 1}; },
         });
 
-    // Signal shutdown ~300ms after run() starts.  By then run_once() (with 0
-    // lookahead) will have committed and entered interruptible_sleep().
-    // The sleep wakes every 100ms (sleep_chunk) and checks shutdown_().
-    std::thread signaler([&g_shutdown] {
-        std::this_thread::sleep_for(std::chrono::milliseconds(300));
+    // Signal only after co_sleep_ms has armed the event-loop timer. This proves
+    // shutdown arrives while the coroutine is suspended in the sleep path.
+    std::thread signaler([&] {
+        sleep_was_armed.store(
+            armed.wait_for(std::chrono::seconds(2)) == std::future_status::ready);
         g_shutdown.store(true);
     });
 
@@ -532,8 +565,8 @@ TEST_CASE("PartitionMaintainer::run: shutdown during sleep exits within sleep_ch
 
     signaler.join();
 
-    // Expected: signal at ~300ms, next sleep_chunk fires within 100ms -> ~400ms.
-    // Allow 3s for slow CI runners.
+    REQUIRE(sleep_was_armed.load());
+    // The 2-second fallback prevents a broken hook from hanging the test.
     REQUIRE(elapsed < std::chrono::seconds(3));
     // run_once() with lookahead=0 creates no partitions; no cleanup needed.
 }

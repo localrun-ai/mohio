@@ -4,26 +4,37 @@
 #include <spdlog/spdlog.h>
 #include <chrono>
 #include <format>
+#include <stdexcept>
 
 namespace wikore::scheduler {
 
 namespace {
 
 // Coroutine-friendly millisecond sleep using Drogon's event loop timer.
-drogon::Task<void> co_sleep_ms(std::chrono::milliseconds d)
+drogon::Task<void> co_sleep_ms(std::chrono::milliseconds d,
+                               const std::function<void()>& on_armed)
 {
     auto* loop = drogon::app().getLoop();
     struct Awaiter {
         trantor::EventLoop*       loop;
         std::chrono::milliseconds delay;
+        const std::function<void()>* on_armed;
         bool await_ready() const noexcept { return false; }
         void await_suspend(std::coroutine_handle<> h) {
             loop->runAfter(static_cast<double>(delay.count()) / 1000.0,
                            [h]() mutable { h.resume(); });
+            if (*on_armed) {
+                try {
+                    (*on_armed)();
+                } catch (const std::exception& ex) {
+                    spdlog::error("[partition-maintainer] sleep observer failed: {}",
+                                  ex.what());
+                }
+            }
         }
         void await_resume() const noexcept {}
     };
-    co_await Awaiter{loop, d};
+    co_await Awaiter{loop, d, &on_armed};
 }
 
 // Returns current UTC year and month.
@@ -44,7 +55,11 @@ PartitionMaintainer::PartitionMaintainer(drogon::orm::DbClientPtr db,
     : db_(std::move(db))
     , shutdown_(std::move(shutdown_requested))
     , opts_(std::move(opts))
-{}
+{
+    if (opts_.sleep_chunk <= std::chrono::milliseconds::zero()) {
+        throw std::invalid_argument("PartitionMaintainer sleep_chunk must be positive");
+    }
+}
 
 // ---------------------------------------------------------------------------
 // interruptible_sleep
@@ -66,7 +81,7 @@ drogon::Task<void> PartitionMaintainer::interruptible_sleep()
         const auto remaining =
             std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now);
         const auto chunk = std::min(remaining, opts_.sleep_chunk);
-        co_await co_sleep_ms(chunk);
+        co_await co_sleep_ms(chunk, opts_.on_sleep_armed);
     }
 }
 

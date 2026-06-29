@@ -69,6 +69,13 @@ int main()
 {
     const auto cfg = wikore::Config::from_env();
 
+    if (cfg.partition_database_url.empty()) {
+        spdlog::critical(
+            "[wikore-scheduler] PARTITION_DATABASE_URL is required for the "
+            "restricted partition-maintenance connection");
+        return EXIT_FAILURE;
+    }
+
     spdlog::info("[wikore-scheduler] version: " WIKORE_GIT_HASH);
     spdlog::info("[wikore-scheduler] db:      {}", cfg.database_url);
     spdlog::info("[wikore-scheduler] redis:   {}", cfg.redis_url);
@@ -105,6 +112,23 @@ int main()
             // requires the drogon framework to be running.
             // -----------------------------------------------------------
             auto db = wikore::Db::get();
+
+            drogon::orm::DbClientPtr partition_db;
+            try {
+                partition_db = drogon::orm::DbClient::newPgClient(
+                    cfg.partition_database_url, 2);
+                // Validate connectivity and the V031 EXECUTE grant at startup.
+                co_await partition_db->execSqlCoro(
+                    "SELECT 1 FROM public.wikore_check_partition_overflow() LIMIT 1");
+            } catch (const drogon::orm::DrogonDbException& ex) {
+                fail_startup(std::format(
+                    "partition database validation failed: {}", ex.base().what()));
+                co_return;
+            } catch (const std::exception& ex) {
+                fail_startup(std::format(
+                    "partition database configuration failed: {}", ex.what()));
+                co_return;
+            }
 
             std::string qdrant_collection;
             int         registered_dim = 0;
@@ -153,7 +177,7 @@ int main()
                 db, shutdown,
                 wikore::scheduler::PollingFallback::Options{});
             static wikore::scheduler::PartitionMaintainer partitions(
-                db, shutdown,
+                partition_db, shutdown,
                 wikore::scheduler::PartitionMaintainer::Options{});
 
             // Ensure the registry-resolved Qdrant collection exists

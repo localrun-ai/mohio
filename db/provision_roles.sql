@@ -1,4 +1,6 @@
--- db/provision_roles.sql - idempotent runtime role provisioning.
+\set ON_ERROR_STOP on
+
+-- db/provision_roles.sql - idempotent partition-maintenance role provisioning.
 --
 -- Run ONCE as a superuser or a role with CREATEROLE before applying migrations.
 -- Migrations themselves require only standard schema DDL; they do not need
@@ -7,25 +9,27 @@
 -- Usage:
 --   psql -h HOST -U superuser -d DATABASE -f db/provision_roles.sql
 --
--- Default password 'wikore_app' is used in development and CI.
--- In production, change it before running this script:
---   sed 's/wikore_app/YOUR_SECURE_PASSWORD/' db/provision_roles.sql | psql ...
+-- This script intentionally creates no LOGIN and contains no credentials.
+-- The DBA creates a login separately and grants it membership in
+-- wikore_partition_maintainer. CI does the same with a test-only login.
 
 DO $$
 BEGIN
-    CREATE ROLE wikore_app NOLOGIN;
+    CREATE ROLE wikore_partition_maintainer NOLOGIN;
 EXCEPTION WHEN duplicate_object THEN NULL;
 END
 $$;
 
+-- Converge an existing role to the intended non-login, non-privileged shape.
+ALTER ROLE wikore_partition_maintainer
+    NOLOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION;
+
+-- The login inheriting this role must be able to reach this database even when
+-- deployments revoke the default PUBLIC CONNECT privilege.
 DO $$
 BEGIN
-    CREATE ROLE wikore_app_login
-        NOSUPERUSER INHERIT LOGIN
-        PASSWORD 'wikore_app';
-EXCEPTION WHEN duplicate_object THEN NULL;
+    EXECUTE format(
+        'GRANT CONNECT ON DATABASE %I TO wikore_partition_maintainer',
+        current_database());
 END
 $$;
-
--- GRANT is idempotent: a no-op if wikore_app_login is already a member.
-GRANT wikore_app TO wikore_app_login;
