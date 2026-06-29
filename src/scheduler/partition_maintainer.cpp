@@ -29,6 +29,10 @@ drogon::Task<void> co_sleep_ms(std::chrono::milliseconds d,
                 } catch (const std::exception& ex) {
                     spdlog::error("[partition-maintainer] sleep observer failed: {}",
                                   ex.what());
+                } catch (...) {
+                    spdlog::error(
+                        "[partition-maintainer] sleep observer failed with "
+                        "a non-standard exception");
                 }
             }
         }
@@ -155,7 +159,8 @@ drogon::Task<void> PartitionMaintainer::run_once()
         if (!got_lock) {
             spdlog::debug("[partition-maintainer] another replica holds the lock; skipping DDL");
             uow.rollback();
-            goto overflow_check;
+            co_await check_default_overflow();
+            co_return;
         }
 
         {
@@ -209,7 +214,6 @@ drogon::Task<void> PartitionMaintainer::run_once()
         spdlog::error("[partition-maintainer] sweep failed: {}", ex.base().what());
     }
 
-overflow_check:
     co_await check_default_overflow();
 }
 

@@ -22,6 +22,10 @@
 -- migration runs.
 -- Run db/provision_roles.sql as superuser before applying migrations.
 
+-- Keep CREATE/REVOKE/GRANT atomic so SECURITY DEFINER functions are never
+-- committed with PostgreSQL's default PUBLIC EXECUTE privilege.
+BEGIN;
+
 -- Required to resolve the functions when PUBLIC schema access is hardened.
 GRANT USAGE ON SCHEMA public TO wikore_partition_maintainer;
 
@@ -235,3 +239,5 @@ $$;
 REVOKE EXECUTE ON FUNCTION wikore_check_partition_overflow() FROM PUBLIC;
 GRANT  EXECUTE ON FUNCTION wikore_check_partition_overflow()
     TO wikore_partition_maintainer;
+
+COMMIT;

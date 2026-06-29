@@ -382,6 +382,8 @@ TEST_CASE("V031 unauthorized role: cannot call partition functions", "[integrati
 
     try { exec_sync(db, "CREATE ROLE wikore_partition_test_noaccess NOLOGIN"); }
     catch (const drogon::orm::DrogonDbException&) {}
+    exec_sync(db,
+              "GRANT USAGE ON SCHEMA public TO wikore_partition_test_noaccess");
 
     bool denied = false;
     drogon::sync_wait([&db, &denied]() -> drogon::Task<void> {
@@ -392,11 +394,15 @@ TEST_CASE("V031 unauthorized role: cannot call partition functions", "[integrati
                 "SELECT public.wikore_ensure_audit_log_partition($1, $2)", 2044, 2);
         } catch (const drogon::orm::DrogonDbException& ex) {
             std::string msg = ex.base().what();
-            denied = msg.find("permission denied") != std::string::npos;
+            denied = msg.find(
+                "permission denied for function "
+                "wikore_ensure_audit_log_partition") != std::string::npos;
         }
     }());
     REQUIRE(denied);
 
+    exec_sync(db,
+              "REVOKE USAGE ON SCHEMA public FROM wikore_partition_test_noaccess");
     try { exec_sync(db, "DROP ROLE wikore_partition_test_noaccess"); }
     catch (const drogon::orm::DrogonDbException&) {}
 }
@@ -532,7 +538,7 @@ TEST_CASE("PartitionMaintainer::run: shutdown during sleep exits within sleep_ch
 
     std::atomic<bool> g_shutdown{false};
     std::atomic<bool> sleep_was_armed{false};
-    std::atomic_flag reported = ATOMIC_FLAG_INIT;
+    std::atomic_flag reported{};
     std::promise<void> armed_promise;
     auto armed = armed_promise.get_future();
     wikore::scheduler::PartitionMaintainer pm(

@@ -11,6 +11,7 @@
 #include <atomic>
 #include <cstdlib>
 #include <format>
+#include <stdexcept>
 
 // ---------------------------------------------------------------------------
 // wikore-scheduler: outbox drainer + polling fallback + partition maintainer.
@@ -117,7 +118,24 @@ int main()
             try {
                 partition_db = drogon::orm::DbClient::newPgClient(
                     cfg.partition_database_url, 2);
-                // Validate connectivity and the V031 EXECUTE grant at startup.
+                auto grants = co_await partition_db->execSqlCoro(
+                    "SELECT "
+                    "has_function_privilege(current_user, "
+                    "'public.wikore_ensure_audit_log_partition(integer,integer)', "
+                    "'EXECUTE') AS audit_ok, "
+                    "has_function_privilege(current_user, "
+                    "'public.wikore_ensure_usage_events_partition(integer,integer)', "
+                    "'EXECUTE') AS usage_ok, "
+                    "has_function_privilege(current_user, "
+                    "'public.wikore_check_partition_overflow()', "
+                    "'EXECUTE') AS overflow_ok");
+                if (grants.empty() || !grants[0]["audit_ok"].as<bool>() ||
+                    !grants[0]["usage_ok"].as<bool>() ||
+                    !grants[0]["overflow_ok"].as<bool>()) {
+                    throw std::runtime_error(
+                        "partition role is missing required V031 EXECUTE grants");
+                }
+                // Invoke the read-only helper to validate SECURITY DEFINER access.
                 co_await partition_db->execSqlCoro(
                     "SELECT 1 FROM public.wikore_check_partition_overflow() LIMIT 1");
             } catch (const drogon::orm::DrogonDbException& ex) {
