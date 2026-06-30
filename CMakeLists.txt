@@ -104,6 +104,7 @@ add_library(wikore_core STATIC
     src/db.cpp
     src/org_tree.cpp
     src/access.cpp
+    src/access_resolver.cpp
     src/redis.cpp
 )
 target_include_directories(wikore_core PUBLIC include)

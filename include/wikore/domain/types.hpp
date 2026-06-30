@@ -90,7 +90,8 @@ struct Principal {
 struct AccessScope {
     std::vector<Uuid>                          org_unit_ids;
     std::chrono::system_clock::time_point      cache_until;
-    int                                        access_epoch = 0;
+    int                                        access_epoch = 0;   // companies.acl_epoch
+    int                                        scope_epoch  = 0;   // users.scope_epoch (section 2.6)
 };
 
 // ---------------------------------------------------------------------------
