@@ -129,6 +129,7 @@ add_library(wikore_rag STATIC
     src/rag/generator.cpp
     src/rag/pipeline.cpp
     src/rag/qdrant_filter_builder.cpp
+    src/rag/evidence_gate.cpp
 )
 target_link_libraries(wikore_rag PUBLIC wikore_core)
 
