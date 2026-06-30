@@ -165,6 +165,63 @@ TEST_CASE("PromoteDocumentVersion: audit_log and outbox written atomically", "[i
     REQUIRE(std::stoi(outbox[0]["n"].c_str()) == 1);
 }
 
+TEST_CASE("PromoteDocumentVersion: outbox dedups across DIFFERENT trace_ids (idempotency key drops trace_id)",
+          "[integration][promote]") {
+    // Opus finding H: with trace_id in the idempotency_key, two distinct
+    // promote requests for the same (document, version, active) wrote two
+    // outbox_events rows. The new key omits trace_id so the same
+    // (doc, version, status) produces exactly one row regardless of how
+    // many requests asked for the promotion.
+    if (!db_available()) SKIP("DATABASE_URL not set");
+    seed_fixtures();
+
+    auto ctx_with_trace = [](const char* trace) {
+        return wikore::RequestContext{
+            .tenant    = {.company_id = CO},
+            .principal = {.user_id = USR, .email = "test@test.com"},
+            .span      = {.trace_id = trace, .span_id = "s"},
+            .deadline  = std::chrono::steady_clock::now() + std::chrono::seconds(30),
+        };
+    };
+
+    wikore::application::PromoteDocumentVersionUseCase uc{wikore::Db::get()};
+
+    REQUIRE(drogon::sync_wait(uc.execute(
+        ctx_with_trace("trace-promote-A"),
+        {.document_id = DOC, .version_id = V1})).has_value());
+
+    // Re-promote: the row is already active, the SQL no-ops on the row
+    // (CAS gate inside the use case), but the outbox INSERT still attempts
+    // to write a row. With the trace-bearing key, this would have produced
+    // a second row; with the new key, the existing row's UNIQUE wins.
+    auto _ = drogon::sync_wait(uc.execute(
+        ctx_with_trace("trace-promote-B-different"),
+        {.document_id = DOC, .version_id = V1}));
+
+    auto outbox = exec_sync(wikore::Db::get(),
+        "SELECT COUNT(*) AS n FROM outbox_events "
+        "WHERE aggregate_id=$1 AND job_type='qdrant_resync_version_lifecycle'",
+        std::string(V1));
+    CHECK(std::stoi(outbox[0]["n"].c_str()) == 1);
+
+    auto keys = exec_sync(wikore::Db::get(),
+        "SELECT idempotency_key FROM outbox_events "
+        "WHERE aggregate_id=$1 AND job_type='qdrant_resync_version_lifecycle'",
+        std::string(V1));
+    REQUIRE(keys.size() == 1);
+    const auto key = std::string(keys[0]["idempotency_key"].c_str());
+    CHECK(key.find("trace-promote-A") == std::string::npos);
+    CHECK(key.find("trace-promote-B") == std::string::npos);
+
+    // trace_id remains in the payload (first writer wins).
+    auto payload = exec_sync(wikore::Db::get(),
+        "SELECT payload->>'trace_id' AS trace_id FROM outbox_events "
+        "WHERE aggregate_id=$1 AND job_type='qdrant_resync_version_lifecycle'",
+        std::string(V1));
+    REQUIRE(payload.size() == 1);
+    CHECK(std::string(payload[0]["trace_id"].c_str()) == "trace-promote-A");
+}
+
 TEST_CASE("PromoteDocumentVersion: archived version is terminal", "[integration][promote]") {
     if (!db_available()) SKIP("DATABASE_URL not set");
     seed_fixtures();

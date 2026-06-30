@@ -210,12 +210,20 @@ IngestDocumentVersionUseCase::execute(RequestContext ctx,
     }
 
     // Outbox row: same UoW. The worker drains this and performs the actual
-    // embed + Qdrant upsert. Idempotency key includes trace_id so client
-    // retries are bounded (re-ingest of the same version under the same
-    // trace_id is a no-op via ON CONFLICT DO NOTHING).
+    // embed + Qdrant upsert. The idempotency key is keyed on
+    // (version_id, embed_model_id) ONLY -- NOT on trace_id. The job is
+    // "embed this version under this model"; it does not matter how many
+    // distinct HTTP requests asked for it. Including trace_id (Opus
+    // finding H) defeated cross-request dedup: two genuinely distinct
+    // requests for the same version produced two outbox rows and the
+    // worker ran the embed/upsert twice. The duplicate work was harmless
+    // (the deterministic Qdrant point id meant the second upsert was a
+    // no-op) but the duplicate event still costs an embed batch and a
+    // round-trip per chunk. trace_id remains in the payload so the worker
+    // can stitch its logs back to the originating span.
     const auto idempotency_key = std::format(
-        "qdrant_upsert:{}:{}:{}",
-        cmd.document_version_id, cmd.embed_model_id, ctx.span.trace_id);
+        "qdrant_upsert:{}:{}",
+        cmd.document_version_id, cmd.embed_model_id);
     std::optional<Error> outbox_err;
     try {
         co_await uow.exec(
@@ -226,8 +234,9 @@ IngestDocumentVersionUseCase::execute(RequestContext ctx,
                            'document_id',       $3::text,
                            'document_version_id', $4::text,
                            'embed_model_id',    $5::text,
-                           'chunk_count',       $6::int),
-                       $7)
+                           'chunk_count',       $6::int,
+                           'trace_id',          $7::text),
+                       $8)
                ON CONFLICT (company_id, job_type, idempotency_key) DO NOTHING)",
             ctx.tenant.company_id,
             cmd.document_version_id,   // aggregate_id
@@ -235,6 +244,7 @@ IngestDocumentVersionUseCase::execute(RequestContext ctx,
             cmd.document_version_id,
             cmd.embed_model_id,
             static_cast<int>(chunks.size()),
+            ctx.span.trace_id,
             idempotency_key);
     } catch (const drogon::orm::DrogonDbException& ex) {
         outbox_err = postgres::map_db_exception(ex);
