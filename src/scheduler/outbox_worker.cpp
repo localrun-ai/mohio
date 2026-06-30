@@ -251,7 +251,8 @@ drogon::Task<Result<void>> OutboxWorker::process(const ClaimedEvent& ev)
     try {
         // V014 added document_sections; join on it for the section_heading.
         // V003: document_chunks(company_id, document_version_id, chunk_index,
-        //                       content, access_scope_ids, section_id).
+        //                       content, qdrant_prefilter_scope_ids
+        //                       [renamed from access_scope_ids in V032], section_id).
         // V014: document_versions(sensitivity_label, lifecycle_status,
         //                          activated_at, superseded_at).
         // V003: documents(owner_org_unit_id, authority_level): reranker
@@ -262,7 +263,7 @@ drogon::Task<Result<void>> OutboxWorker::process(const ClaimedEvent& ev)
                     dc.content                               AS content,
                     dc.section_id::text                      AS section_id,
                     ds.heading                               AS section_heading,
-                    array_to_string(dc.access_scope_ids, ',') AS access_scope_csv,
+                    array_to_string(dc.qdrant_prefilter_scope_ids, ',') AS access_scope_csv,
                     dv.sensitivity_label                     AS sensitivity_label,
                     dv.lifecycle_status                      AS lifecycle_status,
                     dv.activated_at                          AS activated_at,
