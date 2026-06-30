@@ -4,7 +4,9 @@
 #include <drogon/drogon.h>
 #include <drogon/utils/coroutine.h>
 #include <algorithm>
+#include <chrono>
 #include <cstdlib>
+#include <memory>
 #include <string>
 
 // Integration tests for PostgresAccessResolver (Iteration 2 read-path resolver).
@@ -17,7 +19,20 @@ namespace {
 
 constexpr auto CO = "a5e50000-0000-0000-0000-0000000000a1"; // "access resolver co"
 
-bool db_available() { return std::getenv("DATABASE_URL") != nullptr; }
+bool db_available()    { return std::getenv("DATABASE_URL") != nullptr; }
+bool redis_available() { return std::getenv("REDIS_URL")    != nullptr; }
+
+// Inner resolver that counts calls and returns a canned scope, so we can
+// observe whether the cache served a hit (inner not called) or re-resolved.
+struct SpyResolver : wikore::AccessResolverPort {
+    mutable int          calls = 0;
+    wikore::AccessScope  canned;
+    drogon::Task<wikore::Result<wikore::AccessScope>>
+    resolve(std::string_view, std::string_view, std::string_view) const override {
+        ++calls;
+        co_return canned;
+    }
+};
 
 template<typename... Args>
 drogon::orm::Result exec_sync(drogon::orm::DbClientPtr db, std::string sql, Args... args)
@@ -154,4 +169,81 @@ TEST_CASE("AccessResolver: acl_epoch stamp advances after an org structural chan
     REQUIRE(r1.has_value());
     INFO("acl_epoch a0=" << a0 << " a1=" << r1->access_epoch);
     CHECK(r1->access_epoch > a0);
+}
+
+TEST_CASE("Resolver: cache_until defaults to ~5min and clamps to earliest membership expiry",
+          "[integration][access_resolver]")
+{
+    if (!db_available()) SKIP("DATABASE_URL not set");
+    using namespace std::chrono;
+    auto db = wikore::Db::get();
+    auto f  = seed(db);
+    wikore::PostgresAccessResolver resolver(db);
+
+    // Non-expiring membership -> default ~5 minutes.
+    exec_sync(db,
+        "INSERT INTO memberships (company_id,user_id,org_unit_id,role,applies_to) "
+        "VALUES ($1::uuid,$2::uuid,$3::uuid,'viewer','self_only')",
+        std::string(CO), f.user, f.ou);
+    auto r1   = drogon::sync_wait(resolver.resolve(CO, f.user, f.root));
+    auto now1 = system_clock::now();
+    REQUIRE(r1.has_value());
+    CHECK(r1->cache_until >  now1 + minutes(4));
+    CHECK(r1->cache_until <= now1 + minutes(5) + seconds(5));
+
+    // Add a membership expiring in 30s -> cache_until clamps well under 5min.
+    exec_sync(db,
+        "INSERT INTO memberships (company_id,user_id,org_unit_id,role,applies_to,expires_at) "
+        "VALUES ($1::uuid,$2::uuid,$3::uuid,'viewer','self_and_descendants', now()+interval '30 seconds')",
+        std::string(CO), f.user, f.root);
+    auto r2   = drogon::sync_wait(resolver.resolve(CO, f.user, f.root));
+    auto now2 = system_clock::now();
+    REQUIRE(r2.has_value());
+    CHECK(r2->cache_until <= now2 + seconds(60));
+    CHECK(r2->cache_until >  now2);
+}
+
+TEST_CASE("CachedAccessResolver: epoch-valid hit is served from cache; an epoch bump re-resolves",
+          "[integration][access_resolver]")
+{
+    if (!db_available() || !redis_available())
+        SKIP("DATABASE_URL or REDIS_URL not set");
+    using namespace std::chrono;
+    auto db = wikore::Db::get();
+    auto f  = seed(db);
+
+    // Stamp the canned scope with the LIVE epochs so the cache validation passes.
+    auto ep = exec_sync(db,
+        "SELECT c.acl_epoch, u.scope_epoch FROM companies c "
+        "JOIN users u ON u.company_id=c.id WHERE c.id=$1::uuid AND u.id=$2::uuid",
+        std::string(CO), f.user);
+    auto spy = std::make_shared<SpyResolver>();
+    spy->canned.access_epoch = ep[0]["acl_epoch"].as<int>();
+    spy->canned.scope_epoch  = ep[0]["scope_epoch"].as<int>();
+    spy->canned.cache_until  = system_clock::now() + minutes(5);
+    spy->canned.org_unit_ids = {f.ou};
+
+    wikore::CachedAccessResolver cached(spy, db);
+
+    auto r1 = drogon::sync_wait(cached.resolve(CO, f.user, f.root));
+    REQUIRE(r1.has_value());
+    CHECK(spy->calls == 1);                       // miss -> inner resolved
+    CHECK(contains(r1->org_unit_ids, f.ou));
+
+    auto r2 = drogon::sync_wait(cached.resolve(CO, f.user, f.root));
+    REQUIRE(r2.has_value());
+    CHECK(spy->calls == 1);                       // HIT -> inner NOT called again
+    CHECK(contains(r2->org_unit_ids, f.ou));
+
+    // Bump users.scope_epoch via a membership change (V032 trigger): the stamp
+    // is now stale and the next resolve must fall through to inner.
+    exec_sync(db,
+        "INSERT INTO memberships (company_id,user_id,org_unit_id,role,applies_to) "
+        "VALUES ($1::uuid,$2::uuid,$3::uuid,'viewer','self_only')",
+        std::string(CO), f.user, f.ou);
+
+    auto r3 = drogon::sync_wait(cached.resolve(CO, f.user, f.root));
+    REQUIRE(r3.has_value());
+    INFO("spy calls after epoch bump=" << spy->calls);
+    CHECK(spy->calls == 2);                       // stale epoch -> re-resolve
 }

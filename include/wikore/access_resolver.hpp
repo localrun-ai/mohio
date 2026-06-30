@@ -2,6 +2,7 @@
 #include "wikore/domain/types.hpp"
 #include <drogon/drogon.h>
 #include <cstdint>
+#include <memory>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -58,6 +59,38 @@ public:
 
 private:
     drogon::orm::DbClientPtr db_;
+};
+
+// ---------------------------------------------------------------------------
+// CachedAccessResolver (section 2.6)
+//
+// Redis lr:eff cache in front of an inner resolver. A cache hit is served only
+// when the entry is unexpired (its cache_until) AND its stamped epochs match
+// the LIVE (companies.acl_epoch, users.scope_epoch). The epoch check is the
+// crash-safe correctness path: a stale entry is detected even if its lr:eff
+// invalidation (DEL / reverse-index evict) was lost. On miss or stale it
+// delegates to `inner` and writes the entry with a TTL clamped to cache_until.
+//
+// The live-epoch read is a single cheap two-int Postgres lookup, far cheaper
+// than the inner scope resolution (closure + membership joins) it lets us
+// skip. (Mirroring the company epoch into Redis to drop even that lookup, and
+// piggybacking scope_epoch on the identity cache, are the further section-2.6
+// optimizations; not required for correctness.)
+// ---------------------------------------------------------------------------
+class CachedAccessResolver : public AccessResolverPort {
+public:
+    CachedAccessResolver(std::shared_ptr<AccessResolverPort> inner,
+                         drogon::orm::DbClientPtr            db)
+        : inner_(std::move(inner)), db_(std::move(db)) {}
+
+    drogon::Task<Result<AccessScope>>
+    resolve(std::string_view company_id,
+            std::string_view user_id,
+            std::string_view scope_org_unit_id) const override;
+
+private:
+    std::shared_ptr<AccessResolverPort> inner_;
+    drogon::orm::DbClientPtr            db_;
 };
 
 } // namespace wikore
