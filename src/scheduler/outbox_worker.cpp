@@ -355,9 +355,19 @@ drogon::Task<Result<void>> OutboxWorker::process(const ClaimedEvent& ev)
                 .section_id          = chunk.section_id,
                 .section_heading     = chunk.section_heading,
             };
-            const auto point_id = rag::uuid_v5(
+            // uuid_v5 returns nullopt on OpenSSL EVP failure (effectively
+            // OOM). The previous all-zero sentinel would collide every
+            // chunk in the batch onto a single point id and silently drop
+            // all but one on upsert. Failing the event makes the next poll
+            // retry; if the allocator is healthy again the retry succeeds.
+            auto point_id = rag::uuid_v5(
                 chunk.chunk_id + ":" + ev.embed_model_id);
-            points.push_back({point_id, vectors[j], std::move(payload)});
+            if (!point_id) {
+                co_return std::unexpected(Error::unavailable(
+                    "uuid_v5 returned nullopt for chunk " + chunk.chunk_id
+                    + " (OpenSSL EVP allocation failed); will retry"));
+            }
+            points.push_back({std::move(*point_id), vectors[j], std::move(payload)});
         }
     }
 
