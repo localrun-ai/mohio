@@ -45,6 +45,7 @@ public:
     virtual drogon::Task<Result<void>>
     write_chunks(std::vector<Chunk>&             chunks,
                  std::string_view                company_id,
+                 std::string_view                document_version_id,
                  const std::vector<std::string>& access_scope_ids,
                  postgres::UnitOfWork&           uow) = 0;
 
@@ -146,6 +147,7 @@ public:
     drogon::Task<Result<void>>
     write_chunks(std::vector<Chunk>&             chunks,
                  std::string_view                company_id,
+                 std::string_view                document_version_id,
                  const std::vector<std::string>& access_scope_ids,
                  postgres::UnitOfWork&           uow) override;
 
@@ -217,6 +219,7 @@ public:
     drogon::Task<Result<void>>
     write_chunks(std::vector<Chunk>&             chunks,
                  std::string_view                /*company_id*/,
+                 std::string_view                /*document_version_id*/,
                  const std::vector<std::string>& /*access_scope_ids*/,
                  postgres::UnitOfWork&           /*uow*/) override
     {

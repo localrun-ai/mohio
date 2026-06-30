@@ -319,6 +319,7 @@ PostgresDocumentRepo::write_sections(ParsedDocument&        doc,
 drogon::Task<Result<void>>
 PostgresDocumentRepo::write_chunks(std::vector<Chunk>&             chunks,
                                     std::string_view                company_id,
+                                    std::string_view                document_version_id,
                                     const std::vector<std::string>& access_scope_ids,
                                     postgres::UnitOfWork&           uow)
 {
@@ -391,20 +392,22 @@ PostgresDocumentRepo::write_chunks(std::vector<Chunk>&             chunks,
     //
     // Special case: chunks.size() == 0 deletes every row for the version,
     // which is the intended behaviour if a re-parse produced no content.
+    // document_version_id is passed explicitly (not read from chunks.front())
+    // so this still runs - and correctly deletes all rows - when chunks is
+    // empty; deriving it from the vector would have skipped the empty case
+    // and leaked the prior attempt's orphan chunks.
     const int new_count = static_cast<int>(chunks.size());
-    if (!chunks.empty()) {
-        try {
-            co_await uow.exec(
-                "DELETE FROM document_chunks "
-                "WHERE  company_id          = $1::uuid "
-                "  AND  document_version_id = $2::uuid "
-                "  AND  chunk_index         >= $3",
-                std::string(company_id),
-                std::string(chunks.front().document_version_id),
-                new_count);
-        } catch (const drogon::orm::DrogonDbException& ex) {
-            co_return std::unexpected(postgres::map_db_exception(ex));
-        }
+    try {
+        co_await uow.exec(
+            "DELETE FROM document_chunks "
+            "WHERE  company_id          = $1::uuid "
+            "  AND  document_version_id = $2::uuid "
+            "  AND  chunk_index         >= $3",
+            std::string(company_id),
+            std::string(document_version_id),
+            new_count);
+    } catch (const drogon::orm::DrogonDbException& ex) {
+        co_return std::unexpected(postgres::map_db_exception(ex));
     }
     co_return Result<void>{};
 }
