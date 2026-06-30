@@ -266,6 +266,116 @@ TEST_CASE("IngestDocumentVersion: re-ingest is idempotent (no duplicate chunks)"
     CHECK(std::stoi(outbox[0]["n"].c_str()) == 1);
 }
 
+TEST_CASE("IngestDocumentVersion: re-ingest with a SHRUNK document removes orphan chunks and sections",
+          "[integration][ingest]")
+{
+    // Opus finding G: prior to the fix, the upsert-only write path left
+    // high-index chunks and sections from the previous attempt in place,
+    // each carrying stale content and stale access_scope_ids. A shrinking
+    // re-ingest must converge the row set exactly to the new layout.
+    if (!db_available()) SKIP("DATABASE_URL not set");
+    auto db = wikore::Db::get();
+    seed_ingest_fixtures(db);
+
+    auto uc = make_use_case(db);
+
+    auto write_large_doc = []{
+        auto dir = std::filesystem::temp_directory_path() / "wikore-ingest-it";
+        std::filesystem::create_directories(dir);
+        auto path = dir / "manual-large.md";
+        std::ofstream f(path);
+        // Five headings + a long body each -> many chunks, many sections.
+        for (int i = 1; i <= 5; ++i) {
+            f << "# Section " << i << "\n\n";
+            for (int j = 0; j < 6; ++j) {
+                f << "Paragraph " << j << " of section " << i
+                  << " body text with several sentences to exercise the chunker. "
+                  << "The K5 invariant is that chunks do not span across "
+                  << "headings. Each section produces multiple chunks.\n\n";
+            }
+        }
+        return path.string();
+    };
+
+    auto write_small_doc = []{
+        auto dir = std::filesystem::temp_directory_path() / "wikore-ingest-it";
+        std::filesystem::create_directories(dir);
+        auto path = dir / "manual-small.md";
+        std::ofstream f(path);
+        // Single heading + a single short body -> few chunks, 1 section.
+        f << "# Only Section\n\nShort body.\n";
+        return path.string();
+    };
+
+    // First ingest: large layout.
+    REQUIRE(drogon::sync_wait(uc.execute(
+        make_ctx(),
+        {.company_id = CO, .document_id = DOC, .document_version_id = VERSION,
+         .file_path = write_large_doc(), .embed_model_id = "bge-m3"})).has_value());
+
+    auto chunks_before = exec_sync(db,
+        "SELECT COUNT(*) AS n, MAX(chunk_index) AS hi FROM document_chunks "
+        "WHERE document_version_id=$1::uuid",
+        std::string(VERSION));
+    const int n_before  = std::stoi(chunks_before[0]["n"].c_str());
+    const int hi_before = std::stoi(chunks_before[0]["hi"].c_str());
+    REQUIRE(n_before >= 5);   // sanity check the fixture really produced many chunks
+    REQUIRE(hi_before == n_before - 1);
+
+    auto sections_before = exec_sync(db,
+        "SELECT COUNT(*) AS n, MAX(ordinal) AS hi FROM document_sections "
+        "WHERE document_version_id=$1::uuid",
+        std::string(VERSION));
+    const int s_before  = std::stoi(sections_before[0]["n"].c_str());
+    REQUIRE(s_before >= 5);
+
+    // Reset the row to 'pending' so the use case allows the re-ingest path
+    // (use case CAS-gates on pending/processing).
+    exec_sync(db,
+        "UPDATE document_versions SET ingest_status='pending', "
+        "completed_at=NULL, chunk_count=NULL "
+        "WHERE id=$1::uuid", std::string(VERSION));
+
+    // Second ingest: small layout. Must converge row counts EXACTLY to the
+    // new layout (no leftover high-index rows from the previous attempt).
+    REQUIRE(drogon::sync_wait(uc.execute(
+        make_ctx(),
+        {.company_id = CO, .document_id = DOC, .document_version_id = VERSION,
+         .file_path = write_small_doc(), .embed_model_id = "bge-m3"})).has_value());
+
+    auto chunks_after = exec_sync(db,
+        "SELECT COUNT(*) AS n, MAX(chunk_index) AS hi FROM document_chunks "
+        "WHERE document_version_id=$1::uuid",
+        std::string(VERSION));
+    const int n_after  = std::stoi(chunks_after[0]["n"].c_str());
+    const int hi_after = std::stoi(chunks_after[0]["hi"].c_str());
+    CHECK(n_after  <  n_before);            // strictly fewer rows
+    CHECK(hi_after == n_after - 1);         // contiguous 0..n_after-1
+    CHECK(n_after  >= 1);                   // small doc still produces >=1 chunk
+
+    auto sections_after = exec_sync(db,
+        "SELECT COUNT(*) AS n FROM document_sections "
+        "WHERE document_version_id=$1::uuid",
+        std::string(VERSION));
+    const int s_after = std::stoi(sections_after[0]["n"].c_str());
+    CHECK(s_after == 1);                    // small doc has exactly one heading
+    CHECK(s_after <  s_before);
+
+    // Confirm no row at an index >= n_after survived. Direct anti-join:
+    // any leftover orphan would surface as a row in this query.
+    auto orphans = exec_sync(db,
+        "SELECT chunk_index FROM document_chunks "
+        "WHERE document_version_id=$1::uuid AND chunk_index >= $2",
+        std::string(VERSION), std::to_string(n_after));
+    CHECK(orphans.empty());
+
+    auto orphan_sections = exec_sync(db,
+        "SELECT ordinal FROM document_sections "
+        "WHERE document_version_id=$1::uuid AND ordinal >= $2",
+        std::string(VERSION), std::to_string(s_after));
+    CHECK(orphan_sections.empty());
+}
+
 TEST_CASE("IngestDocumentVersion: missing file marks version 'error' (returns TerminalError)",
           "[integration][ingest]")
 {

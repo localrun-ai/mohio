@@ -277,6 +277,32 @@ PostgresDocumentRepo::write_sections(ParsedDocument&        doc,
             co_return res;
         }
     }
+
+    // Remove orphan sections from a previous attempt that produced a longer
+    // layout. Without this, a re-ingest that shrinks the document leaves
+    // high-ordinal rows behind with stale heading_path and stale FK targets
+    // for document_chunks.section_id. The recursive upsert_section above
+    // upserts ordinals 0..ordinal-1; anything at ordinal..N is orphan.
+    //
+    // Cascade behaviour for the surviving rows:
+    //   * document_sections.parent_section_id ON DELETE CASCADE -- deleting
+    //     a parent removes its descendants, so a single DELETE covers the
+    //     entire orphan subtree even if the recursion produced child rows.
+    //   * document_chunks.section_id ON DELETE SET NULL -- chunks that
+    //     pointed at an orphan section have their section_id NULLed; the
+    //     write_chunks pass that follows then deletes those chunk rows too.
+    try {
+        co_await uow.exec(
+            "DELETE FROM document_sections "
+            "WHERE  company_id          = $1::uuid "
+            "  AND  document_version_id = $2::uuid "
+            "  AND  ordinal             >= $3",
+            std::string(company_id),
+            std::string(document_version_id),
+            ordinal);
+    } catch (const drogon::orm::DrogonDbException& ex) {
+        co_return std::unexpected(postgres::map_db_exception(ex));
+    }
     co_return Result<void>{};
 }
 
@@ -293,6 +319,7 @@ PostgresDocumentRepo::write_sections(ParsedDocument&        doc,
 drogon::Task<Result<void>>
 PostgresDocumentRepo::write_chunks(std::vector<Chunk>&             chunks,
                                     std::string_view                company_id,
+                                    std::string_view                document_version_id,
                                     const std::vector<std::string>& access_scope_ids,
                                     postgres::UnitOfWork&           uow)
 {
@@ -348,6 +375,39 @@ PostgresDocumentRepo::write_chunks(std::vector<Chunk>&             chunks,
         } catch (const drogon::orm::DrogonDbException& ex) {
             co_return std::unexpected(postgres::map_db_exception(ex));
         }
+    }
+
+    // Remove orphan chunks from a previous attempt that produced more
+    // chunks than this one (re-ingest after a chunker tweak, retry after a
+    // partial earlier write). The upsert loop above wrote chunk_index
+    // 0..N-1; everything at >= N is orphan with stale content and stale
+    // access_scope_ids. document_chunk_vectors has ON DELETE CASCADE on
+    // (company_id, chunk_id), so the Postgres-side vector bookkeeping is
+    // removed too. The corresponding Qdrant points are NOT explicitly
+    // dropped here -- they are bookkept by the deterministic point id
+    // (uuid_v5(chunk_id + model)), so they orphan in Qdrant; a separate
+    // resync/sweep is the right place to garbage-collect them. This change
+    // closes the Postgres-side data-leak (stale content + stale ACLs) and
+    // keeps the audit trail correct.
+    //
+    // Special case: chunks.size() == 0 deletes every row for the version,
+    // which is the intended behaviour if a re-parse produced no content.
+    // document_version_id is passed explicitly (not read from chunks.front())
+    // so this still runs - and correctly deletes all rows - when chunks is
+    // empty; deriving it from the vector would have skipped the empty case
+    // and leaked the prior attempt's orphan chunks.
+    const int new_count = static_cast<int>(chunks.size());
+    try {
+        co_await uow.exec(
+            "DELETE FROM document_chunks "
+            "WHERE  company_id          = $1::uuid "
+            "  AND  document_version_id = $2::uuid "
+            "  AND  chunk_index         >= $3",
+            std::string(company_id),
+            std::string(document_version_id),
+            new_count);
+    } catch (const drogon::orm::DrogonDbException& ex) {
+        co_return std::unexpected(postgres::map_db_exception(ex));
     }
     co_return Result<void>{};
 }

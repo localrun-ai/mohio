@@ -170,7 +170,7 @@ IngestDocumentVersionUseCase::execute(RequestContext ctx,
     spdlog::debug("[ingest] produced {} chunks", chunks.size());
 
     if (auto r = co_await repo_->write_chunks(
-            chunks, cmd.company_id, access_scope_ids, uow);
+            chunks, cmd.company_id, cmd.document_version_id, access_scope_ids, uow);
         !r)
     {
         uow.rollback();
