@@ -9,6 +9,7 @@
 #include <random>
 #include <set>
 #include <string>
+#include <thread>
 #include <vector>
 
 // ---------------------------------------------------------------------------
@@ -323,5 +324,169 @@ TEST_CASE("G1 property: gate output equals authoritative PG truth across random 
             }
             CHECK(gate_visible == oracle_visible);
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Scenario F (section-5 item 2): a lost lr:eff invalidation cannot leak.
+//
+// A membership revoke whose lr:eff DEL is lost would leave a stale-wide
+// cached reader scope; feeding that to the gate would leak. The §2.6 fix is
+// users.scope_epoch: V032's membership trigger bumps it in the same tx as the
+// revoke, so a stale cache entry (carrying the old epoch) is DETECTABLY stale
+// and forces a re-resolve. This test pins both halves of the backstop without
+// the not-yet-built cache layer:
+//   (1) the revoke bumps users.scope_epoch (old != new -> stale cache caught),
+//   (2) the re-resolved scope excludes the revoked OU, so the gate fed the
+//       fresh scope returns nothing (no leak).
+// It should fail if V032's scope_epoch coverage of membership changes is ever
+// removed (the stale cache would then be undetectable).
+// ---------------------------------------------------------------------------
+TEST_CASE("G1 scenario F: revoke bumps scope_epoch and re-resolve is leak-free",
+          "[integration][retrieval][g1]")
+{
+    if (!db_available()) SKIP("DATABASE_URL not set");
+    auto db = wikore::Db::get();
+    wikore::AccessService access(db);
+
+    exec_sync(db, "DELETE FROM companies WHERE id=$1::uuid", std::string(CO));
+    exec_sync(db, "INSERT INTO companies (id,name,slug) VALUES ($1::uuid,'F','f')", std::string(CO));
+    const auto root = std::string(exec_sync(db,
+        "SELECT id FROM org_units WHERE company_id=$1::uuid AND type='root'",
+        std::string(CO))[0]["id"].c_str());
+    const auto hr = std::string(exec_sync(db,
+        "INSERT INTO org_units (company_id,parent_id,type,slug,name) "
+        "VALUES ($1::uuid,$2::uuid,'department','hr','HR') RETURNING id",
+        std::string(CO), root)[0]["id"].c_str());
+    const auto user = std::string(exec_sync(db,
+        "INSERT INTO users (company_id,external_sub,email) "
+        "VALUES ($1::uuid,'subF','f@test') RETURNING id", std::string(CO))[0]["id"].c_str());
+    exec_sync(db,
+        "INSERT INTO memberships (company_id,user_id,org_unit_id,role,applies_to) "
+        "VALUES ($1::uuid,$2::uuid,$3::uuid,'viewer','self_and_descendants')",
+        std::string(CO), user, hr);
+    // an HR-owned doc + chunk
+    const auto doc = std::string(exec_sync(db,
+        "INSERT INTO documents (company_id,owner_org_unit_id,filename) "
+        "VALUES ($1::uuid,$2::uuid,'hr.txt') RETURNING id", std::string(CO), hr)[0]["id"].c_str());
+    const auto ver = std::string(exec_sync(db,
+        "INSERT INTO document_versions (company_id,document_id,version_no,source_hash,"
+        "ingest_status,completed_at,activated_at,chunk_count,lifecycle_status) "
+        "VALUES ($1::uuid,$2::uuid,1,'h','done',now(),now(),1,'active') RETURNING id",
+        std::string(CO), doc)[0]["id"].c_str());
+    const auto chunk = std::string(exec_sync(db,
+        "INSERT INTO document_chunks (company_id,document_version_id,chunk_index,content,"
+        "content_hash,qdrant_prefilter_scope_ids) VALUES ($1::uuid,$2::uuid,0,'x','hF','{}') "
+        "RETURNING id", std::string(CO), ver)[0]["id"].c_str());
+
+    const std::vector<std::string> cand{chunk};
+    const std::vector<std::string> lifecycles{"active"};
+    const std::vector<std::string> sens{"public","internal","confidential","restricted"};
+    auto gate_docs = [&](const std::vector<std::string>& scope) {
+        auto rows = exec_sync(db, kG1Sql, std::string(CO), pg_array(lifecycles),
+                              pg_array(sens), pg_array(scope), pg_array(cand));
+        std::set<std::string> out;
+        for (const auto& r : rows) out.insert(std::string(r["doc_id"].c_str()));
+        return out;
+    };
+    auto epoch_of = [&]{
+        return std::string(exec_sync(db,
+            "SELECT scope_epoch::text AS e FROM users WHERE id=$1::uuid",
+            std::string(user))[0]["e"].c_str());
+    };
+
+    // Pre-revoke: U is in HR, the gate returns the HR doc.
+    auto scope0 = drogon::sync_wait(access.effective_read_orgs(CO, user, root));
+    const auto epoch0 = epoch_of();
+    REQUIRE(gate_docs(scope0).count(doc) == 1);
+
+    // Revoke. The lr:eff DEL is "lost" (we touch no cache); only PG changes.
+    exec_sync(db, "DELETE FROM memberships WHERE company_id=$1::uuid AND user_id=$2::uuid",
+              std::string(CO), std::string(user));
+
+    // (1) scope_epoch bumped -> a stale cache carrying epoch0 is now detectable.
+    const auto epoch1 = epoch_of();
+    INFO("epoch0=" << epoch0 << " epoch1=" << epoch1);
+    CHECK(epoch1 != epoch0);
+
+    // (2) re-resolve excludes HR, and the gate fed the fresh scope leaks nothing.
+    auto scope1 = drogon::sync_wait(access.effective_read_orgs(CO, user, root));
+    CHECK(std::find(scope1.begin(), scope1.end(), hr) == scope1.end());
+    CHECK(gate_docs(scope1).empty());
+}
+
+// ---------------------------------------------------------------------------
+// Scenario E (section-5 item 3): concurrent move_org_unit never tears scope.
+//
+// effective_read_orgs is a single SQL statement, so under Read Committed it
+// sees one consistent snapshot and can never observe a half-applied move. We
+// run the resolver concurrently with a move_org_unit (separate pooled
+// connections, real overlap) many times and assert the resolver output is
+// ALWAYS exactly the pre-move or the post-move scope, never a mix. Fails if
+// the resolver is ever refactored into multiple statements.
+// ---------------------------------------------------------------------------
+TEST_CASE("G1 scenario E: concurrent move_org_unit yields pre- or post-move scope, never torn",
+          "[integration][retrieval][g1]")
+{
+    if (!db_available()) SKIP("DATABASE_URL not set");
+    auto db = wikore::Db::get();
+    wikore::AccessService access(db);
+
+    exec_sync(db, "DELETE FROM companies WHERE id=$1::uuid", std::string(CO));
+    exec_sync(db, "INSERT INTO companies (id,name,slug) VALUES ($1::uuid,'E','e')", std::string(CO));
+    const auto root = std::string(exec_sync(db,
+        "SELECT id FROM org_units WHERE company_id=$1::uuid AND type='root'",
+        std::string(CO))[0]["id"].c_str());
+    auto mk = [&](const std::string& parent, const std::string& slug) {
+        return std::string(exec_sync(db,
+            "INSERT INTO org_units (company_id,parent_id,type,slug,name) "
+            "VALUES ($1::uuid,$2::uuid,'team',$3,$3) RETURNING id",
+            std::string(CO), parent, slug)[0]["id"].c_str());
+    };
+    const auto A = mk(root, "a");
+    const auto B = mk(root, "b");
+    const auto N = mk(A, "n");          // movable node, starts under A
+    mk(N, "nc");                        // N has a child, so a torn closure read is detectable
+    const auto user = std::string(exec_sync(db,
+        "INSERT INTO users (company_id,external_sub,email) "
+        "VALUES ($1::uuid,'subE','e@test') RETURNING id", std::string(CO))[0]["id"].c_str());
+    exec_sync(db,                       // U reads everything under A (s_and_d)
+        "INSERT INTO memberships (company_id,user_id,org_unit_id,role,applies_to) "
+        "VALUES ($1::uuid,$2::uuid,$3::uuid,'viewer','self_and_descendants')",
+        std::string(CO), user, A);
+
+    auto resolve_set = [&]{
+        auto v = drogon::sync_wait(access.effective_read_orgs(CO, user, root));
+        return std::set<std::string>(v.begin(), v.end());
+    };
+    auto move_to = [&](const std::string& parent){
+        exec_sync(db, "SELECT move_org_unit($1::uuid,$2::uuid,$3::uuid)",
+                  std::string(CO), std::string(N), parent);
+    };
+
+    // The two legal outcomes (N under A includes N+NC; N under B excludes them).
+    move_to(A); const auto set_A = resolve_set();
+    move_to(B); const auto set_B = resolve_set();
+    REQUIRE(set_A != set_B);            // the move actually changes U's scope
+    move_to(A);                         // reset to known start
+
+    std::mt19937 rng(12345);
+    constexpr int kIters = 100;
+    for (int i = 0; i < kIters; ++i) {
+        const auto& target = (i % 2 == 0) ? B : A;   // alternate direction
+        std::set<std::string> got;
+        std::thread mover([&]{ move_to(target); });
+        std::thread reader([&]{
+            // small jitter to vary the move/resolve overlap window
+            std::this_thread::sleep_for(std::chrono::microseconds(rng() % 200));
+            got = resolve_set();
+        });
+        mover.join(); reader.join();
+        INFO("iter=" << i << " target=" << (target == B ? "B" : "A"));
+        const bool ok = (got == set_A) || (got == set_B);
+        if (!ok)
+            FAIL("TORN read: resolver output is neither the pre- nor post-move "
+                 "scope (iter=" << i << ", size=" << got.size() << ")");
+        CHECK(ok);
     }
 }

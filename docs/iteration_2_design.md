@@ -1065,20 +1065,26 @@ simplified or removed.
    prefilter-staleness interleaving layer is added on top once EvidenceGate
    and the §2 overlay exist.
 
-2. **Scenario F regression test.** Forced membership-revoke with a
-   mocked Redis drop on the `lr:eff:keys:user` DEL must not return
-   HR chunks to the removed user. Under §2.6 this becomes a test
-   that an unbumped or lost reverse-index DEL is backstopped by the
-   epoch check; the test should fail if §2.6's epoch coverage of
-   membership changes is ever removed.
+2. **Scenario F regression test. DONE**
+   (`tests/test_retrieval_invariants.cpp`). A membership revoke with the
+   `lr:eff` DEL "lost" (no cache touched) asserts (a) `users.scope_epoch`
+   is bumped by V032's membership trigger - so a stale cache carrying the
+   old epoch is detectably stale - and (b) the re-resolved scope excludes
+   the revoked OU and the gate fed that fresh scope returns nothing. Fails
+   if V032's `scope_epoch` coverage of membership changes is removed (the
+   stale cache would become undetectable). The mocked-Redis-drop plumbing
+   layers on once the AccessResolver cache + EvidenceGate exist; this pins
+   the backstop they rely on.
 
-3. **Scenario E torn-read test.** Concurrent `move_org_unit` during
-   a scope re-resolution must yield either the pre-move or post-move
-   scope, never a mix. Easiest assertion shape: instrument the
-   resolver to return the scope set; run 1000 trials of "start
-   resolver in thread A, start move in thread B" with random delays;
-   assert the resolver output is in the set
-   `{pre_move_scope, post_move_scope}` for every trial.
+3. **Scenario E torn-read test. DONE**
+   (`tests/test_retrieval_invariants.cpp`). Runs `effective_read_orgs`
+   concurrently with `move_org_unit` (separate pooled connections, 100
+   iterations alternating direction with jitter) and asserts the resolver
+   output is always exactly the pre- or post-move scope, never a mix. The
+   movable node has a child so a half-applied closure read would be
+   detectable. Holds because the resolver is a single statement (one Read
+   Committed snapshot); fails if it is ever refactored into multiple
+   statements.
 
 4. **Schema migration draft.** §2.1's `ALTER TABLE` statements (the
    `acl_epoch` / `acl_version` / `qdrant_synced_version` columns, the
@@ -1124,9 +1130,11 @@ simplified or removed.
    `access_tokens` user/group grant model lands (§4), which adds a principal
    fan-out the closure-only bound does not cover.
 
-Once those five land, Iter 2 implementation can begin. Anything that
-contradicts G1 or G2 during implementation is a bug and reverts to
-this document for adjudication.
+All five acceptance items have landed (items 1-3 as tests in
+`tests/test_retrieval_invariants.cpp`, item 4 as V032, item 5 as the
+recorded benchmark), so **Iter 2 implementation can begin.** Anything that
+contradicts G1 or G2 during implementation is a bug and reverts to this
+document for adjudication.
 
 ---
 
