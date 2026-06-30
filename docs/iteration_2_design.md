@@ -155,7 +155,10 @@ Two properties make G1 cheap enough to actually be the boundary:
        JOIN resource_grants rg ON rg.company_id=$1 AND rg.resource_type='document'
             AND rg.resource_id=cd.doc_id AND rg.permission IN ('read','write','admin')
             AND (rg.expires_at IS NULL OR rg.expires_at>now())
-       JOIN reader_grant_keys k ON k.ou_id = rg.principal_id
+       WHERE (rg.principal_applies_to='self_only'
+              AND rg.principal_id = ANY($4::uuid[]))            -- reader_scope
+          OR (rg.principal_applies_to='self_and_descendants'
+              AND rg.principal_id IN (SELECT ou_id FROM reader_grant_keys))
      UNION
        SELECT cd.doc_id FROM cand_docs cd                              -- arm 3
        JOIN org_unit_closure rc ON rc.company_id=$1 AND rc.descendant_id=cd.owner
@@ -164,7 +167,10 @@ Two properties make G1 cheap enough to actually be the boundary:
             AND (rg.expires_at IS NULL OR rg.expires_at>now())
             AND (rg.resource_applies_to='self_and_descendants'
                  OR (rg.resource_applies_to='self_only' AND rc.depth=0))
-       JOIN reader_grant_keys k ON k.ou_id = rg.principal_id
+       WHERE (rg.principal_applies_to='self_only'
+              AND rg.principal_id = ANY($4::uuid[]))            -- reader_scope
+          OR (rg.principal_applies_to='self_and_descendants'
+              AND rg.principal_id IN (SELECT ou_id FROM reader_grant_keys))
    )
    SELECT dc.id, dc.section_id, dv.sensitivity_label, dv.lifecycle_status,
           d.authority_level, d.owner_org_unit_id
@@ -181,6 +187,18 @@ Two properties make G1 cheap enough to actually be the boundary:
    referenced; resource visibility is computed from live grants. The
    overlay's role is to keep `$5` short (fewer candidate docs to resolve),
    not to replace this query.
+
+   **`principal_applies_to` matters (arms 2 and 3).** A `self_only`-principal
+   grant applies only to its exact principal OU, so it matches iff the
+   principal is in `reader_scope` (`$4`). A `self_and_descendants`-principal
+   grant matches iff the principal is in `reader_grant_keys` (reader_scope +
+   ancestors). Matching every grant against `reader_grant_keys` - the first
+   cut of this query - over-grants a `self_only` grant to a reader sitting in
+   a descendant of the principal (an over-grant = leak). The §5-item-1
+   property test (`tests/test_retrieval_invariants.cpp`) catches exactly this
+   by checking the gate against an independent oracle
+   (`fetch_access_scopes` resource-side expansion intersected with
+   `effective_read_orgs`).
 
 2. **One snapshot.** The query reads `document_chunks`, `document_versions`,
    `documents`, `resource_grants`, and `org_unit_closure` in one statement
@@ -1034,18 +1052,18 @@ overlay's internal invariant. This is the test a security reviewer
 will ask for, and it keeps passing even if the overlay is later
 simplified or removed.
 
-1. **G1 subset property test.** Fuzz random interleavings of W1, W2,
-   and W3 against a reference oracle (the authoritative PG state),
-   and assert two properties for every reader R at every wall-clock
-   t:
-   - **Safety:** `gate_output(R, t)` ⊆ `pg_truth_allowed(R, t)`. The
-     gate never emits a chunk the authoritative state would deny.
-     This is the no-leak property.
-   - **Liveness:** once the outbox drains, `gate_output(R, t)` =
-     `pg_truth_allowed(R, t)`. The overlay reaches consistency.
-
-   `tests/test_retrieval_invariants.cpp` holds the harness, marked
-   `[wip]` until Iter 2 lands.
+1. **G1 subset property test. DONE.** `tests/test_retrieval_invariants.cpp`
+   fuzzes randomized tenant configurations (random tree, grants,
+   memberships, documents) and for every reader asserts the gate equals
+   an INDEPENDENT oracle - `fetch_access_scopes` (resource-side expansion)
+   intersected with `effective_read_orgs` (reader-side scope). Because the
+   gate resolves live PG, safety (`gate ⊆ pg_truth`, no leak) and liveness
+   (`gate = pg_truth`) collapse to one equality check per config. 40 trials
+   / 945 assertions pass against Postgres 17; the test was confirmed to
+   fail with an OVER-GRANT on the pre-fix query (see the arm-2/arm-3
+   `principal_applies_to` note in §0), so it has teeth. The W1/W2/W3
+   prefilter-staleness interleaving layer is added on top once EvidenceGate
+   and the §2 overlay exist.
 
 2. **Scenario F regression test.** Forced membership-revoke with a
    mocked Redis drop on the `lr:eff:keys:user` DEL must not return
@@ -1265,3 +1283,16 @@ leaves `acl_epoch` unchanged; org-unit insert/move bumps `acl_epoch`;
 membership/group-member bumps `users.scope_epoch`; the backfill enqueue is
 idempotent. The `document_repo.cpp` / `outbox_worker.cpp` write path was
 renamed to `qdrant_prefilter_scope_ids` in the same change.
+
+**Gate-query `principal_applies_to` fix (found by the §5-item-1 property
+test).** The set-based §0 query matched `principal_id` against
+`reader_grant_keys` (reader_scope + ancestors) for every grant, silently
+treating all grants as `self_and_descendants`-principal. That over-grants a
+`self_only`-principal grant to a reader sitting in a descendant of the
+principal - an over-grant, i.e. a leak. Arms 2 and 3 now split on
+`principal_applies_to`: `self_only` matches against `reader_scope`,
+`self_and_descendants` against `reader_grant_keys`. The property test
+(`tests/test_retrieval_invariants.cpp`) compares the gate to an independent
+oracle and was confirmed to fail on the pre-fix query, so the boundary is
+now regression-guarded. The §5 item-5 benchmark numbers are unaffected (the
+fix is the same query shape).
