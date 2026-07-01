@@ -153,42 +153,58 @@ $$;
 -- so handling the effective (NEW-or-OLD) row is sufficient.
 -- ===========================================================================
 
+-- Documents a grant tuple covers: the exact document, or every document whose
+-- owner is in the org_unit resource's subtree (self_only = depth 0).
+CREATE OR REPLACE FUNCTION wikore_grant_affected_docs(
+    p_company UUID, p_rtype TEXT, p_rid UUID, p_applies TEXT
+) RETURNS UUID[]
+LANGUAGE plpgsql AS $$
+DECLARE v_docs UUID[];
+BEGIN
+    IF p_rtype = 'document' THEN
+        v_docs := ARRAY[p_rid];
+    ELSIF p_rtype = 'org_unit' THEN
+        SELECT array_agg(d.id) INTO v_docs
+        FROM   documents d
+        WHERE  d.company_id = p_company
+          AND  d.owner_org_unit_id IN (
+              SELECT c.descendant_id
+              FROM   org_unit_closure c
+              WHERE  c.company_id  = p_company
+                AND  c.ancestor_id = p_rid
+                AND  (p_applies = 'self_and_descendants' OR c.depth = 0)
+          );
+    ELSE
+        v_docs := NULL;   -- wiki_page: no documents
+    END IF;
+    RETURN v_docs;
+END;
+$$;
+
 CREATE OR REPLACE FUNCTION wikore_grant_acl_bump()
 RETURNS TRIGGER
 LANGUAGE plpgsql AS $$
 DECLARE
-    g_company UUID;
-    g_rtype   TEXT;
-    g_rid     UUID;
-    g_applies TEXT;
-    v_doc_ids UUID[];
+    v_docs UUID[] := '{}';
 BEGIN
-    IF TG_OP = 'DELETE' THEN
-        g_company := OLD.company_id; g_rtype := OLD.resource_type;
-        g_rid     := OLD.resource_id; g_applies := OLD.resource_applies_to;
-    ELSE
-        g_company := NEW.company_id; g_rtype := NEW.resource_type;
-        g_rid     := NEW.resource_id; g_applies := NEW.resource_applies_to;
+    -- Process the UNION of the documents the OLD grant scope covered and the
+    -- NEW scope covers. Narrowing (self_and_descendants -> self_only) or moving
+    -- a grant must resync the documents it NO LONGER covers, or their Qdrant
+    -- payloads stay permanently stale (they are never bumped again).
+    IF TG_OP IN ('UPDATE','DELETE') THEN
+        v_docs := v_docs || COALESCE(
+            wikore_grant_affected_docs(OLD.company_id, OLD.resource_type,
+                                       OLD.resource_id, OLD.resource_applies_to), '{}');
+    END IF;
+    IF TG_OP IN ('UPDATE','INSERT') THEN
+        v_docs := v_docs || COALESCE(
+            wikore_grant_affected_docs(NEW.company_id, NEW.resource_type,
+                                       NEW.resource_id, NEW.resource_applies_to), '{}');
     END IF;
 
-    IF g_rtype = 'document' THEN
-        v_doc_ids := ARRAY[g_rid];
-    ELSIF g_rtype = 'org_unit' THEN
-        SELECT array_agg(d.id) INTO v_doc_ids
-        FROM   documents d
-        WHERE  d.company_id = g_company
-          AND  d.owner_org_unit_id IN (
-              SELECT c.descendant_id
-              FROM   org_unit_closure c
-              WHERE  c.company_id  = g_company
-                AND  c.ancestor_id = g_rid
-                AND  (g_applies = 'self_and_descendants' OR c.depth = 0)
-          );
-    ELSE
-        v_doc_ids := NULL;   -- wiki_page: no documents
-    END IF;
-
-    PERFORM wikore_bump_docs_and_enqueue(g_company, v_doc_ids);
+    PERFORM wikore_bump_docs_and_enqueue(
+        COALESCE(NEW.company_id, OLD.company_id),
+        (SELECT array_agg(DISTINCT x) FROM unnest(v_docs) AS x));
     RETURN NULL;
 END;
 $$;

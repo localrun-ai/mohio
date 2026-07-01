@@ -277,3 +277,44 @@ TEST_CASE("V032: reassigning a membership bumps BOTH the old and new principal (
     CHECK(epoch(f.user) > a0);   // OLD principal invalidated (the fix)
     CHECK(epoch(userB) > b0);    // NEW principal invalidated
 }
+
+TEST_CASE("V032: narrowing a resource_grant resyncs the documents it no longer covers (P2)",
+          "[integration][access_resolver]")
+{
+    if (!db_available()) SKIP("DATABASE_URL not set");
+    auto db = wikore::Db::get();
+    auto f  = seed(db);
+    // tree: root -> A -> B; a document owned by B.
+    const auto A = std::string(exec_sync(db,
+        "INSERT INTO org_units (company_id,parent_id,type,slug,name) "
+        "VALUES ($1::uuid,$2::uuid,'department','a2','A2') RETURNING id",
+        std::string(CO), f.root)[0]["id"].c_str());
+    const auto B = std::string(exec_sync(db,
+        "INSERT INTO org_units (company_id,parent_id,type,slug,name) "
+        "VALUES ($1::uuid,$2::uuid,'team','b2','B2') RETURNING id",
+        std::string(CO), A)[0]["id"].c_str());
+    const auto doc = std::string(exec_sync(db,
+        "INSERT INTO documents (company_id,owner_org_unit_id,filename) "
+        "VALUES ($1::uuid,$2::uuid,'d.txt') RETURNING id",
+        std::string(CO), B)[0]["id"].c_str());
+    auto docver = [&] {
+        return std::stoll(std::string(exec_sync(db,
+            "SELECT acl_version::text AS v FROM documents WHERE id=$1::uuid", doc)[0]["v"].c_str()));
+    };
+
+    // Grant on A, self_and_descendants -> covers B's subtree, including the doc.
+    exec_sync(db,
+        "INSERT INTO resource_grants (company_id,resource_type,resource_id,resource_applies_to,"
+        "principal_type,principal_id,principal_applies_to,permission) "
+        "VALUES ($1::uuid,'org_unit',$2::uuid,'self_and_descendants','org_unit',$2::uuid,'self_only','read')",
+        std::string(CO), A);
+    const auto v_after_insert = docver();   // bumped by INSERT (doc owner in A subtree)
+
+    // Narrow to self_only: the doc (owned by B) is no longer covered. The OLD
+    // scope must still reprocess it, or its payload would stay stale forever.
+    exec_sync(db,
+        "UPDATE resource_grants SET resource_applies_to='self_only' "
+        "WHERE company_id=$1::uuid AND resource_type='org_unit' AND resource_id=$2::uuid",
+        std::string(CO), A);
+    CHECK(docver() > v_after_insert);       // OLD scope reprocessed the dropped doc
+}

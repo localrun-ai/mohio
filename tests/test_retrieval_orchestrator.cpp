@@ -150,6 +150,12 @@ TEST_CASE("RetrievalOrchestrator: gate overrides a stale prefilter and clearance
     CHECK(std::find(got.begin(), got.end(), stale.chunk_id)      == got.end());
     CHECK(std::find(got.begin(), got.end(), restricted.chunk_id) == got.end());
     CHECK((*r)[0].text.find("body") != std::string::npos);  // hydrated by the gate
+
+    // P2: a very large limit must not overflow limit * over_fetch; the result
+    // stays bounded and correct.
+    auto big = drogon::sync_wait(orch.retrieve(ctx, "any query", g_root, 2000000000));
+    REQUIRE(big.has_value());
+    CHECK(big->size() == 1);
 }
 
 TEST_CASE("RetrievalOrchestrator: a non-positive limit is rejected before any work (P2)",

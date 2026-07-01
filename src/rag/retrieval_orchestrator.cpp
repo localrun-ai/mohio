@@ -38,7 +38,12 @@ RetrievalOrchestrator::retrieve(const RequestContext& ctx,
     const auto filter = QdrantFilterBuilder::build(company, *scope, labels);
 
     // 5. vector search, over-fetched so gate drops do not starve the result.
-    const int fetch = std::max(1, limit) * std::max(1, over_fetch_);
+    //    Computed in 64-bit and capped so `limit * over_fetch` cannot overflow
+    //    int for a large caller-supplied limit (limit is already > 0).
+    constexpr long long kMaxFetch = 10000;
+    const long long want  = static_cast<long long>(limit)
+                          * static_cast<long long>(std::max(1, over_fetch_));
+    const int fetch = static_cast<int>(std::min(want, kMaxFetch));
     auto candidates = co_await vector_store_->search(*vec, filter, fetch);
     if (!candidates) co_return std::unexpected(candidates.error());
 
