@@ -95,6 +95,7 @@ constexpr auto kGateSql = R"(
 )";
 
 struct Hydrated {
+    std::string                document_version_id;   // authoritative, from PG
     std::string                content;
     std::optional<std::string> section_heading;
 };
@@ -131,7 +132,8 @@ EvidenceGate::evaluate(std::string_view                   company_id,
         allowed.reserve(rows.size());
         for (const auto& r : rows) {
             Hydrated h;
-            h.content = r["content"].as<std::string>();
+            h.document_version_id = r["document_version_id"].as<std::string>();
+            h.content             = r["content"].as<std::string>();
             if (!r["section_heading"].isNull())
                 h.section_heading = r["section_heading"].as<std::string>();
             allowed.emplace(r["chunk_id"].as<std::string>(), std::move(h));
@@ -150,7 +152,9 @@ EvidenceGate::evaluate(std::string_view                   company_id,
             continue;
         out.push_back(AllowedCandidate{
             .chunk_id            = c.chunk_id,
-            .document_version_id = c.document_version_id,
+            // Authoritative version from PG, NOT the (possibly stale) candidate:
+            // Postgres is the evidence, so evidence attribution comes from PG.
+            .document_version_id = std::move(it->second.document_version_id),
             .score               = c.score,
             .text                = std::move(it->second.content),
             .section_heading     = std::move(it->second.section_heading),

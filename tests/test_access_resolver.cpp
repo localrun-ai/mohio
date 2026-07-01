@@ -247,3 +247,33 @@ TEST_CASE("CachedAccessResolver: epoch-valid hit is served from cache; an epoch 
     INFO("spy calls after epoch bump=" << spy->calls);
     CHECK(spy->calls == 2);                       // stale epoch -> re-resolve
 }
+
+TEST_CASE("V032: reassigning a membership bumps BOTH the old and new principal (P1)",
+          "[integration][access_resolver]")
+{
+    if (!db_available()) SKIP("DATABASE_URL not set");
+    auto db = wikore::Db::get();
+    auto f  = seed(db);
+    const auto userB = std::string(exec_sync(db,
+        "INSERT INTO users (company_id,external_sub,email) "
+        "VALUES ($1::uuid,'subB','b@ar.test') RETURNING id", std::string(CO))[0]["id"].c_str());
+    exec_sync(db,
+        "INSERT INTO memberships (company_id,user_id,org_unit_id,role,applies_to) "
+        "VALUES ($1::uuid,$2::uuid,$3::uuid,'viewer','self_only')",
+        std::string(CO), f.user, f.ou);
+
+    auto epoch = [&](const std::string& u) {
+        return std::stoll(std::string(exec_sync(db,
+            "SELECT scope_epoch::text AS e FROM users WHERE id=$1::uuid", u)[0]["e"].c_str()));
+    };
+    const auto a0 = epoch(f.user);
+    const auto b0 = epoch(userB);
+
+    // Reassign the membership from f.user to userB (an in-place UPDATE).
+    exec_sync(db,
+        "UPDATE memberships SET user_id=$1::uuid WHERE company_id=$2::uuid AND user_id=$3::uuid",
+        userB, std::string(CO), f.user);
+
+    CHECK(epoch(f.user) > a0);   // OLD principal invalidated (the fix)
+    CHECK(epoch(userB) > b0);    // NEW principal invalidated
+}

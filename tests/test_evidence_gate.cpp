@@ -196,6 +196,28 @@ TEST_CASE("EvidenceGate: self_only-principal grant does not leak to a descendant
     CHECK(allow->size() == 1);
 }
 
+TEST_CASE("EvidenceGate: document_version_id is taken from Postgres, not the candidate (P1)",
+          "[integration][gate]")
+{
+    if (!db_available()) SKIP("DATABASE_URL not set");
+    auto db = wikore::Db::get(); seed(db);
+    const auto A = make_ou(db, g_root, "a");
+    auto ref = make_chunk(db, A);                  // authoritative version = ref.version_id
+
+    // Candidate carries a bogus version, as a stale Qdrant payload might.
+    wikore::rag::ChunkCandidate bogus{
+        .chunk_id = ref.chunk_id,
+        .document_version_id = "00000000-0000-0000-0000-000000000000",
+        .score = 0.9f, .payload = {}};
+
+    wikore::AccessScope scope; scope.org_unit_ids = {A};
+    wikore::rag::EvidenceGate gate(db);
+    auto r = drogon::sync_wait(gate.evaluate(CO, scope, kMember, {bogus}));
+    REQUIRE(r.has_value());
+    REQUIRE(r->size() == 1);
+    CHECK((*r)[0].document_version_id == ref.version_id);   // PG value, not the bogus one
+}
+
 TEST_CASE("EvidenceGate: fail-closed on empty scope, empty clearance, or no candidates",
           "[integration][gate]")
 {

@@ -249,28 +249,39 @@ CREATE TRIGGER org_units_acl_epoch_bump
 -- 7. memberships -> users.scope_epoch (the user, or every user in the group).
 -- ===========================================================================
 
+-- Bump every user whose resolved scope depends on a membership's principal
+-- (the user directly, or every member of the group).
+CREATE OR REPLACE FUNCTION wikore_bump_membership_principal(
+    p_company UUID, p_user UUID, p_group UUID
+) RETURNS VOID
+LANGUAGE plpgsql AS $$
+BEGIN
+    IF p_user IS NOT NULL THEN
+        UPDATE users SET scope_epoch = scope_epoch + 1
+        WHERE company_id = p_company AND id = p_user;
+    ELSIF p_group IS NOT NULL THEN
+        UPDATE users SET scope_epoch = scope_epoch + 1
+        WHERE company_id = p_company
+          AND id IN (SELECT gm.user_id FROM group_members gm
+                     WHERE gm.company_id = p_company AND gm.group_id = p_group);
+    END IF;
+END;
+$$;
+
 CREATE OR REPLACE FUNCTION wikore_membership_scope_bump()
 RETURNS TRIGGER
 LANGUAGE plpgsql AS $$
-DECLARE
-    m_company UUID;
-    m_user    UUID;
-    m_group   UUID;
 BEGIN
-    IF TG_OP = 'DELETE' THEN
-        m_company := OLD.company_id; m_user := OLD.user_id; m_group := OLD.group_id;
-    ELSE
-        m_company := NEW.company_id; m_user := NEW.user_id; m_group := NEW.group_id;
+    -- Bump BOTH the losing (OLD) and the gaining (NEW) principal. An UPDATE
+    -- that reassigns a membership to a different user/group must invalidate the
+    -- OLD principal's cache too, or that user keeps revoked access until the
+    -- lr:eff TTL expires. Bumping the same user twice is harmless (the epoch
+    -- only has to change).
+    IF TG_OP IN ('UPDATE','DELETE') THEN
+        PERFORM wikore_bump_membership_principal(OLD.company_id, OLD.user_id, OLD.group_id);
     END IF;
-
-    IF m_user IS NOT NULL THEN
-        UPDATE users SET scope_epoch = scope_epoch + 1
-        WHERE company_id = m_company AND id = m_user;
-    ELSIF m_group IS NOT NULL THEN
-        UPDATE users SET scope_epoch = scope_epoch + 1
-        WHERE company_id = m_company
-          AND id IN (SELECT gm.user_id FROM group_members gm
-                     WHERE gm.company_id = m_company AND gm.group_id = m_group);
+    IF TG_OP IN ('UPDATE','INSERT') THEN
+        PERFORM wikore_bump_membership_principal(NEW.company_id, NEW.user_id, NEW.group_id);
     END IF;
     RETURN NULL;
 END;
@@ -288,18 +299,17 @@ CREATE TRIGGER memberships_scope_epoch_bump
 CREATE OR REPLACE FUNCTION wikore_group_member_scope_bump()
 RETURNS TRIGGER
 LANGUAGE plpgsql AS $$
-DECLARE
-    gm_company UUID;
-    gm_user    UUID;
 BEGIN
-    IF TG_OP = 'DELETE' THEN
-        gm_company := OLD.company_id; gm_user := OLD.user_id;
-    ELSE
-        gm_company := NEW.company_id; gm_user := NEW.user_id;
+    -- Bump the losing (OLD) and the gaining (NEW) user; a reassigned row must
+    -- invalidate both principals' caches.
+    IF TG_OP IN ('UPDATE','DELETE') THEN
+        UPDATE users SET scope_epoch = scope_epoch + 1
+        WHERE company_id = OLD.company_id AND id = OLD.user_id;
     END IF;
-
-    UPDATE users SET scope_epoch = scope_epoch + 1
-    WHERE company_id = gm_company AND id = gm_user;
+    IF TG_OP IN ('UPDATE','INSERT') THEN
+        UPDATE users SET scope_epoch = scope_epoch + 1
+        WHERE company_id = NEW.company_id AND id = NEW.user_id;
+    END IF;
     RETURN NULL;
 END;
 $$;

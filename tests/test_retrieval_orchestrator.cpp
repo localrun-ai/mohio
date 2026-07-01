@@ -151,3 +151,24 @@ TEST_CASE("RetrievalOrchestrator: gate overrides a stale prefilter and clearance
     CHECK(std::find(got.begin(), got.end(), restricted.chunk_id) == got.end());
     CHECK((*r)[0].text.find("body") != std::string::npos);  // hydrated by the gate
 }
+
+TEST_CASE("RetrievalOrchestrator: a non-positive limit is rejected before any work (P2)",
+          "[integration][orchestrator]")
+{
+    if (!db_available()) SKIP("DATABASE_URL not set");
+    auto db = wikore::Db::get(); seed(db);
+    wikore::rag::RetrievalOrchestrator orch(
+        std::make_shared<wikore::rag::NullEmbedder>(DIM),
+        std::make_shared<wikore::PostgresAccessResolver>(db),
+        std::make_shared<wikore::rag::NullVectorStore>(),
+        wikore::rag::EvidenceGate(db));
+    wikore::RequestContext ctx{
+        .tenant = {.company_id = CO}, .principal = {.user_id = "u", .email = "x"},
+        .span = {}, .deadline = std::chrono::steady_clock::now() + std::chrono::seconds(30)};
+
+    for (int bad : {0, -5}) {
+        auto r = drogon::sync_wait(orch.retrieve(ctx, "q", g_root, bad));
+        REQUIRE_FALSE(r.has_value());
+        CHECK(r.error().kind == wikore::Error::Kind::InvalidInput);
+    }
+}

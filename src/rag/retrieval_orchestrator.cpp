@@ -15,6 +15,11 @@ RetrievalOrchestrator::retrieve(const RequestContext& ctx,
     if (ctx.deadline_exceeded())
         co_return std::unexpected(Error::unavailable("retrieve: deadline exceeded"));
 
+    // Validate before doing any work: a non-positive limit would flow into
+    // resize(limit), where a negative int converts to a huge size_t.
+    if (limit <= 0)
+        co_return std::unexpected(Error::invalid_input("retrieve: limit must be positive"));
+
     const auto& company = ctx.tenant.company_id;
 
     // 1. embed the query.
