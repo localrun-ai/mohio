@@ -70,7 +70,10 @@ PostgresAccessResolver::resolve(std::string_view company_id,
         )
         SELECT e.acl_epoch    AS acl_epoch,
                e.scope_epoch  AS scope_epoch,
-               extract(epoch FROM x.min_expiry)::bigint AS min_expiry_epoch,
+               -- FLOOR to the millisecond, never round: a rounded-up expiry
+               -- would extend the cached scope's TTL past the real expiry and
+               -- briefly keep an expired membership authorized.
+               floor(extract(epoch FROM x.min_expiry) * 1000)::bigint AS min_expiry_ms,
                s.org_unit_id  AS org_unit_id
         FROM   epochs e
         CROSS JOIN min_expiry x
@@ -94,10 +97,10 @@ PostgresAccessResolver::resolve(std::string_view company_id,
         using namespace std::chrono;
         constexpr auto kDefaultTtl = minutes(5);     // V008 default
         auto cache_until = system_clock::now() + kDefaultTtl;
-        if (!rows[0]["min_expiry_epoch"].isNull()) {
+        if (!rows[0]["min_expiry_ms"].isNull()) {
             const auto exp = system_clock::time_point(
-                seconds(rows[0]["min_expiry_epoch"].as<long long>()));
-            cache_until = std::min(cache_until, exp);
+                milliseconds(rows[0]["min_expiry_ms"].as<long long>()));
+            cache_until = std::min(cache_until, exp);   // floored: never past expiry
         }
         scope.cache_until = cache_until;
 

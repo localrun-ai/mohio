@@ -203,6 +203,35 @@ TEST_CASE("Resolver: cache_until defaults to ~5min and clamps to earliest member
     CHECK(r2->cache_until >  now2);
 }
 
+TEST_CASE("AccessResolver: cache_until floors a fractional expiry, never rounds past it (P2)",
+          "[integration][access_resolver]")
+{
+    if (!db_available()) SKIP("DATABASE_URL not set");
+    using namespace std::chrono;
+    auto db = wikore::Db::get();
+    auto f  = seed(db);
+    // Membership expiring at a whole second + 600ms: extract(epoch)::bigint
+    // would round this UP to the next second, extending cache_until past it.
+    exec_sync(db,
+        "INSERT INTO memberships (company_id,user_id,org_unit_id,role,applies_to,expires_at) "
+        "VALUES ($1::uuid,$2::uuid,$3::uuid,'viewer','self_only', "
+        "        date_trunc('second', now()) + interval '45.6 seconds')",
+        std::string(CO), f.user, f.ou);
+
+    wikore::PostgresAccessResolver resolver(db);
+    auto r = drogon::sync_wait(resolver.resolve(CO, f.user, f.root));
+    REQUIRE(r.has_value());
+
+    const auto exp_ms = std::stoll(std::string(exec_sync(db,
+        "SELECT floor(extract(epoch FROM expires_at)*1000)::bigint::text AS e "
+        "FROM memberships WHERE company_id=$1::uuid AND user_id=$2::uuid "
+        "  AND expires_at IS NOT NULL ORDER BY expires_at LIMIT 1",
+        std::string(CO), f.user)[0]["e"].c_str()));
+    const auto cu_ms = duration_cast<milliseconds>(r->cache_until.time_since_epoch()).count();
+    INFO("cache_until_ms=" << cu_ms << " expiry_ms=" << exp_ms);
+    CHECK(cu_ms <= exp_ms);   // never outlives the real expiry (fails under rounding)
+}
+
 TEST_CASE("CachedAccessResolver: epoch-valid hit is served from cache; an epoch bump re-resolves",
           "[integration][access_resolver]")
 {
