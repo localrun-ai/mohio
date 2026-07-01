@@ -184,27 +184,25 @@ $$;
 CREATE OR REPLACE FUNCTION wikore_grant_acl_bump()
 RETURNS TRIGGER
 LANGUAGE plpgsql AS $$
-DECLARE
-    v_docs UUID[] := '{}';
 BEGIN
-    -- Process the UNION of the documents the OLD grant scope covered and the
-    -- NEW scope covers. Narrowing (self_and_descendants -> self_only) or moving
-    -- a grant must resync the documents it NO LONGER covers, or their Qdrant
-    -- payloads stay permanently stale (they are never bumped again).
+    -- Process the OLD and NEW grant scopes SEPARATELY, each under ITS OWN
+    -- company_id. Narrowing (self_and_descendants -> self_only) or moving a
+    -- grant must resync the documents it no longer covers, or their Qdrant
+    -- payloads stay permanently stale. Keeping each side on its own tenant also
+    -- means a cross-tenant change (should V009 ever permit one) resyncs
+    -- documents in BOTH tenants instead of filtering the OLD tenant's out.
     IF TG_OP IN ('UPDATE','DELETE') THEN
-        v_docs := v_docs || COALESCE(
+        PERFORM wikore_bump_docs_and_enqueue(
+            OLD.company_id,
             wikore_grant_affected_docs(OLD.company_id, OLD.resource_type,
-                                       OLD.resource_id, OLD.resource_applies_to), '{}');
+                                       OLD.resource_id, OLD.resource_applies_to));
     END IF;
     IF TG_OP IN ('UPDATE','INSERT') THEN
-        v_docs := v_docs || COALESCE(
+        PERFORM wikore_bump_docs_and_enqueue(
+            NEW.company_id,
             wikore_grant_affected_docs(NEW.company_id, NEW.resource_type,
-                                       NEW.resource_id, NEW.resource_applies_to), '{}');
+                                       NEW.resource_id, NEW.resource_applies_to));
     END IF;
-
-    PERFORM wikore_bump_docs_and_enqueue(
-        COALESCE(NEW.company_id, OLD.company_id),
-        (SELECT array_agg(DISTINCT x) FROM unnest(v_docs) AS x));
     RETURN NULL;
 END;
 $$;

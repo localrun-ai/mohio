@@ -318,3 +318,52 @@ TEST_CASE("V032: narrowing a resource_grant resyncs the documents it no longer c
         std::string(CO), A);
     CHECK(docver() > v_after_insert);       // OLD scope reprocessed the dropped doc
 }
+
+TEST_CASE("V032: a cross-tenant grant move still resyncs the OLD tenant's documents (P2)",
+          "[integration][access_resolver]")
+{
+    if (!db_available()) SKIP("DATABASE_URL not set");
+    auto db = wikore::Db::get();
+    auto f  = seed(db);                                  // company CO, f.root
+    constexpr auto CO2 = "a5e50000-0000-0000-0000-0000000000c2";
+    exec_sync(db, "DELETE FROM companies WHERE id=$1::uuid", std::string(CO2));
+    exec_sync(db, "INSERT INTO companies (id,name,slug) VALUES ($1::uuid,'AR2','ar2')",
+              std::string(CO2));
+    const auto root2 = std::string(exec_sync(db,
+        "SELECT id FROM org_units WHERE company_id=$1::uuid AND type='root'",
+        std::string(CO2))[0]["id"].c_str());
+    const auto ouY = std::string(exec_sync(db,
+        "INSERT INTO org_units (company_id,parent_id,type,slug,name) "
+        "VALUES ($1::uuid,$2::uuid,'team','y','Y') RETURNING id",
+        std::string(CO2), root2)[0]["id"].c_str());
+
+    // company1: an OU, a document owned by it, and a grant on that OU.
+    const auto ouX = std::string(exec_sync(db,
+        "INSERT INTO org_units (company_id,parent_id,type,slug,name) "
+        "VALUES ($1::uuid,$2::uuid,'team','x','X') RETURNING id",
+        std::string(CO), f.root)[0]["id"].c_str());
+    const auto doc = std::string(exec_sync(db,
+        "INSERT INTO documents (company_id,owner_org_unit_id,filename) "
+        "VALUES ($1::uuid,$2::uuid,'x.txt') RETURNING id",
+        std::string(CO), ouX)[0]["id"].c_str());
+    exec_sync(db,
+        "INSERT INTO resource_grants (company_id,resource_type,resource_id,resource_applies_to,"
+        "principal_type,principal_id,principal_applies_to,permission) "
+        "VALUES ($1::uuid,'org_unit',$2::uuid,'self_only','org_unit',$2::uuid,'self_only','read')",
+        std::string(CO), ouX);
+    auto docver = [&] {
+        return std::stoll(std::string(exec_sync(db,
+            "SELECT acl_version::text AS v FROM documents WHERE id=$1::uuid", doc)[0]["v"].c_str()));
+    };
+    const auto v0 = docver();   // bumped by the INSERT
+
+    // Move the grant to company2 (V009 permits it: the NEW actors are valid in
+    // CO2). The OLD tenant's document must still be resynced under CO.
+    exec_sync(db,
+        "UPDATE resource_grants SET company_id=$1::uuid, resource_id=$2::uuid, principal_id=$2::uuid "
+        "WHERE company_id=$3::uuid AND resource_type='org_unit' AND resource_id=$4::uuid",
+        std::string(CO2), ouY, std::string(CO), ouX);
+    CHECK(docver() > v0);       // OLD-tenant doc bumped under its own company_id
+
+    exec_sync(db, "DELETE FROM companies WHERE id=$1::uuid", std::string(CO2));
+}
