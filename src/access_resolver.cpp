@@ -87,8 +87,8 @@ PostgresAccessResolver::resolve(std::string_view company_id,
                 "access_resolver: principal not found in tenant"));
 
         AccessScope scope;
-        scope.access_epoch = rows[0]["acl_epoch"].as<int>();
-        scope.scope_epoch  = rows[0]["scope_epoch"].as<int>();
+        scope.access_epoch = rows[0]["acl_epoch"].as<std::int64_t>();
+        scope.scope_epoch  = rows[0]["scope_epoch"].as<std::int64_t>();
 
         // cache_until = min(now + default TTL, earliest contributing expiry).
         using namespace std::chrono;
@@ -122,8 +122,8 @@ namespace {
 // keys are stable across builds (it crosses the process boundary).
 struct CachedScopeDto {
     std::vector<std::string> org_unit_ids;
-    int                      access_epoch   = 0;
-    int                      scope_epoch    = 0;
+    std::int64_t             access_epoch   = 0;
+    std::int64_t             scope_epoch    = 0;
     long long                cache_until_ms = 0;
 };
 
@@ -168,8 +168,8 @@ CachedAccessResolver::resolve(std::string_view company_id,
                     "WHERE c.id = $1::uuid AND u.id = $2::uuid",
                     std::string(company_id), std::string(user_id));
                 if (!ep.empty()
-                    && ep[0]["acl_epoch"].as<int>()   == dto.access_epoch
-                    && ep[0]["scope_epoch"].as<int>() == dto.scope_epoch)
+                    && ep[0]["acl_epoch"].as<std::int64_t>()   == dto.access_epoch
+                    && ep[0]["scope_epoch"].as<std::int64_t>() == dto.scope_epoch)
                 {
                     AccessScope s;
                     s.org_unit_ids = std::move(dto.org_unit_ids);

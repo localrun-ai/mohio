@@ -218,8 +218,8 @@ TEST_CASE("CachedAccessResolver: epoch-valid hit is served from cache; an epoch 
         "JOIN users u ON u.company_id=c.id WHERE c.id=$1::uuid AND u.id=$2::uuid",
         std::string(CO), f.user);
     auto spy = std::make_shared<SpyResolver>();
-    spy->canned.access_epoch = ep[0]["acl_epoch"].as<int>();
-    spy->canned.scope_epoch  = ep[0]["scope_epoch"].as<int>();
+    spy->canned.access_epoch = ep[0]["acl_epoch"].as<std::int64_t>();
+    spy->canned.scope_epoch  = ep[0]["scope_epoch"].as<std::int64_t>();
     spy->canned.cache_until  = system_clock::now() + minutes(5);
     spy->canned.org_unit_ids = {f.ou};
 

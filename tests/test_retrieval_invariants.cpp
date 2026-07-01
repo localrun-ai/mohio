@@ -161,7 +161,22 @@ Trial build_random_trial(drogon::orm::DbClientPtr db, std::mt19937& rng)
         }
     }
 
-    // Users with 1-2 memberships each.
+    // Two groups, each with a membership on a random OU (principal = group).
+    // Users added to a group inherit its org_unit membership, exercising the
+    // group-derived arm of the reader-scope resolvers.
+    std::vector<std::string> groups;
+    for (int g = 0; g < 2; ++g) {
+        const auto gid = std::string(exec_sync(db,
+            "INSERT INTO groups (company_id, name) VALUES ($1::uuid, $2) RETURNING id",
+            std::string(CO), std::string("grp") + std::to_string(g))[0]["id"].c_str());
+        groups.push_back(gid);
+        exec_sync(db,
+            "INSERT INTO memberships (company_id, group_id, org_unit_id, role, applies_to) "
+            "VALUES ($1::uuid, $2::uuid, $3::uuid, 'viewer', $4) ON CONFLICT DO NOTHING",
+            std::string(CO), gid, t.ous[rng() % t.ous.size()], std::string(applies[rng() % 2]));
+    }
+
+    // Users with 1-2 direct memberships each, ~half also placed in a group.
     const int n_user = 3 + (rng() % 3);            // 3..5 users
     for (int i = 0; i < n_user; ++i) {
         auto u = exec_sync(db,
@@ -179,6 +194,11 @@ Trial build_random_trial(drogon::orm::DbClientPtr db, std::mt19937& rng)
                 "VALUES ($1::uuid, $2::uuid, $3::uuid, 'viewer', $4) ON CONFLICT DO NOTHING",
                 std::string(CO), uid, ou, std::string(applies[rng() % 2]));
         }
+        if (rng() % 2 == 0)
+            exec_sync(db,
+                "INSERT INTO group_members (company_id, group_id, user_id) "
+                "VALUES ($1::uuid, $2::uuid, $3::uuid) ON CONFLICT DO NOTHING",
+                std::string(CO), groups[rng() % groups.size()], uid);
     }
     return t;
 }
@@ -190,8 +210,9 @@ TEST_CASE("G1 property: EvidenceGate output equals authoritative PG truth across
 {
     if (!db_available()) SKIP("DATABASE_URL not set");
     auto db = wikore::Db::get();
-    wikore::AccessService                access(db);
-    wikore::ingest::PostgresDocumentRepo repo(db);
+    wikore::AccessService                access(db);   // oracle reader-side
+    wikore::ingest::PostgresDocumentRepo repo(db);     // oracle resource-side
+    wikore::PostgresAccessResolver       resolver(db); // PRODUCTION reader-side (under test)
     wikore::rag::EvidenceGate            gate(db);
 
     // Full clearance + all fixtures active, so lifecycle/sensitivity never drop
@@ -217,10 +238,9 @@ TEST_CASE("G1 property: EvidenceGate output equals authoritative PG truth across
         }
 
         for (const auto& user : t.users) {
-            auto reader_scope = drogon::sync_wait(access.effective_read_orgs(CO, user, root));
-
-            // ---- ORACLE: doc visible iff fetch_access_scopes(doc) ∩ reader_scope ----
-            std::set<std::string> scope_set(reader_scope.begin(), reader_scope.end());
+            // ---- ORACLE reader-side: effective_read_orgs (independent copy) ----
+            auto oracle_scope = drogon::sync_wait(access.effective_read_orgs(CO, user, root));
+            std::set<std::string> scope_set(oracle_scope.begin(), oracle_scope.end());
             std::set<std::string> oracle_chunks;
             for (const auto& doc : t.docs) {
                 auto res = drogon::sync_wait(repo.fetch_access_scopes(CO, doc));
@@ -229,8 +249,12 @@ TEST_CASE("G1 property: EvidenceGate output equals authoritative PG truth across
                     if (scope_set.count(ou)) { oracle_chunks.insert(doc_chunk[doc]); break; }
             }
 
-            // ---- GATE: the actual EvidenceGate ----
-            wikore::AccessScope scope; scope.org_unit_ids = reader_scope;
+            // ---- GATE fed by the PRODUCTION resolver: validates both the
+            // resolver's scope SQL AND the gate against the oracle at once. If
+            // the resolver diverges from effective_read_orgs, the sets differ. --
+            auto rr = drogon::sync_wait(resolver.resolve(CO, user, root));
+            REQUIRE(rr.has_value());
+            wikore::AccessScope scope; scope.org_unit_ids = rr->org_unit_ids;
             auto allowed = drogon::sync_wait(gate.evaluate(CO, scope, full_clearance, candidates));
             REQUIRE(allowed.has_value());
             std::set<std::string> gate_chunks;
@@ -238,7 +262,8 @@ TEST_CASE("G1 property: EvidenceGate output equals authoritative PG truth across
 
             // ---- assert equality (safety + liveness) ----
             INFO("seed=" << seed << " user=" << user
-                 << " reader_scope_size=" << reader_scope.size());
+                 << " oracle_scope=" << oracle_scope.size()
+                 << " resolver_scope=" << rr->org_unit_ids.size());
             for (const auto& c : gate_chunks)
                 if (!oracle_chunks.count(c))
                     FAIL("OVER-GRANT (leak): gate emitted chunk " << c
