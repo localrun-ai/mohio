@@ -367,3 +367,46 @@ TEST_CASE("V032: a cross-tenant grant move still resyncs the OLD tenant's docume
 
     exec_sync(db, "DELETE FROM companies WHERE id=$1::uuid", std::string(CO2));
 }
+
+TEST_CASE("V032: a same-tenant grant UPDATE bumps each document once, not twice (P2)",
+          "[integration][access_resolver]")
+{
+    if (!db_available()) SKIP("DATABASE_URL not set");
+    auto db = wikore::Db::get();
+    auto f  = seed(db);
+    const auto ouX = std::string(exec_sync(db,
+        "INSERT INTO org_units (company_id,parent_id,type,slug,name) "
+        "VALUES ($1::uuid,$2::uuid,'team','x3','X3') RETURNING id",
+        std::string(CO), f.root)[0]["id"].c_str());
+    const auto doc = std::string(exec_sync(db,
+        "INSERT INTO documents (company_id,owner_org_unit_id,filename) "
+        "VALUES ($1::uuid,$2::uuid,'x3.txt') RETURNING id",
+        std::string(CO), ouX)[0]["id"].c_str());
+    exec_sync(db,
+        "INSERT INTO resource_grants (company_id,resource_type,resource_id,resource_applies_to,"
+        "principal_type,principal_id,principal_applies_to,permission) "
+        "VALUES ($1::uuid,'org_unit',$2::uuid,'self_only','org_unit',$2::uuid,'self_only','read')",
+        std::string(CO), ouX);
+
+    auto docver = [&] {
+        return std::stoll(std::string(exec_sync(db,
+            "SELECT acl_version::text AS v FROM documents WHERE id=$1::uuid", doc)[0]["v"].c_str()));
+    };
+    auto events = [&] {
+        return std::stoll(std::string(exec_sync(db,
+            "SELECT count(*)::text AS n FROM outbox_events "
+            "WHERE aggregate_id=$1::uuid AND job_type='qdrant_resync_chunk_acl'",
+            doc)[0]["n"].c_str()));
+    };
+    const auto v1 = docver();   // bumped once by the INSERT
+    const auto n1 = events();
+
+    // Permission change: resource scope is unchanged, so OLD scope == NEW scope.
+    exec_sync(db,
+        "UPDATE resource_grants SET permission='write' "
+        "WHERE company_id=$1::uuid AND resource_type='org_unit' AND resource_id=$2::uuid",
+        std::string(CO), ouX);
+
+    CHECK(docver() == v1 + 1);  // one bump, not two
+    CHECK(events() == n1 + 1);  // one new resync event, not two
+}

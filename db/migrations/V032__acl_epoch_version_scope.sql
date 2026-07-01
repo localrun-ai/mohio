@@ -185,19 +185,38 @@ CREATE OR REPLACE FUNCTION wikore_grant_acl_bump()
 RETURNS TRIGGER
 LANGUAGE plpgsql AS $$
 BEGIN
-    -- Process the OLD and NEW grant scopes SEPARATELY, each under ITS OWN
-    -- company_id. Narrowing (self_and_descendants -> self_only) or moving a
-    -- grant must resync the documents it no longer covers, or their Qdrant
-    -- payloads stay permanently stale. Keeping each side on its own tenant also
-    -- means a cross-tenant change (should V009 ever permit one) resyncs
-    -- documents in BOTH tenants instead of filtering the OLD tenant's out.
-    IF TG_OP IN ('UPDATE','DELETE') THEN
+    -- INSERT/DELETE process their single affected scope. For UPDATE within the
+    -- same tenant (the common case) the OLD and NEW scopes are UNIONED and
+    -- deduplicated so an overlapping document is bumped and enqueued exactly
+    -- ONCE - bumping it twice would just make the first resync event obsolete.
+    -- Narrowing/moving still resyncs the documents dropped from scope because
+    -- they are in the OLD side of the union. Only a cross-tenant move needs
+    -- separate per-tenant calls (its OLD and NEW document sets cannot overlap),
+    -- so no document is left stale in the OLD tenant.
+    IF TG_OP = 'DELETE' THEN
         PERFORM wikore_bump_docs_and_enqueue(
             OLD.company_id,
             wikore_grant_affected_docs(OLD.company_id, OLD.resource_type,
                                        OLD.resource_id, OLD.resource_applies_to));
-    END IF;
-    IF TG_OP IN ('UPDATE','INSERT') THEN
+    ELSIF TG_OP = 'INSERT' THEN
+        PERFORM wikore_bump_docs_and_enqueue(
+            NEW.company_id,
+            wikore_grant_affected_docs(NEW.company_id, NEW.resource_type,
+                                       NEW.resource_id, NEW.resource_applies_to));
+    ELSIF OLD.company_id = NEW.company_id THEN
+        PERFORM wikore_bump_docs_and_enqueue(
+            NEW.company_id,
+            (SELECT array_agg(DISTINCT x) FROM unnest(
+                 COALESCE(wikore_grant_affected_docs(OLD.company_id, OLD.resource_type,
+                                                     OLD.resource_id, OLD.resource_applies_to), '{}'::uuid[])
+              || COALESCE(wikore_grant_affected_docs(NEW.company_id, NEW.resource_type,
+                                                     NEW.resource_id, NEW.resource_applies_to), '{}'::uuid[])
+             ) AS x));
+    ELSE   -- cross-tenant move: no overlap; resync each tenant on its own id
+        PERFORM wikore_bump_docs_and_enqueue(
+            OLD.company_id,
+            wikore_grant_affected_docs(OLD.company_id, OLD.resource_type,
+                                       OLD.resource_id, OLD.resource_applies_to));
         PERFORM wikore_bump_docs_and_enqueue(
             NEW.company_id,
             wikore_grant_affected_docs(NEW.company_id, NEW.resource_type,
