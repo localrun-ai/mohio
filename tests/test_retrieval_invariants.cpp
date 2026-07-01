@@ -1,11 +1,14 @@
 #include <catch2/catch_test_macros.hpp>
 #include "wikore/access.hpp"
+#include "wikore/access_resolver.hpp"
 #include "wikore/ingest/document_repo.hpp"
+#include "wikore/rag/evidence_gate.hpp"
 #include "wikore/db.hpp"
 #include <drogon/drogon.h>
 #include <drogon/utils/coroutine.h>
 #include <algorithm>
 #include <cstdlib>
+#include <map>
 #include <random>
 #include <set>
 #include <string>
@@ -24,8 +27,8 @@
 //   gate(reader, candidates)  ==  oracle(reader, candidates)
 //
 // where:
-//   * gate   = the canonical SET-BASED G1 query (docs/iteration_2_design.md
-//              section 0). It is the code under test.
+//   * gate   = the ACTUAL EvidenceGate (its production set-based query), so
+//              this test validates the real boundary, not a copy of the SQL.
 //   * oracle = an INDEPENDENT formulation built from two pre-existing,
 //              separately-written resolvers:
 //                - PostgresDocumentRepo::fetch_access_scopes(doc) -> the
@@ -65,91 +68,11 @@ drogon::orm::Result exec_sync(drogon::orm::DbClientPtr db, std::string sql, Args
         }());
 }
 
-// Postgres uuid[] / text[] literal from a vector.
-std::string pg_array(const std::vector<std::string>& v)
-{
-    std::string out = "{";
-    for (size_t i = 0; i < v.size(); ++i) {
-        if (i) out += ',';
-        out += '"';
-        out += v[i];
-        out += '"';
-    }
-    out += '}';
-    return out;
-}
-
-// The canonical SET-BASED G1 gate query (docs/iteration_2_design.md s0).
-// $1 company, $2 lifecycle[], $3 sensitivity[], $4 reader_scope uuid[],
-// $5 candidate chunk-id uuid[]. Returns the visible doc ids.
-constexpr auto kG1Sql = R"(
-    WITH reader_scope(ou_id) AS (
-        SELECT DISTINCT x FROM unnest($4::uuid[]) AS x
-    ),
-    reader_grant_keys AS (
-        SELECT ou_id FROM reader_scope
-        UNION
-        SELECT c.ancestor_id
-        FROM   org_unit_closure c
-        WHERE  c.company_id = $1::uuid
-          AND  c.descendant_id IN (SELECT ou_id FROM reader_scope)
-    ),
-    cand_docs AS (
-        SELECT DISTINCT d.id AS doc_id, d.owner_org_unit_id AS owner
-        FROM   document_chunks   dc
-        JOIN   document_versions dv ON dv.id = dc.document_version_id
-        JOIN   documents         d  ON d.id  = dv.document_id
-        WHERE  dc.company_id        = $1::uuid
-          AND  dc.id                = ANY($5::uuid[])
-          AND  dv.lifecycle_status  = ANY($2)
-          AND  dv.sensitivity_label = ANY($3)
-    ),
-    visible AS (
-        -- arm 1: reader is in the document's owner scope
-        SELECT doc_id FROM cand_docs
-        WHERE  owner IN (SELECT ou_id FROM reader_scope)
-      UNION
-        -- arm 2: a document-level read grant whose principal reaches reader
-        SELECT cd.doc_id
-        FROM   cand_docs cd
-        JOIN   resource_grants rg
-            ON rg.company_id    = $1::uuid
-           AND rg.resource_type = 'document'
-           AND rg.resource_id   = cd.doc_id
-           AND rg.permission IN ('read','write','admin')
-           AND (rg.expires_at IS NULL OR rg.expires_at > now())
-        WHERE  (rg.principal_applies_to = 'self_only'
-                AND rg.principal_id IN (SELECT ou_id FROM reader_scope))
-           OR  (rg.principal_applies_to = 'self_and_descendants'
-                AND rg.principal_id IN (SELECT ou_id FROM reader_grant_keys))
-      UNION
-        -- arm 3: an org-unit read grant on an ancestor of the owner whose
-        --        principal reaches reader (resource subtree via closure)
-        SELECT cd.doc_id
-        FROM   cand_docs cd
-        JOIN   org_unit_closure rc
-            ON rc.company_id    = $1::uuid
-           AND rc.descendant_id = cd.owner
-        JOIN   resource_grants rg
-            ON rg.company_id    = $1::uuid
-           AND rg.resource_type = 'org_unit'
-           AND rg.resource_id   = rc.ancestor_id
-           AND rg.permission IN ('read','write','admin')
-           AND (rg.expires_at IS NULL OR rg.expires_at > now())
-           AND (rg.resource_applies_to = 'self_and_descendants'
-                OR (rg.resource_applies_to = 'self_only' AND rc.depth = 0))
-        WHERE  (rg.principal_applies_to = 'self_only'
-                AND rg.principal_id IN (SELECT ou_id FROM reader_scope))
-           OR  (rg.principal_applies_to = 'self_and_descendants'
-                AND rg.principal_id IN (SELECT ou_id FROM reader_grant_keys))
-    )
-    SELECT doc_id::text FROM visible
-)";
-
 struct Trial {
     std::vector<std::string> ous;      // all org_unit ids (incl root at [0])
     std::vector<std::string> docs;     // document ids
-    std::vector<std::string> chunks;   // chunk ids (one per doc)
+    std::vector<std::string> versions; // active version id per doc (index-aligned)
+    std::vector<std::string> chunks;   // chunk id per doc (index-aligned)
     std::vector<std::string> users;    // user ids
 };
 
@@ -197,6 +120,7 @@ Trial build_random_trial(drogon::orm::DbClientPtr db, std::mt19937& rng)
             "RETURNING id",
             std::string(CO), doc_id);
         const auto ver_id = std::string(v[0]["id"].c_str());
+        t.versions.push_back(ver_id);
         auto c = exec_sync(db,
             "INSERT INTO document_chunks "
             "(company_id, document_version_id, chunk_index, content, content_hash, "
@@ -261,16 +185,19 @@ Trial build_random_trial(drogon::orm::DbClientPtr db, std::mt19937& rng)
 
 } // namespace
 
-TEST_CASE("G1 property: gate output equals authoritative PG truth across random configs",
+TEST_CASE("G1 property: EvidenceGate output equals authoritative PG truth across random configs",
           "[integration][retrieval][g1]")
 {
     if (!db_available()) SKIP("DATABASE_URL not set");
     auto db = wikore::Db::get();
-    wikore::AccessService          access(db);
+    wikore::AccessService                access(db);
     wikore::ingest::PostgresDocumentRepo repo(db);
+    wikore::rag::EvidenceGate            gate(db);
 
-    const std::vector<std::string> lifecycles{"active"};
-    const std::vector<std::string> sensitivities{"public", "internal", "confidential", "restricted"};
+    // Full clearance + all fixtures active, so lifecycle/sensitivity never drop
+    // anything and the gate output reflects purely the resource+reader axes -
+    // exactly what the oracle computes.
+    const std::vector<std::string> full_clearance{"public","internal","confidential","restricted"};
 
     constexpr unsigned kTrials = 40;
     for (unsigned seed = 1; seed <= kTrials; ++seed) {
@@ -278,51 +205,49 @@ TEST_CASE("G1 property: gate output equals authoritative PG truth across random 
         Trial t = build_random_trial(db, rng);
         const auto& root = t.ous[0];
 
-        // Candidate set = every chunk in the tenant.
-        const auto cand_lit = pg_array(t.chunks);
+        // Candidate set = every chunk; doc -> its single chunk (index-aligned).
+        std::map<std::string, std::string> doc_chunk;
+        std::vector<wikore::rag::ChunkCandidate> candidates;
+        candidates.reserve(t.docs.size());
+        for (size_t i = 0; i < t.docs.size(); ++i) {
+            doc_chunk[t.docs[i]] = t.chunks[i];
+            candidates.push_back({.chunk_id = t.chunks[i],
+                                  .document_version_id = t.versions[i],
+                                  .score = 1.0f, .payload = {}});
+        }
 
         for (const auto& user : t.users) {
-            // ---- reader scope (company-wide: query scope = root) ----
             auto reader_scope = drogon::sync_wait(access.effective_read_orgs(CO, user, root));
 
             // ---- ORACLE: doc visible iff fetch_access_scopes(doc) ∩ reader_scope ----
             std::set<std::string> scope_set(reader_scope.begin(), reader_scope.end());
-            std::set<std::string> oracle_visible;
+            std::set<std::string> oracle_chunks;
             for (const auto& doc : t.docs) {
                 auto res = drogon::sync_wait(repo.fetch_access_scopes(CO, doc));
                 REQUIRE(res.has_value());
-                for (const auto& ou : *res) {
-                    if (scope_set.count(ou)) { oracle_visible.insert(doc); break; }
-                }
+                for (const auto& ou : *res)
+                    if (scope_set.count(ou)) { oracle_chunks.insert(doc_chunk[doc]); break; }
             }
 
-            // ---- GATE: the canonical set-based G1 query ----
-            auto rows = exec_sync(db, kG1Sql,
-                std::string(CO),
-                pg_array(lifecycles),
-                pg_array(sensitivities),
-                pg_array(reader_scope),
-                cand_lit);
-            std::set<std::string> gate_visible;
-            for (const auto& r : rows) gate_visible.insert(std::string(r["doc_id"].c_str()));
+            // ---- GATE: the actual EvidenceGate ----
+            wikore::AccessScope scope; scope.org_unit_ids = reader_scope;
+            auto allowed = drogon::sync_wait(gate.evaluate(CO, scope, full_clearance, candidates));
+            REQUIRE(allowed.has_value());
+            std::set<std::string> gate_chunks;
+            for (const auto& a : *allowed) gate_chunks.insert(a.chunk_id);
 
             // ---- assert equality (safety + liveness) ----
             INFO("seed=" << seed << " user=" << user
                  << " reader_scope_size=" << reader_scope.size());
-            if (gate_visible != oracle_visible) {
-                // Surface the divergence direction for debugging.
-                for (const auto& d : gate_visible)
-                    if (!oracle_visible.count(d))
-                        FAIL("OVER-GRANT (leak): gate emitted doc " << d
-                             << " not in PG truth (seed=" << seed
-                             << " user=" << user << ")");
-                for (const auto& d : oracle_visible)
-                    if (!gate_visible.count(d))
-                        FAIL("under-grant (recall): gate dropped doc " << d
-                             << " that PG truth allows (seed=" << seed
-                             << " user=" << user << ")");
-            }
-            CHECK(gate_visible == oracle_visible);
+            for (const auto& c : gate_chunks)
+                if (!oracle_chunks.count(c))
+                    FAIL("OVER-GRANT (leak): gate emitted chunk " << c
+                         << " not in PG truth (seed=" << seed << " user=" << user << ")");
+            for (const auto& c : oracle_chunks)
+                if (!gate_chunks.count(c))
+                    FAIL("under-grant (recall): gate dropped chunk " << c
+                         << " that PG truth allows (seed=" << seed << " user=" << user << ")");
+            CHECK(gate_chunks == oracle_chunks);
         }
     }
 }
@@ -379,15 +304,15 @@ TEST_CASE("G1 scenario F: revoke bumps scope_epoch and re-resolve is leak-free",
         "content_hash,qdrant_prefilter_scope_ids) VALUES ($1::uuid,$2::uuid,0,'x','hF','{}') "
         "RETURNING id", std::string(CO), ver)[0]["id"].c_str());
 
-    const std::vector<std::string> cand{chunk};
-    const std::vector<std::string> lifecycles{"active"};
+    wikore::rag::EvidenceGate gate(db);
     const std::vector<std::string> sens{"public","internal","confidential","restricted"};
-    auto gate_docs = [&](const std::vector<std::string>& scope) {
-        auto rows = exec_sync(db, kG1Sql, std::string(CO), pg_array(lifecycles),
-                              pg_array(sens), pg_array(scope), pg_array(cand));
-        std::set<std::string> out;
-        for (const auto& r : rows) out.insert(std::string(r["doc_id"].c_str()));
-        return out;
+    const std::vector<wikore::rag::ChunkCandidate> candidates{
+        {.chunk_id = chunk, .document_version_id = ver, .score = 1.0f, .payload = {}}};
+    auto gate_sees_chunk = [&](const std::vector<std::string>& scope_vec) {
+        wikore::AccessScope s; s.org_unit_ids = scope_vec;
+        auto a = drogon::sync_wait(gate.evaluate(CO, s, sens, candidates));
+        REQUIRE(a.has_value());
+        return !a->empty();
     };
     auto epoch_of = [&]{
         return std::string(exec_sync(db,
@@ -395,10 +320,10 @@ TEST_CASE("G1 scenario F: revoke bumps scope_epoch and re-resolve is leak-free",
             std::string(user))[0]["e"].c_str());
     };
 
-    // Pre-revoke: U is in HR, the gate returns the HR doc.
+    // Pre-revoke: U is in HR, the gate returns the HR chunk.
     auto scope0 = drogon::sync_wait(access.effective_read_orgs(CO, user, root));
     const auto epoch0 = epoch_of();
-    REQUIRE(gate_docs(scope0).count(doc) == 1);
+    REQUIRE(gate_sees_chunk(scope0));
 
     // Revoke. The lr:eff DEL is "lost" (we touch no cache); only PG changes.
     exec_sync(db, "DELETE FROM memberships WHERE company_id=$1::uuid AND user_id=$2::uuid",
@@ -412,7 +337,7 @@ TEST_CASE("G1 scenario F: revoke bumps scope_epoch and re-resolve is leak-free",
     // (2) re-resolve excludes HR, and the gate fed the fresh scope leaks nothing.
     auto scope1 = drogon::sync_wait(access.effective_read_orgs(CO, user, root));
     CHECK(std::find(scope1.begin(), scope1.end(), hr) == scope1.end());
-    CHECK(gate_docs(scope1).empty());
+    CHECK_FALSE(gate_sees_chunk(scope1));
 }
 
 // ---------------------------------------------------------------------------

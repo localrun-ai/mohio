@@ -24,10 +24,10 @@ namespace wikore::rag {
 // denies. Only the gate produces AllowedCandidate, so nothing reaches the
 // reranker without passing through here.
 //
-// The visibility CTEs below are the exact logic validated by the section-5
-// item-1 property test (tests/test_retrieval_invariants.cpp), including the
-// principal_applies_to split that test caught. TODO(consolidate): extract the
-// shared visibility SQL so the gate and the property test cannot drift.
+// The section-5 item-1 property test (tests/test_retrieval_invariants.cpp)
+// drives THIS gate directly against an independent oracle over randomized
+// configs - there is no separate copy of the visibility SQL to drift from. It
+// is what caught the principal_applies_to over-grant in the arms below.
 // ---------------------------------------------------------------------------
 class EvidenceGate {
 public:
