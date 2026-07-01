@@ -1,10 +1,13 @@
 #include "wikore/scheduler/resync_worker.hpp"
 #include "wikore/adapters/postgres/error_mapper.hpp"
+#include "wikore/adapters/postgres/unit_of_work.hpp"
 #include "wikore/rag/types.hpp"
 #include <drogon/drogon.h>
 #include <spdlog/spdlog.h>
 #include <chrono>
 #include <format>
+#include <map>
+#include <optional>
 #include <string>
 #include <unistd.h>
 
@@ -47,12 +50,12 @@ std::string to_pg_uuid_array(const std::vector<std::string>& ids)
 } // namespace
 
 ResyncWorker::ResyncWorker(drogon::orm::DbClientPtr                  db,
-                           std::shared_ptr<rag::VectorStorePort>     vector_store,
+                           VectorStoreForCollection                  store_for_collection,
                            std::shared_ptr<ingest::DocumentRepoPort> repo,
                            ShutdownPredicate                         shutdown_requested,
                            Options                                   opts)
     : db_(std::move(db))
-    , vector_store_(std::move(vector_store))
+    , store_for_collection_(std::move(store_for_collection))
     , repo_(std::move(repo))
     , shutdown_(std::move(shutdown_requested))
     , opts_(std::move(opts))
@@ -174,17 +177,38 @@ drogon::Task<int> ResyncWorker::release_my_claims()
 drogon::Task<Result<ResyncWorker::Outcome>>
 ResyncWorker::process(const ClaimedEvent& ev)
 {
-    // 1. Read the document's current ACL truth (owner + version counters).
+    // Everything runs inside ONE transaction that first takes a per-document
+    // advisory xact lock, so no two resync workers can interleave their
+    // read->write->CAS for the same document (design 2.3). The lock (and the
+    // pooled connection) is held across the Qdrant network write; resync is a
+    // low-rate path and drain_once processes events sequentially, so at most
+    // one connection is held per worker at a time.
+    std::optional<postgres::UnitOfWork> uow_opt;
+    try {
+        uow_opt.emplace(co_await postgres::UnitOfWork::begin(db_));
+    } catch (const std::exception& ex) {
+        co_return std::unexpected(Error::unavailable(
+            std::string("resync: begin tx failed: ") + ex.what()));
+    }
+    auto& uow = *uow_opt;
+
+    // 1. Serialize on the document, then read its current ACL truth.
     std::string  owner_org_unit_id;
     std::int64_t v_cur = 0;
     try {
-        auto rows = co_await db_->execSqlCoro(
+        // Blocking lock: a competing worker for the same document waits here
+        // until we commit, guaranteeing our Qdrant write + CAS are atomic
+        // w.r.t. any other resync of this document.
+        co_await uow.exec("SELECT pg_advisory_xact_lock(hashtext($1))",
+                          "resync:doc:" + ev.document_id);
+        auto rows = co_await uow.exec(
             "SELECT owner_org_unit_id::text AS owner, acl_version "
             "FROM documents WHERE company_id = $1::uuid AND id = $2::uuid",
             ev.company_id, ev.document_id);
         if (rows.empty()) {
             // Document deleted since the event was enqueued; its points are
             // cascade-removed independently. Nothing to resync -> drop.
+            uow.rollback();
             spdlog::info("[resync-worker] event={} document={} gone; dropping",
                          ev.id, ev.document_id);
             co_return Outcome::Superseded;
@@ -192,13 +216,14 @@ ResyncWorker::process(const ClaimedEvent& ev)
         owner_org_unit_id = rows[0]["owner"].as<std::string>();
         v_cur             = rows[0]["acl_version"].as<std::int64_t>();
     } catch (const drogon::orm::DrogonDbException& ex) {
+        uow.rollback();
         co_return std::unexpected(postgres::map_db_exception(ex));
     }
 
     // 2. Out-of-order drop: a strictly newer ACL bump has already committed and
-    //    enqueued its own event, which will do the authoritative write. Doing
-    //    ours would risk publishing a stale payload as the final state.
+    //    enqueued its own event, which will do the authoritative write.
     if (ev.acl_version < v_cur) {
+        uow.rollback();
         spdlog::info("[resync-worker] event={} document={} superseded "
                      "(event acl_version={} < current {}); dropping",
                      ev.id, ev.document_id, ev.acl_version, v_cur);
@@ -206,21 +231,25 @@ ResyncWorker::process(const ClaimedEvent& ev)
     }
 
     // 3. Recompute the resource-axis scope LIVE from resource_grants (the whole
-    //    point of the resync: the denormalized column is stale).
+    //    point of the resync: the denormalized column is stale). Read-only, so
+    //    the separate connection used by the repo does not extend the lock.
     auto scope_r = co_await repo_->fetch_access_scopes(ev.company_id, ev.document_id);
-    if (!scope_r)
+    if (!scope_r) {
+        uow.rollback();
         co_return std::unexpected(scope_r.error());
+    }
     const auto& scope = *scope_r;
 
-    // 4. Collect the active version's point ids + its (uniform) sensitivity /
-    //    lifecycle. Older versions are not searchable (filtered by lifecycle),
-    //    so only the active version's payloads need refreshing.
-    std::vector<std::string> point_ids;
+    // 4. Collect the active version's point ids GROUPED BY Qdrant collection
+    //    (a chunk may be embedded by several models, each in its own
+    //    collection), plus the version's uniform sensitivity / lifecycle.
+    std::map<std::string, std::vector<std::string>> points_by_collection;
     std::string sensitivity = "internal";
     std::string lifecycle   = "active";
     try {
-        auto rows = co_await db_->execSqlCoro(R"(
+        auto rows = co_await uow.exec(R"(
             SELECT dcv.qdrant_point_id::text AS point_id,
+                   em.qdrant_collection      AS collection,
                    dv.sensitivity_label      AS sensitivity_label,
                    dv.lifecycle_status       AS lifecycle_status
             FROM   document_versions dv
@@ -228,25 +257,53 @@ ResyncWorker::process(const ClaimedEvent& ev)
                 ON dc.document_version_id = dv.id AND dc.company_id = dv.company_id
             JOIN   document_chunk_vectors dcv
                 ON dcv.chunk_id = dc.id AND dcv.company_id = dc.company_id
+            JOIN   embedding_models em
+                ON em.id = dcv.embedding_model_id
             WHERE  dv.company_id = $1::uuid
               AND  dv.document_id = $2::uuid
               AND  dv.lifecycle_status = 'active'
         )", ev.company_id, ev.document_id);
-        point_ids.reserve(rows.size());
         for (const auto& r : rows) {
-            point_ids.push_back(r["point_id"].as<std::string>());
+            points_by_collection[r["collection"].as<std::string>()]
+                .push_back(r["point_id"].as<std::string>());
             sensitivity = r["sensitivity_label"].as<std::string>();
             lifecycle   = r["lifecycle_status"].as<std::string>();
         }
     } catch (const drogon::orm::DrogonDbException& ex) {
+        uow.rollback();
         co_return std::unexpected(postgres::map_db_exception(ex));
     }
 
-    // 5. Refresh the denormalized column for EVERY chunk of the document so a
+    // 5. Rewrite the Qdrant payload keys in EVERY collection (no re-embedding).
+    //    A collection this deployment cannot serve is a hard error: advancing
+    //    synced_version while leaving it stale would be a silent lie.
+    rag::PayloadPatch patch{
+        .access_scope_ids  = scope,
+        .sensitivity_label = sensitivity,
+        .lifecycle_status  = lifecycle,
+        .owner_org_unit_id = owner_org_unit_id,
+        .acl_version       = v_cur,
+    };
+    for (const auto& [collection, ids] : points_by_collection) {
+        auto store = store_for_collection_(collection);
+        if (!store) {
+            uow.rollback();
+            co_return std::unexpected(Error::invalid_state(std::format(
+                "resync: no vector store bound to Qdrant collection '{}' "
+                "(document {} has points there); route a worker for it",
+                collection, ev.document_id)));
+        }
+        if (auto r = co_await store->set_payload(ev.company_id, ids, patch); !r) {
+            uow.rollback();
+            co_return std::unexpected(r.error());
+        }
+    }
+
+    // 6. Refresh the denormalized column for EVERY chunk of the document so a
     //    later re-ingest/upsert writes the correct scope. Scope is
     //    document-level (owner + grants), identical across all versions.
     try {
-        co_await db_->execSqlCoro(R"(
+        co_await uow.exec(R"(
             UPDATE document_chunks dc
             SET    qdrant_prefilter_scope_ids = $3::uuid[]
             FROM   document_versions dv
@@ -256,27 +313,16 @@ ResyncWorker::process(const ClaimedEvent& ev)
               AND  dc.company_id  = $1::uuid
         )", ev.company_id, ev.document_id, to_pg_uuid_array(scope));
     } catch (const drogon::orm::DrogonDbException& ex) {
+        uow.rollback();
         co_return std::unexpected(postgres::map_db_exception(ex));
     }
 
-    // 6. Rewrite the Qdrant payload keys (no re-embedding). No-op if there are
-    //    no points yet (ingest still pending) -- the upsert worker will write
-    //    them fresh with the now-current column value.
-    rag::PayloadPatch patch{
-        .access_scope_ids  = scope,
-        .sensitivity_label = sensitivity,
-        .lifecycle_status  = lifecycle,
-        .owner_org_unit_id = owner_org_unit_id,
-        .acl_version       = v_cur,
-    };
-    if (auto r = co_await vector_store_->set_payload(ev.company_id, point_ids, patch); !r)
-        co_return std::unexpected(r.error());
-
     // 7. Compare-and-set the monotonic synced_version. Zero rows means a
-    //    concurrent bump moved acl_version during our Qdrant write; our payload
-    //    is now stale, but the newer event covers it -> drop, do not advance.
+    //    concurrent grant-mutation bump moved acl_version during processing;
+    //    its own event (enqueued by the bump) re-writes under this same lock.
+    Outcome outcome = Outcome::Completed;
     try {
-        auto rows = co_await db_->execSqlCoro(R"(
+        auto rows = co_await uow.exec(R"(
             UPDATE documents
             SET    qdrant_synced_version = $2::bigint
             WHERE  id          = $1::uuid
@@ -286,15 +332,22 @@ ResyncWorker::process(const ClaimedEvent& ev)
         )", ev.document_id, v_cur, ev.company_id);
         if (rows.empty()) {
             spdlog::info("[resync-worker] event={} document={} raced (acl_version "
-                         "moved past {} during write); dropping, newer event owns it",
+                         "moved past {} during processing); newer event owns it",
                          ev.id, ev.document_id, v_cur);
-            co_return Outcome::Superseded;
+            outcome = Outcome::Superseded;
         }
     } catch (const drogon::orm::DrogonDbException& ex) {
+        uow.rollback();
         co_return std::unexpected(postgres::map_db_exception(ex));
     }
 
-    co_return Outcome::Completed;
+    // Commit the payload refresh (column) + CAS atomically, releasing the
+    // advisory lock. A commit failure fails the event so the next poll retries
+    // (set_payload is idempotent).
+    if (auto r = co_await uow.commit(); !r)
+        co_return std::unexpected(r.error());
+
+    co_return outcome;
 }
 
 drogon::Task<void> ResyncWorker::mark_completed(const std::string& event_id)

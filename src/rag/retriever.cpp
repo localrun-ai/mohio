@@ -312,10 +312,15 @@ QdrantVectorStore::set_payload(std::string_view                company_id,
         company_id, scope, owner, patch.sensitivity_label, patch.lifecycle_status,
         patch.acl_version, patch.payload_schema_version, ids);
 
+    // wait=true: block until Qdrant has APPLIED the payload, not merely accepted
+    // it. The resync worker commits documents.qdrant_synced_version right after
+    // this returns; without wait=true Qdrant's default acknowledges receipt
+    // before the change is visible (or before it fails), so PG could advertise a
+    // version as synced that Qdrant has not yet applied.
     drogon::HttpResponsePtr resp;
     try {
         resp = co_await send(drogon::Post,
-                             std::format("/collections/{}/points/payload", _collection),
+                             std::format("/collections/{}/points/payload?wait=true", _collection),
                              body);
     } catch (const std::exception& ex) {
         co_return std::unexpected(

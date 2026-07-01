@@ -33,7 +33,12 @@ constexpr auto VER      = "7e150000-0000-0000-0000-000000000001";
 constexpr auto CH       = "c8150000-0000-0000-0000-000000000001";
 constexpr auto MODEL_ID = "11ed5000-0000-0000-0000-000000000001";
 constexpr auto POINT_ID = "b0150000-0000-0000-0000-000000000001";
-constexpr int  DIM      = 4;
+// Second embedding model / collection, for the multi-collection routing test.
+constexpr auto MODEL_ID2 = "11ed5000-0000-0000-0000-000000000002";
+constexpr auto POINT_ID2 = "b0150000-0000-0000-0000-000000000002";
+constexpr auto COLL1     = "wikore_resync_test";
+constexpr auto COLL2     = "wikore_resync_test2";
+constexpr int  DIM       = 4;
 
 bool db_available() { return std::getenv("DATABASE_URL") != nullptr; }
 
@@ -96,9 +101,9 @@ void seed(drogon::orm::DbClientPtr db)
         std::string(CO), std::string(CH), std::string(MODEL_ID), std::string(POINT_ID));
 }
 
-// A NullVectorStore seeded with the chunk's point carrying a STALE payload:
-// scope {root}, acl_version 1, schema v2. Resync must overwrite these.
-std::shared_ptr<wikore::rag::NullVectorStore> seeded_store()
+// A NullVectorStore seeded with one point carrying a STALE payload: scope
+// {root}, acl_version 1, schema v2. Resync must overwrite these.
+std::shared_ptr<wikore::rag::NullVectorStore> store_with(const std::string& point_id)
 {
     auto store = std::make_shared<wikore::rag::NullVectorStore>();
     wikore::rag::ChunkPayload p;
@@ -113,17 +118,33 @@ std::shared_ptr<wikore::rag::NullVectorStore> seeded_store()
     p.acl_version         = 1;
     p.payload_schema_version = 2;
     drogon::sync_wait(store->upsert(std::vector<wikore::rag::UpsertPoint>{
-        {.id = POINT_ID, .vector = wikore::rag::Embedding(DIM, 0.1f), .payload = std::move(p)}}));
+        {.id = point_id, .vector = wikore::rag::Embedding(DIM, 0.1f), .payload = std::move(p)}}));
     return store;
 }
+std::shared_ptr<wikore::rag::NullVectorStore> seeded_store() { return store_with(POINT_ID); }
 
+// Grant read on the document to the team org_unit. Fires the V032 trigger
+// (bumps documents.acl_version and enqueues resync:{DOC}:v).
+void grant_team_read(drogon::orm::DbClientPtr db)
+{
+    exec_sync(db,
+        "INSERT INTO resource_grants (company_id,resource_type,resource_id,"
+        "principal_type,principal_id,permission) "
+        "VALUES ($1::uuid,'document',$2::uuid,'org_unit',$3::uuid,'read')",
+        std::string(CO), std::string(DOC), g_team);
+}
+
+// A collection resolver that returns the same store for any collection name
+// (the NullVectorStore holds points keyed only by point id, so it stands in for
+// every collection in these tests).
 wikore::scheduler::ResyncWorker make_worker(
     drogon::orm::DbClientPtr db,
     std::shared_ptr<wikore::rag::VectorStorePort> store,
     std::atomic<bool>& stop)
 {
     return wikore::scheduler::ResyncWorker(
-        db, std::move(store),
+        db,
+        [store](const std::string&) { return store; },
         std::make_shared<wikore::ingest::PostgresDocumentRepo>(db),
         [&] { return stop.load(); },
         wikore::scheduler::ResyncWorker::Options{});
@@ -264,4 +285,82 @@ TEST_CASE("ResyncWorker: no vectors yet still advances synced_version (no stale 
     CHECK(std::stoll(d[0]["qdrant_synced_version"].c_str())
           == std::stoll(d[0]["acl_version"].c_str()));
     CHECK(store->point_count() == 0);
+}
+
+TEST_CASE("ResyncWorker: patches EVERY collection the document has points in",
+          "[integration][resync]")
+{
+    if (!db_available()) SKIP("DATABASE_URL not set");
+    auto db = wikore::Db::get();
+    seed(db);   // model 1 (COLL1) + POINT_ID already seeded
+
+    // A second embedding model in its OWN collection, with a second point for
+    // the same chunk.
+    exec_sync(db,
+        "INSERT INTO embedding_models (id,name,qdrant_collection,dimension) "
+        "VALUES ($1::uuid,'null-resync-2',$2,4) ON CONFLICT (name) DO NOTHING",
+        std::string(MODEL_ID2), std::string(COLL2));
+    exec_sync(db,
+        "INSERT INTO document_chunk_vectors (company_id,chunk_id,embedding_model_id,qdrant_point_id) "
+        "VALUES ($1::uuid,$2::uuid,$3::uuid,$4::uuid)",
+        std::string(CO), std::string(CH), std::string(MODEL_ID2), std::string(POINT_ID2));
+
+    // Distinct store per collection; the resolver routes by name.
+    auto store1 = store_with(POINT_ID);
+    auto store2 = store_with(POINT_ID2);
+    auto resolve = [&](const std::string& c) -> std::shared_ptr<wikore::rag::VectorStorePort> {
+        if (c == COLL1) return store1;
+        if (c == COLL2) return store2;
+        return nullptr;
+    };
+    grant_team_read(db);
+
+    std::atomic<bool> stop{false};
+    wikore::scheduler::ResyncWorker worker(
+        db, resolve, std::make_shared<wikore::ingest::PostgresDocumentRepo>(db),
+        [&] { return stop.load(); }, wikore::scheduler::ResyncWorker::Options{});
+    int processed = drogon::sync_wait(worker.drain_once());
+    CHECK(processed >= 1);
+
+    // BOTH collections' points were refreshed (not just the first).
+    for (auto* pl : {store1->payload_for(POINT_ID), store2->payload_for(POINT_ID2)}) {
+        REQUIRE(pl != nullptr);
+        CHECK(std::ranges::find(pl->access_scope_ids, g_team) != pl->access_scope_ids.end());
+        CHECK(pl->acl_version == 2);
+    }
+    auto d = exec_sync(db,
+        "SELECT qdrant_synced_version FROM documents WHERE id=$1::uuid", std::string(DOC));
+    CHECK(std::stoll(d[0]["qdrant_synced_version"].c_str()) == 2);
+}
+
+TEST_CASE("ResyncWorker: an unservable collection fails the event (no silent advance)",
+          "[integration][resync]")
+{
+    if (!db_available()) SKIP("DATABASE_URL not set");
+    auto db = wikore::Db::get();
+    seed(db);
+    grant_team_read(db);
+
+    // Resolver serves NO collection: the document's points live in COLL1, which
+    // this worker cannot reach. Advancing synced_version would be a silent lie.
+    std::atomic<bool> stop{false};
+    wikore::scheduler::ResyncWorker worker(
+        db,
+        [](const std::string&) -> std::shared_ptr<wikore::rag::VectorStorePort> { return nullptr; },
+        std::make_shared<wikore::ingest::PostgresDocumentRepo>(db),
+        [&] { return stop.load(); }, wikore::scheduler::ResyncWorker::Options{});
+    drogon::sync_wait(worker.drain_once());
+
+    // synced_version NOT advanced; the event is left uncompleted to retry.
+    auto d = exec_sync(db,
+        "SELECT qdrant_synced_version FROM documents WHERE id=$1::uuid", std::string(DOC));
+    CHECK(std::stoll(d[0]["qdrant_synced_version"].c_str()) == 0);
+    auto ev = exec_sync(db,
+        "SELECT completed_at IS NULL AS pending, attempt_count FROM outbox_events "
+        "WHERE company_id=$1::uuid AND aggregate_id=$2::uuid "
+        "  AND job_type='qdrant_resync_chunk_acl'",
+        std::string(CO), std::string(DOC));
+    REQUIRE(ev.size() == 1);
+    CHECK(std::string(ev[0]["pending"].c_str()) == "t");
+    CHECK(std::stoi(ev[0]["attempt_count"].c_str()) >= 1);
 }
