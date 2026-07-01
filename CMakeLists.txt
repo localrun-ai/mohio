@@ -153,10 +153,13 @@ target_link_libraries(wikore_ingest_lib PUBLIC wikore_rag)
 # ---------------------------------------------------------------------------
 add_library(wikore_scheduler_lib STATIC
     src/scheduler/outbox_worker.cpp
+    src/scheduler/resync_worker.cpp
     src/scheduler/polling_fallback.cpp
     src/scheduler/partition_maintainer.cpp
 )
-target_link_libraries(wikore_scheduler_lib PUBLIC wikore_rag wikore_infra)
+# wikore_ingest_lib provides DocumentRepoPort::fetch_access_scopes, the
+# canonical live scope recompute the resync worker reuses (no duplicated SQL).
+target_link_libraries(wikore_scheduler_lib PUBLIC wikore_rag wikore_infra wikore_ingest_lib)
 
 # ---------------------------------------------------------------------------
 # wikore_wiki: wiki store + ops (DB-backed, org-scoped)

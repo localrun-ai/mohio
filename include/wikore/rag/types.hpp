@@ -81,7 +81,14 @@ inline std::optional<std::string> uuid_v5(std::string_view name) {
 // ---------------------------------------------------------------------------
 
 struct ChunkPayload {
-    static constexpr int kSchemaVersion = 2;
+    // v3 adds acl_version: the documents.acl_version stamped into the payload
+    // at write time. It is a staleness HINT for the §2.1 pre-gate fast-path
+    // (payload trustworthy iff acl_version >= documents.acl_version), never an
+    // authorization authority -- G1 (EvidenceGate) resolves the resource axis
+    // live regardless. The qdrant_resync_chunk_acl worker refreshes this field
+    // (and access_scope_ids / sensitivity / lifecycle) without re-embedding
+    // when an ACL change bumps documents.acl_version.
+    static constexpr int kSchemaVersion = 3;
 
     std::string              company_id;
     std::string              document_id;
@@ -92,9 +99,10 @@ struct ChunkPayload {
     // UUID parameter (e.g. the reranker's WHERE d.id = $1::uuid) raises
     // ERROR: invalid input syntax for type uuid. std::optional + glaze's
     // skip_null_members write path keeps round-trips faithful: v1 points
-    // round-trip as nullopt, v2+ writes the real value. The resync worker
-    // (deferred) is the long-term fix; this keeps the system safe in the
-    // meantime. Same rationale as section_id / section_heading.
+    // round-trip as nullopt, v2+ writes the real value. scheduler::ResyncWorker
+    // refreshes this field for existing points on an ACL change; this keeps
+    // pre-resync points safe in the meantime. Same rationale as section_id /
+    // section_heading.
     std::optional<std::string> owner_org_unit_id;
     std::string              chunk_id;
     int                      chunk_index         = 0;
@@ -105,6 +113,11 @@ struct ChunkPayload {
     std::vector<std::string> access_scope_ids;
     std::string              sensitivity_label   = "internal";
     std::string              lifecycle_status    = "draft";
+    // documents.acl_version at write time. Staleness hint only; see the
+    // struct comment. Default 0 keeps schema-v1/v2 points (no acl_version key)
+    // deserializing to the always-stale sentinel, so the pre-gate treats them
+    // as untrusted and falls through to G1.
+    std::int64_t             acl_version         = 0;
     std::optional<std::string> activated_at;     // ISO 8601
     std::optional<std::string> superseded_at;    // ISO 8601
     std::optional<std::string> section_id;
@@ -161,6 +174,24 @@ struct QdrantFilter {
     std::vector<std::string> access_scope_ids;     // MatchAny on payload field
     std::vector<std::string> sensitivity_labels;   // MatchAny on payload field
     std::string              lifecycle_status = "active";
+};
+
+// ---------------------------------------------------------------------------
+// PayloadPatch: the ACL-relevant subset of a chunk payload, refreshed by the
+// qdrant_resync_chunk_acl worker without touching the vector. Applied via
+// VectorStorePort::set_payload to a set of existing point ids. Every field is
+// document-level (owner + grants) or version-level (sensitivity, lifecycle) and
+// therefore identical across all chunks of one document version, so a single
+// patch covers a whole document's point set.
+// ---------------------------------------------------------------------------
+
+struct PayloadPatch {
+    std::vector<std::string>   access_scope_ids;
+    std::string                sensitivity_label;
+    std::string                lifecycle_status;
+    std::optional<std::string> owner_org_unit_id;
+    std::int64_t               acl_version            = 0;
+    int                        payload_schema_version = ChunkPayload::kSchemaVersion;
 };
 
 // ---------------------------------------------------------------------------

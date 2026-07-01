@@ -67,8 +67,9 @@ std::string sha256_hex(std::string_view s)
 //
 // RESYNC NOTE: this snapshot is computed once at ingest. Grant revocation,
 // expiry, owner changes, and org-tree moves leave existing snapshots stale.
-// A resync worker that re-runs fetch_access_scopes + Qdrant payload update
-// must be triggered by AccessService mutation operations (tracked separately).
+// scheduler::ResyncWorker re-runs this exact query on a qdrant_resync_chunk_acl
+// outbox event (enqueued by V032's ACL-change triggers), refreshes the
+// qdrant_prefilter_scope_ids column, and set_payloads Qdrant without re-embedding.
 // ---------------------------------------------------------------------------
 
 drogon::Task<Result<std::vector<std::string>>>

@@ -246,6 +246,7 @@ drogon::Task<Result<void>> OutboxWorker::process(const ClaimedEvent& ev)
         std::optional<std::string> superseded_at;
         std::string                owner_org_unit_id;   // documents.owner_org_unit_id
         int                        authority_level = 50; // documents.authority_level
+        std::int64_t               acl_version = 0;      // documents.acl_version (v3 payload hint)
     };
     std::vector<DbChunk> chunks;
     try {
@@ -269,7 +270,8 @@ drogon::Task<Result<void>> OutboxWorker::process(const ClaimedEvent& ev)
                     dv.activated_at                          AS activated_at,
                     dv.superseded_at                         AS superseded_at,
                     d.owner_org_unit_id::text                AS owner_org_unit_id,
-                    d.authority_level                        AS authority_level
+                    d.authority_level                        AS authority_level,
+                    d.acl_version                            AS acl_version
             FROM    document_chunks  dc
             JOIN    document_versions dv ON dv.id = dc.document_version_id
             JOIN    documents         d  ON d.id  = dv.document_id
@@ -289,6 +291,7 @@ drogon::Task<Result<void>> OutboxWorker::process(const ClaimedEvent& ev)
             c.lifecycle_status   = r["lifecycle_status"].as<std::string>();
             c.owner_org_unit_id  = r["owner_org_unit_id"].as<std::string>();
             c.authority_level    = r["authority_level"].as<int>();
+            c.acl_version        = r["acl_version"].as<std::int64_t>();
             if (!r["section_id"].isNull())
                 c.section_id = r["section_id"].as<std::string>();
             if (!r["section_heading"].isNull())
@@ -351,6 +354,7 @@ drogon::Task<Result<void>> OutboxWorker::process(const ClaimedEvent& ev)
                 .access_scope_ids    = chunk.access_scope_ids,
                 .sensitivity_label   = chunk.sensitivity_label,
                 .lifecycle_status    = chunk.lifecycle_status,
+                .acl_version         = chunk.acl_version,
                 .activated_at        = chunk.activated_at,
                 .superseded_at       = chunk.superseded_at,
                 .section_id          = chunk.section_id,

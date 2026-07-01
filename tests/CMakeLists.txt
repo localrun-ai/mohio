@@ -17,6 +17,7 @@ add_executable(wikore_tests
     test_evidence_gate.cpp
     test_clearance.cpp
     test_retrieval_orchestrator.cpp
+    test_resync_worker.cpp
 )
 target_link_libraries(wikore_tests PRIVATE
     wikore_ingest_lib
