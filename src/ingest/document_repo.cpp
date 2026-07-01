@@ -311,7 +311,8 @@ PostgresDocumentRepo::write_sections(ParsedDocument&        doc,
 //
 // V003 document_chunks columns: company_id, document_version_id, chunk_index,
 //                                content (NOT text_content), content_hash
-//                                (NOT NULL, SHA-256), access_scope_ids,
+//                                (NOT NULL, SHA-256), qdrant_prefilter_scope_ids
+//                                (renamed from access_scope_ids in V032),
 //                                section_id (V014).
 // V003 unique index: (document_version_id, chunk_index)  -- no company_id.
 // ---------------------------------------------------------------------------
@@ -326,15 +327,15 @@ PostgresDocumentRepo::write_chunks(std::vector<Chunk>&             chunks,
     constexpr auto kSql = R"(
         INSERT INTO document_chunks
                (company_id, document_version_id, chunk_index,
-                content, content_hash, access_scope_ids, section_id)
+                content, content_hash, qdrant_prefilter_scope_ids, section_id)
         VALUES ($1::uuid, $2::uuid, $3,
                 $4, $5, $6::uuid[], $7::uuid)
         ON CONFLICT (document_version_id, chunk_index)
         DO UPDATE SET
-            content          = EXCLUDED.content,
-            content_hash     = EXCLUDED.content_hash,
-            access_scope_ids = EXCLUDED.access_scope_ids,
-            section_id       = EXCLUDED.section_id
+            content                    = EXCLUDED.content,
+            content_hash               = EXCLUDED.content_hash,
+            qdrant_prefilter_scope_ids = EXCLUDED.qdrant_prefilter_scope_ids,
+            section_id                 = EXCLUDED.section_id
         RETURNING id::text
     )";
 

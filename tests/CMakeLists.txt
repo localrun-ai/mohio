@@ -11,6 +11,12 @@ add_executable(wikore_tests
     test_parser.cpp
     test_ingest_use_case.cpp
     test_iter1_worker.cpp
+    test_retrieval_invariants.cpp
+    test_access_resolver.cpp
+    test_qdrant_filter_builder.cpp
+    test_evidence_gate.cpp
+    test_clearance.cpp
+    test_retrieval_orchestrator.cpp
 )
 target_link_libraries(wikore_tests PRIVATE
     wikore_ingest_lib

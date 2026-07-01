@@ -11,9 +11,14 @@ short-lived coordination.
 
 > **Project status:** active development, not production-ready. The Iteration 1
 > ingestion, transactional outbox, vector-indexing worker, and crash-recovery
-> foundation are implemented. Most HTTP routes, complete permission resolution
-> and ACL resynchronization, non-text parsers, the chat pipeline, wiki features,
-> and the evaluation CLI are still under development.
+> foundation are implemented. Iteration 2 adds the access-resolution read path -
+> the snapshot-consistent reader-scope resolver with its epoch-validated Redis
+> cache, sensitivity clearance, the Qdrant prefilter builder, the EvidenceGate
+> authorization boundary, and the retrieval orchestrator - implemented and tested
+> at the library level (see [`docs/iteration_2_design.md`](docs/iteration_2_design.md)).
+> Wiring those into HTTP retrieval routes, as-of and section-expanded retrieval,
+> ACL resynchronization, non-text parsers, the chat pipeline, wiki features, and
+> the evaluation CLI are still under development.
 
 ## Architecture
 
@@ -74,9 +79,16 @@ in-memory test adapters.
 - **Crashes remain recoverable.** Redis processing lists, worker heartbeats,
   persisted ingest payloads, bounded retry counters, stale outbox claims, and
   polling sweeps cover the worker-crash windows implemented in Iteration 1.
-- **Retrieval must fail closed.** The retrieval adapters return no candidates
-  when the resolved access-scope filter is empty. The complete grant model and
-  resynchronization path are still being finalized before retrieval routes ship.
+- **Retrieval must fail closed.** The prefilter and the EvidenceGate both return
+  no candidates when the resolved access scope or the sensitivity clearance is
+  empty.
+- **Postgres is the evidence (gate authority).** A retrieved chunk reaches an
+  answer only after the EvidenceGate re-validates it against live PostgreSQL -
+  tenant, lifecycle, sensitivity, and resource visibility resolved from
+  `resource_grants` and `org_unit_closure`. The Qdrant payload is a recall
+  prefilter, never the access authority, so a stale index can only drop
+  candidates, never leak one. ACL resynchronization of the index and as-of
+  retrieval are still being finalized.
 
 ## Ingestion Flow
 
@@ -100,6 +112,41 @@ On shutdown, workers drain in-flight work before exiting. If an ingest worker
 dies, the scheduler can recover its processing list or requeue a stale database
 claim. Poison jobs have a bounded resume budget and eventually transition to
 `error` rather than looping forever.
+
+## Access Resolution and Retrieval (Iteration 2)
+
+The read path is permission-aware and resolves access against the authoritative
+tree at query time rather than trusting denormalized index payloads:
+
+1. `AccessResolver` resolves a principal's read scope (the org_units they may
+   read) in one snapshot-consistent statement, and stamps it with the
+   `companies.acl_epoch` and `users.scope_epoch` it was computed under.
+2. `CachedAccessResolver` serves the scope from Redis (`lr:eff:*`), validated
+   against those live epochs so a stale entry is detectable even if its
+   invalidation was lost; entries also carry a TTL clamped to membership expiry.
+3. `QdrantFilterBuilder` turns the scope plus the derived sensitivity clearance
+   into the vector prefilter (tenant, access scope, sensitivity labels, active
+   lifecycle). Clearance derivation is a single enforced point that is
+   fail-closed on the top tier.
+4. The `EvidenceGate` re-validates each retrieved candidate against live
+   PostgreSQL - resolving resource visibility from `resource_grants` and
+   `org_unit_closure`, not the index payload - and hydrates the survivors. Only
+   the gate can produce an `AllowedCandidate`, so nothing reaches the reranker
+   without passing it.
+5. `RetrievalOrchestrator` composes the above: embed, resolve, derive clearance,
+   prefilter, search, gate.
+
+Two invariants govern the layer, both covered by a randomized property test that
+drives the real gate against an independent oracle:
+
+- **G1 (gate authority):** the gate, resolving live from PostgreSQL, is the only
+  thing that authorizes a chunk; the prefilter is advisory.
+- **G2 (same-transaction epochs):** every `acl_epoch` / `scope_epoch` /
+  `acl_version` bump commits in the same transaction as the change it describes
+  (enforced by V032 triggers), so observing a new epoch implies the change is
+  already visible.
+
+The full design note is [`docs/iteration_2_design.md`](docs/iteration_2_design.md).
 
 ## Build
 
@@ -275,13 +322,22 @@ Implemented foundation:
   writes, and PostgreSQL vector bookkeeping.
 - OIDC/JWT and API-key authentication foundations, Qdrant adapters, null test
   adapters, schema smoke tests, and integration coverage.
+- Iteration 2 access resolution: the snapshot-consistent reader-scope resolver
+  with an epoch-validated Redis cache, group-aware resolution, sensitivity
+  clearance derivation, the Qdrant prefilter builder, the EvidenceGate live
+  authorization boundary, and the retrieval orchestrator. Covered by a
+  randomized gate property test (validated against an independent oracle) and
+  integration tests.
+- V031-V032 migrations: runtime partition maintenance, and the ACL epoch,
+  per-document version, and per-user scope-epoch columns with same-transaction
+  bump triggers.
 
 Not yet complete:
 
-- Production document upload and administration routes.
-- Final permission-set algebra, group-aware resolution, cache invalidation, and
-  Qdrant ACL resynchronization.
+- Production document upload and administration routes, and HTTP retrieval
+  routes wiring the orchestrator to a live embedder and Qdrant.
+- As-of and section-expanded retrieval, the Qdrant ACL resynchronization worker,
+  and the schema-v3 payload backfill.
 - PDF, DOCX, HTML, and other rich-document parsers.
-- End-to-end retrieval, evidence gating, reranking, answer generation, and SSE.
-- Wiki operations, MCP integrations, retention jobs, partition maintenance, and
-  the evaluation harness.
+- Reranking, answer generation, and SSE streaming.
+- Wiki operations, MCP integrations, retention jobs, and the evaluation harness.

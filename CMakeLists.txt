@@ -104,6 +104,7 @@ add_library(wikore_core STATIC
     src/db.cpp
     src/org_tree.cpp
     src/access.cpp
+    src/access_resolver.cpp
     src/redis.cpp
 )
 target_include_directories(wikore_core PUBLIC include)
@@ -127,6 +128,10 @@ add_library(wikore_rag STATIC
     src/rag/reranker.cpp
     src/rag/generator.cpp
     src/rag/pipeline.cpp
+    src/rag/qdrant_filter_builder.cpp
+    src/rag/evidence_gate.cpp
+    src/rag/clearance.cpp
+    src/rag/retrieval_orchestrator.cpp
 )
 target_link_libraries(wikore_rag PUBLIC wikore_core)
 

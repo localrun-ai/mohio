@@ -1,4 +1,5 @@
 #pragma once
+#include <cstdint>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -90,7 +91,8 @@ struct Principal {
 struct AccessScope {
     std::vector<Uuid>                          org_unit_ids;
     std::chrono::system_clock::time_point      cache_until;
-    int                                        access_epoch = 0;
+    std::int64_t                               access_epoch = 0;   // companies.acl_epoch (BIGINT)
+    std::int64_t                               scope_epoch  = 0;   // users.scope_epoch (BIGINT; section 2.6)
 };
 
 // ---------------------------------------------------------------------------
