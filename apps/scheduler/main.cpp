@@ -1,25 +1,37 @@
 #include "wikore/config.hpp"
 #include "wikore/db.hpp"
+#include "wikore/ingest/document_repo.hpp"
 #include "wikore/rag/embedder.hpp"
 #include "wikore/rag/vector_store.hpp"
 #include "wikore/redis.hpp"
 #include "wikore/scheduler/outbox_worker.hpp"
 #include "wikore/scheduler/partition_maintainer.hpp"
 #include "wikore/scheduler/polling_fallback.hpp"
+#include "wikore/scheduler/resync_worker.hpp"
 #include <drogon/drogon.h>
 #include <spdlog/spdlog.h>
 #include <atomic>
 #include <cstdlib>
 #include <format>
+#include <map>
+#include <memory>
+#include <mutex>
 #include <stdexcept>
 
 // ---------------------------------------------------------------------------
-// wikore-scheduler: outbox drainer + polling fallback + partition maintainer.
+// wikore-scheduler: outbox drainer + resync worker + polling fallback +
+// partition maintainer.
 //
-// Three long-running coroutines on the event loop:
+// Four long-running coroutines on the event loop:
 //   * OutboxWorker drains qdrant_upsert_chunk_payload events from V015's
 //     outbox_events table (FOR UPDATE SKIP LOCKED), embeds each chunk
 //     batch via llama-server, upserts to Qdrant, and writes document_chunk_vectors.
+//   * ResyncWorker drains qdrant_resync_chunk_acl events (enqueued by V032's
+//     ACL-change triggers), recomputes the resource-axis scope live from
+//     Postgres, and rewrites the Qdrant payload's ACL keys WITHOUT re-embedding.
+//     It shares OutboxWorker's per-document advisory lock so ingest and resync
+//     of a document serialize, and patches every collection the document has
+//     points in (see the VectorStoreForCollection resolver below).
 //   * PollingFallback advisory-locks per-call, finds document_versions
 //     rows stuck in 'pending' or 'processing' beyond 15 minutes, and
 //     promotes them to 'error' (or requeues, per V029).
@@ -45,7 +57,7 @@ std::atomic<bool> g_shutdown{false};
 std::atomic<bool> g_fatal_exit{false};
 
 // All workers must finish their drain path before drogon exits.
-std::atomic<int>  g_workers_remaining{3};
+std::atomic<int>  g_workers_remaining{4};
 
 void on_worker_exit(std::string_view name)
 {
@@ -83,7 +95,13 @@ int main()
     spdlog::info("[wikore-scheduler] qdrant:  {}", cfg.qdrant_url);
     spdlog::info("[wikore-scheduler] embed:   {}", cfg.embed_base_url);
 
-    wikore::Db::init(cfg, /*pool_size=*/4);
+    // Pool sized for the concurrent worker connection demand: ResyncWorker
+    // holds a transaction (advisory lock) AND issues a live scope re-read on a
+    // second connection per event, OutboxWorker holds a transaction during its
+    // upsert, and PollingFallback holds one during its sweep -- so several
+    // connections can be in flight at once. 4 could deadlock (a worker holding a
+    // tx while it waits for a second connection that the others are holding).
+    wikore::Db::init(cfg, /*pool_size=*/8);
     wikore::Redis::init(cfg);
 
     drogon::app().setTermSignalHandler([] {
@@ -177,11 +195,40 @@ int main()
             auto vec_store = std::make_shared<wikore::rag::QdrantVectorStore>(
                 cfg.qdrant_url, qdrant_collection);
 
+            // Resync must patch EVERY collection a document has points in (a
+            // chunk may be embedded by several models, each with its own
+            // collection). This resolver lazily builds and caches a
+            // QdrantVectorStore per collection name against the same Qdrant
+            // instance; the primary collection reuses the store above. All
+            // registered collections live on this Qdrant, so a lookup never
+            // fails -- a nullptr return would make ResyncWorker fail the event.
+            struct CollectionStores {
+                std::mutex mu;
+                std::map<std::string, std::shared_ptr<wikore::rag::VectorStorePort>> byName;
+            };
+            auto stores = std::make_shared<CollectionStores>();
+            stores->byName.emplace(qdrant_collection, vec_store);
+            wikore::scheduler::ResyncWorker::VectorStoreForCollection store_for_collection =
+                [stores, qdrant_url = cfg.qdrant_url](const std::string& collection)
+                    -> std::shared_ptr<wikore::rag::VectorStorePort> {
+                    std::lock_guard<std::mutex> lk(stores->mu);
+                    auto it = stores->byName.find(collection);
+                    if (it != stores->byName.end()) return it->second;
+                    auto s = std::make_shared<wikore::rag::QdrantVectorStore>(
+                        qdrant_url, collection);
+                    stores->byName.emplace(collection, s);
+                    return s;
+                };
+            auto doc_repo = std::make_shared<wikore::ingest::PostgresDocumentRepo>(db);
+
             wikore::scheduler::OutboxWorker::Options outbox_opts;
             outbox_opts.expected_embed_model = cfg.embed_model;
 
             static wikore::scheduler::OutboxWorker outbox(
                 db, embedder, vec_store, shutdown, std::move(outbox_opts));
+            static wikore::scheduler::ResyncWorker resync(
+                db, store_for_collection, doc_repo, shutdown,
+                wikore::scheduler::ResyncWorker::Options{});
             static wikore::scheduler::PollingFallback polling(
                 db, shutdown,
                 wikore::scheduler::PollingFallback::Options{});
@@ -205,6 +252,10 @@ int main()
             drogon::async_run([]() -> drogon::Task<void> {
                 co_await outbox.run();
                 on_worker_exit("outbox-worker");
+            });
+            drogon::async_run([]() -> drogon::Task<void> {
+                co_await resync.run();
+                on_worker_exit("resync-worker");
             });
             drogon::async_run([]() -> drogon::Task<void> {
                 co_await polling.run();
