@@ -136,6 +136,40 @@ void clear_queues() {
         wikore::Redis::del(k);
 }
 
+// An embedder that mutates the document's ACL state DURING embed_batch, to
+// simulate a resync (grant change) landing in the window between the outbox
+// worker's pre-embed read and its locked re-read. Returns unit-ish vectors like
+// NullEmbedder so the rest of the pipeline is unaffected.
+struct MutatingEmbedder : wikore::rag::EmbedderPort {
+    drogon::orm::DbClientPtr db;
+    std::string version_id;
+    std::string extra_scope_ou;
+    int         d = 4;
+    std::string name = "null-embedder";
+
+    drogon::Task<wikore::Result<wikore::rag::Embedding>> embed(std::string t) override {
+        auto b = co_await embed_batch(std::vector<std::string>{std::move(t)});
+        if (!b) co_return std::unexpected(b.error());
+        co_return (*b)[0];
+    }
+    drogon::Task<wikore::Result<std::vector<wikore::rag::Embedding>>>
+    embed_batch(std::vector<std::string> texts) override {
+        co_await db->execSqlCoro(
+            "UPDATE documents SET acl_version = acl_version + 1 "
+            "WHERE id = (SELECT document_id FROM document_versions WHERE id=$1::uuid)",
+            version_id);
+        co_await db->execSqlCoro(
+            "UPDATE document_chunks "
+            "SET qdrant_prefilter_scope_ids = qdrant_prefilter_scope_ids || $2::uuid "
+            "WHERE document_version_id=$1::uuid",
+            version_id, extra_scope_ou);
+        co_return std::vector<wikore::rag::Embedding>(texts.size(),
+                                                      wikore::rag::Embedding(d, 0.1f));
+    }
+    int dims() const override { return d; }
+    const std::string& model_name() const override { return name; }
+};
+
 } // namespace
 
 // ---------------------------------------------------------------------------
@@ -239,6 +273,62 @@ TEST_CASE("OutboxWorker: drains the qdrant_upsert_chunk_payload event end-to-end
         "WHERE company_id=$1::uuid AND embedding_model_id=$2::uuid",
         std::string(CO), std::string(MODEL_ID));
     CHECK(std::stoi(vec_rows[0]["n"].c_str()) >= 1);
+}
+
+TEST_CASE("OutboxWorker: re-reads ACL under the lock, so a resync during embed is not clobbered",
+          "[integration][iter1]")
+{
+    if (!db_available()) SKIP("DATABASE_URL not set");
+    auto db = wikore::Db::get();
+    seed_iter1_fixtures(db);
+
+    const auto root = std::string(exec_sync(db,
+        "SELECT id FROM org_units WHERE company_id=$1::uuid AND type='root'",
+        std::string(CO))[0]["id"].c_str());
+    const auto team = std::string(exec_sync(db,
+        "INSERT INTO org_units (company_id,parent_id,type,slug,name) "
+        "VALUES ($1::uuid,$2::uuid,'team','it-team','IT') RETURNING id",
+        std::string(CO), root)[0]["id"].c_str());
+
+    // Move the version to 'active' (constraint requires completed/activated/
+    // chunk_count) and seed one chunk with the STALE pre-embed scope {root}.
+    exec_sync(db,
+        "UPDATE document_versions SET ingest_status='done', lifecycle_status='active', "
+        "completed_at=now(), activated_at=now(), chunk_count=1, sensitivity_label='internal' "
+        "WHERE id=$1::uuid", std::string(VERSION));
+    const auto chunk = std::string(exec_sync(db,
+        "INSERT INTO document_chunks (company_id,document_version_id,chunk_index,content,"
+        "content_hash,qdrant_prefilter_scope_ids) "
+        "VALUES ($1::uuid,$2::uuid,0,'hello','ch',ARRAY[$3::uuid]) RETURNING id",
+        std::string(CO), std::string(VERSION), root)[0]["id"].c_str());
+    exec_sync(db,
+        "INSERT INTO outbox_events (company_id,aggregate_id,job_type,payload,idempotency_key) "
+        "VALUES ($1::uuid,$2::uuid,'qdrant_upsert_chunk_payload',"
+        "        jsonb_build_object('document_id',$3::text,'embed_model_id',$4::text),"
+        "        'upsert:reread')",
+        std::string(CO), std::string(VERSION), std::string(DOC), std::string(MODEL));
+
+    // The mutating embedder bumps acl_version and appends `team` to the scope
+    // DURING embed (between pre-embed read and locked re-read).
+    auto embedder = std::make_shared<MutatingEmbedder>();
+    embedder->db = db; embedder->version_id = VERSION; embedder->extra_scope_ou = team;
+    auto store = std::make_shared<wikore::rag::NullVectorStore>();
+    std::atomic<bool> stop{false};
+    wikore::scheduler::OutboxWorker outbox(
+        db, embedder, store, [&] { return stop.load(); },
+        wikore::scheduler::OutboxWorker::Options{});
+    int completed = drogon::sync_wait(outbox.drain_once());
+    CHECK(completed >= 1);
+
+    // The upserted payload must carry the FRESH values (acl_version 2, scope
+    // including `team`), proving the locked re-read overrode the stale pre-embed
+    // read -- otherwise a late upsert would clobber a concurrent resync.
+    const auto pid = *wikore::rag::uuid_v5(chunk + ":" + std::string(MODEL));
+    const auto* pl = store->payload_for(pid);
+    REQUIRE(pl != nullptr);
+    CHECK(pl->acl_version >= 2);
+    CHECK(std::find(pl->access_scope_ids.begin(), pl->access_scope_ids.end(), team)
+          != pl->access_scope_ids.end());
 }
 
 TEST_CASE("PollingFallback: promotes stuck pending (no payload) versions to 'error'",

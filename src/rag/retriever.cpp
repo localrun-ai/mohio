@@ -231,10 +231,15 @@ QdrantVectorStore::upsert(const std::vector<UpsertPoint>& points)
     }
     json += "]}";
 
+    // wait=true: block until Qdrant has APPLIED the points, not merely accepted
+    // them. The ingest worker takes the per-document resync advisory lock around
+    // this write and refreshes ACL payload fields under it; committing/releasing
+    // that lock before Qdrant applied the write would reopen the resync-vs-ingest
+    // race the lock exists to close.
     drogon::HttpResponsePtr resp;
     try {
         resp = co_await send(drogon::Put,
-                             std::format("/collections/{}/points", _collection),
+                             std::format("/collections/{}/points?wait=true", _collection),
                              std::move(json));
     } catch (const std::exception& ex) {
         co_return std::unexpected(
