@@ -37,6 +37,17 @@ public:
     delete_by_version(std::string_view company_id,
                       std::string_view document_version_id) = 0;
 
+    // Overwrite the ACL-relevant payload keys on an existing set of points
+    // WITHOUT re-embedding (Qdrant set-payload, a merge on the named keys).
+    // Used by the qdrant_resync_chunk_acl worker: when a grant/owner/move
+    // change bumps documents.acl_version, the chunk vectors are unchanged but
+    // access_scope_ids / sensitivity / lifecycle / acl_version must be
+    // refreshed. Empty point_ids is a no-op (success). Idempotent.
+    virtual drogon::Task<Result<void>>
+    set_payload(std::string_view                company_id,
+                const std::vector<std::string>& point_ids,
+                const PayloadPatch&             patch) = 0;
+
     // Search for the top-k most similar vectors that pass the access filter.
     // Returns ChunkCandidates in descending score order.
     virtual drogon::Task<Result<std::vector<ChunkCandidate>>>
@@ -65,6 +76,11 @@ public:
     drogon::Task<Result<void>>
     delete_by_version(std::string_view company_id,
                       std::string_view document_version_id) override;
+
+    drogon::Task<Result<void>>
+    set_payload(std::string_view                company_id,
+                const std::vector<std::string>& point_ids,
+                const PayloadPatch&             patch) override;
 
     drogon::Task<Result<std::vector<ChunkCandidate>>>
     search(const Embedding& query,
@@ -105,6 +121,11 @@ public:
     delete_by_version(std::string_view company_id,
                       std::string_view document_version_id) override;
 
+    drogon::Task<Result<void>>
+    set_payload(std::string_view                company_id,
+                const std::vector<std::string>& point_ids,
+                const PayloadPatch&             patch) override;
+
     drogon::Task<Result<std::vector<ChunkCandidate>>>
     search(const Embedding& query,
            const QdrantFilter& filter,
@@ -112,6 +133,13 @@ public:
 
     // Test introspection: total number of stored points.
     std::size_t point_count() const { return _points.size(); }
+
+    // Test introspection: read back a stored point's payload by point id.
+    const ChunkPayload* payload_for(std::string_view point_id) const {
+        for (const auto& p : _points)
+            if (p.id == point_id) return &p.payload;
+        return nullptr;
+    }
 
 private:
     std::vector<UpsertPoint> _points;

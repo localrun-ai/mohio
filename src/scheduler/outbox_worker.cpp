@@ -1,10 +1,14 @@
 #include "wikore/scheduler/outbox_worker.hpp"
 #include "wikore/adapters/postgres/error_mapper.hpp"
+#include "wikore/adapters/postgres/unit_of_work.hpp"
 #include "wikore/rag/types.hpp"
 #include <drogon/drogon.h>
 #include <spdlog/spdlog.h>
 #include <chrono>
 #include <format>
+#include <optional>
+#include <string>
+#include <unordered_map>
 #include <unistd.h>
 
 namespace wikore::scheduler {
@@ -187,11 +191,15 @@ drogon::Task<int> OutboxWorker::release_my_claims()
 }
 
 // ---------------------------------------------------------------------------
-// Process one claimed event: read chunks -> embed -> upsert to vector store
-// -> write document_chunk_vectors rows -> mark completed.
+// Process one claimed event: read chunks -> embed (unlocked) -> take the
+// per-document resync advisory lock -> re-read ACL fields under it -> upsert
+// to vector store (wait=true) -> write document_chunk_vectors rows -> commit.
 //
-// On any step's failure, the event remains uncompleted (claimed_at cleared
-// in mark_failed) so the next poll re-attempts.
+// The advisory lock (shared with ResyncWorker) serializes ingest and resync of
+// the same document so a late upsert cannot clobber a completed resync with a
+// stale pre-embed payload; the embed runs outside the lock so it never blocks
+// resyncs. On any step's failure, the event remains uncompleted (claimed_at
+// cleared in mark_failed) so the next poll re-attempts.
 // ---------------------------------------------------------------------------
 
 drogon::Task<Result<void>> OutboxWorker::process(const ClaimedEvent& ev)
@@ -246,6 +254,7 @@ drogon::Task<Result<void>> OutboxWorker::process(const ClaimedEvent& ev)
         std::optional<std::string> superseded_at;
         std::string                owner_org_unit_id;   // documents.owner_org_unit_id
         int                        authority_level = 50; // documents.authority_level
+        std::int64_t               acl_version = 0;      // documents.acl_version (v3 payload hint)
     };
     std::vector<DbChunk> chunks;
     try {
@@ -269,7 +278,8 @@ drogon::Task<Result<void>> OutboxWorker::process(const ClaimedEvent& ev)
                     dv.activated_at                          AS activated_at,
                     dv.superseded_at                         AS superseded_at,
                     d.owner_org_unit_id::text                AS owner_org_unit_id,
-                    d.authority_level                        AS authority_level
+                    d.authority_level                        AS authority_level,
+                    d.acl_version                            AS acl_version
             FROM    document_chunks  dc
             JOIN    document_versions dv ON dv.id = dc.document_version_id
             JOIN    documents         d  ON d.id  = dv.document_id
@@ -289,6 +299,7 @@ drogon::Task<Result<void>> OutboxWorker::process(const ClaimedEvent& ev)
             c.lifecycle_status   = r["lifecycle_status"].as<std::string>();
             c.owner_org_unit_id  = r["owner_org_unit_id"].as<std::string>();
             c.authority_level    = r["authority_level"].as<int>();
+            c.acl_version        = r["acl_version"].as<std::int64_t>();
             if (!r["section_id"].isNull())
                 c.section_id = r["section_id"].as<std::string>();
             if (!r["section_heading"].isNull())
@@ -351,6 +362,7 @@ drogon::Task<Result<void>> OutboxWorker::process(const ClaimedEvent& ev)
                 .access_scope_ids    = chunk.access_scope_ids,
                 .sensitivity_label   = chunk.sensitivity_label,
                 .lifecycle_status    = chunk.lifecycle_status,
+                .acl_version         = chunk.acl_version,
                 .activated_at        = chunk.activated_at,
                 .superseded_at       = chunk.superseded_at,
                 .section_id          = chunk.section_id,
@@ -372,22 +384,110 @@ drogon::Task<Result<void>> OutboxWorker::process(const ClaimedEvent& ev)
         }
     }
 
-    // 4. Upsert to the vector store.
-    if (auto r = co_await vector_store_->upsert(points); !r)
-        co_return std::unexpected(r.error());
+    // 4. Take the per-document resync advisory lock, then REFRESH the ACL-mutable
+    //    payload fields under it before upserting. The scope + acl_version read
+    //    in step 2 are pre-embed and may be stale: a grant change during the
+    //    (slow) embed could have bumped documents.acl_version and had a resync
+    //    already write the new payload + CAS qdrant_synced_version. Without this
+    //    lock + re-read, a late upsert would clobber that resync with the stale
+    //    pre-embed scope while PG still advertised the newer synced_version.
+    //    The lock key ('resync:doc:'||document_id) is shared with ResyncWorker,
+    //    so ingest and resync of the same document serialize; the embed itself
+    //    runs OUTSIDE the lock so a long embed never blocks resyncs.
+    std::optional<postgres::UnitOfWork> uow_opt;
+    try {
+        uow_opt.emplace(co_await postgres::UnitOfWork::begin(db_));
+    } catch (const std::exception& ex) {
+        co_return std::unexpected(Error::unavailable(
+            std::string("outbox: begin tx failed: ") + ex.what()));
+    }
+    auto& uow = *uow_opt;
 
-    // 5. document_chunk_vectors bookkeeping: one row per (chunk, model).
+    try {
+        co_await uow.exec("SELECT pg_advisory_xact_lock(hashtext($1))",
+                          "resync:doc:" + ev.document_id);
+
+        // Re-read the ACL-mutable fields as of NOW (content/embeddings are
+        // immutable for a version, so only these can have changed since step 2).
+        auto rows = co_await uow.exec(R"(
+            SELECT dc.id::text                              AS chunk_id,
+                   array_to_string(dc.qdrant_prefilter_scope_ids, ',') AS access_scope_csv,
+                   dv.sensitivity_label                     AS sensitivity_label,
+                   dv.lifecycle_status                      AS lifecycle_status,
+                   dv.activated_at                          AS activated_at,
+                   dv.superseded_at                         AS superseded_at,
+                   d.owner_org_unit_id::text                AS owner_org_unit_id,
+                   d.acl_version                            AS acl_version
+            FROM   document_chunks  dc
+            JOIN   document_versions dv ON dv.id = dc.document_version_id
+            JOIN   documents         d  ON d.id  = dv.document_id
+            WHERE  dc.document_version_id = $1::uuid
+              AND  dc.company_id          = $2::uuid
+        )", ev.aggregate_id, ev.company_id);
+
+        struct AclFields {
+            std::vector<std::string>   scope;
+            std::string                sensitivity;
+            std::string                lifecycle;
+            std::optional<std::string> activated_at;
+            std::optional<std::string> superseded_at;
+            std::string                owner;
+            std::int64_t               acl_version = 0;
+        };
+        std::unordered_map<std::string, AclFields> fresh;
+        fresh.reserve(rows.size());
+        for (const auto& r : rows) {
+            AclFields f;
+            f.sensitivity = r["sensitivity_label"].as<std::string>();
+            f.lifecycle   = r["lifecycle_status"].as<std::string>();
+            f.owner       = r["owner_org_unit_id"].as<std::string>();
+            f.acl_version = r["acl_version"].as<std::int64_t>();
+            if (!r["activated_at"].isNull())  f.activated_at  = r["activated_at"].as<std::string>();
+            if (!r["superseded_at"].isNull()) f.superseded_at = r["superseded_at"].as<std::string>();
+            const auto csv = r["access_scope_csv"].as<std::string>();
+            std::size_t pos = 0;
+            while (pos < csv.size()) {
+                auto comma = csv.find(',', pos);
+                auto end   = (comma == std::string::npos) ? csv.size() : comma;
+                if (end > pos) f.scope.emplace_back(csv.substr(pos, end - pos));
+                pos = (comma == std::string::npos) ? csv.size() : comma + 1;
+            }
+            fresh.emplace(r["chunk_id"].as<std::string>(), std::move(f));
+        }
+        for (auto& p : points) {
+            auto it = fresh.find(p.payload.chunk_id);
+            if (it == fresh.end()) continue;   // chunk vanished mid-process
+            p.payload.access_scope_ids  = it->second.scope;
+            p.payload.sensitivity_label = it->second.sensitivity;
+            p.payload.lifecycle_status  = it->second.lifecycle;
+            p.payload.activated_at      = it->second.activated_at;
+            p.payload.superseded_at     = it->second.superseded_at;
+            p.payload.owner_org_unit_id = it->second.owner;
+            p.payload.acl_version       = it->second.acl_version;
+        }
+    } catch (const drogon::orm::DrogonDbException& ex) {
+        uow.rollback();
+        co_return std::unexpected(postgres::map_db_exception(ex));
+    }
+
+    // 5. Upsert to the vector store (wait=true) while holding the lock.
+    if (auto r = co_await vector_store_->upsert(points); !r) {
+        uow.rollback();
+        co_return std::unexpected(r.error());
+    }
+
+    // 6. document_chunk_vectors bookkeeping: one row per (chunk, model).
     //    ON CONFLICT DO NOTHING because deterministic point IDs mean a
     //    re-run already has a matching row.
     //
     //    Bookkeeping is part of the consistency contract -- callers join
     //    chunks -> vectors -> points to find the Qdrant point for a chunk.
-    //    A bookkeeping failure must fail the event so the next poll
-    //    retries. Qdrant upsert is idempotent on the deterministic point
-    //    IDs, so a retry just no-ops the actual vector write.
+    //    A bookkeeping failure must fail the event so the next poll retries.
+    //    Qdrant upsert is idempotent on the deterministic point IDs, so a
+    //    retry just no-ops the actual vector write.
     try {
         for (const auto& point : points) {
-            co_await db_->execSqlCoro(R"(
+            co_await uow.exec(R"(
                 INSERT INTO document_chunk_vectors
                        (company_id, chunk_id, embedding_model_id, qdrant_point_id)
                 VALUES ($1::uuid, $2::uuid, $3::uuid, $4::uuid)
@@ -395,8 +495,14 @@ drogon::Task<Result<void>> OutboxWorker::process(const ClaimedEvent& ev)
             )", ev.company_id, point.payload.chunk_id, embedding_model_id, point.id);
         }
     } catch (const drogon::orm::DrogonDbException& ex) {
+        uow.rollback();
         co_return std::unexpected(postgres::map_db_exception(ex));
     }
+
+    // 7. Commit the bookkeeping + release the advisory lock. A commit failure
+    //    fails the event so the next poll retries (upsert is idempotent).
+    if (auto r = co_await uow.commit(); !r)
+        co_return std::unexpected(r.error());
 
     co_return Result<void>{};
 }

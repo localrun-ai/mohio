@@ -231,10 +231,15 @@ QdrantVectorStore::upsert(const std::vector<UpsertPoint>& points)
     }
     json += "]}";
 
+    // wait=true: block until Qdrant has APPLIED the points, not merely accepted
+    // them. The ingest worker takes the per-document resync advisory lock around
+    // this write and refreshes ACL payload fields under it; committing/releasing
+    // that lock before Qdrant applied the write would reopen the resync-vs-ingest
+    // race the lock exists to close.
     drogon::HttpResponsePtr resp;
     try {
         resp = co_await send(drogon::Put,
-                             std::format("/collections/{}/points", _collection),
+                             std::format("/collections/{}/points?wait=true", _collection),
                              std::move(json));
     } catch (const std::exception& ex) {
         co_return std::unexpected(
@@ -267,6 +272,69 @@ QdrantVectorStore::delete_by_version(std::string_view company_id,
     if (static_cast<int>(resp->getStatusCode()) != 200) {
         co_return std::unexpected(Error::unavailable(
             std::format("qdrant delete returned {}",
+                        static_cast<int>(resp->getStatusCode()))));
+    }
+    co_return Result<void>{};
+}
+
+drogon::Task<Result<void>>
+QdrantVectorStore::set_payload(std::string_view                company_id,
+                               const std::vector<std::string>& point_ids,
+                               const PayloadPatch&              patch)
+{
+    if (point_ids.empty())
+        co_return Result<void>{};
+
+    // Qdrant POST /points/payload sets (merges) the named keys on the listed
+    // points, leaving the vector and any unlisted keys intact. We only rewrite
+    // the ACL-relevant keys, so the embedding is never re-uploaded.
+    std::string scope = "[";
+    for (size_t i = 0; i < patch.access_scope_ids.size(); ++i) {
+        if (i) scope += ',';
+        scope += std::format("\"{}\"", patch.access_scope_ids[i]);
+    }
+    scope += ']';
+
+    std::string owner = patch.owner_org_unit_id
+        ? std::format("\"{}\"", *patch.owner_org_unit_id)
+        : std::string("null");
+
+    std::string ids = "[";
+    for (size_t i = 0; i < point_ids.size(); ++i) {
+        if (i) ids += ',';
+        ids += std::format("\"{}\"", point_ids[i]);
+    }
+    ids += ']';
+
+    // company_id is included so a misrouted patch cannot silently land on
+    // another tenant's point: the id is a uuid_v5 of chunk+model and is not
+    // tenant-scoped by itself, but the caller only ever collects ids from
+    // its own tenant's rows. Writing company_id keeps the payload coherent.
+    const std::string body = std::format(
+        R"({{"payload":{{"company_id":"{}","access_scope_ids":{},"owner_org_unit_id":{},)"
+        R"("sensitivity_label":"{}","lifecycle_status":"{}","acl_version":{},)"
+        R"("payload_schema_version":{}}},"points":{}}})",
+        company_id, scope, owner, patch.sensitivity_label, patch.lifecycle_status,
+        patch.acl_version, patch.payload_schema_version, ids);
+
+    // wait=true: block until Qdrant has APPLIED the payload, not merely accepted
+    // it. The resync worker commits documents.qdrant_synced_version right after
+    // this returns; without wait=true Qdrant's default acknowledges receipt
+    // before the change is visible (or before it fails), so PG could advertise a
+    // version as synced that Qdrant has not yet applied.
+    drogon::HttpResponsePtr resp;
+    try {
+        resp = co_await send(drogon::Post,
+                             std::format("/collections/{}/points/payload?wait=true", _collection),
+                             body);
+    } catch (const std::exception& ex) {
+        co_return std::unexpected(
+            Error::unavailable(std::format("qdrant set_payload: {}", ex.what())));
+    }
+
+    if (static_cast<int>(resp->getStatusCode()) != 200) {
+        co_return std::unexpected(Error::unavailable(
+            std::format("qdrant set_payload returned {}",
                         static_cast<int>(resp->getStatusCode()))));
     }
     co_return Result<void>{};
@@ -356,6 +424,29 @@ NullVectorStore::delete_by_version(std::string_view company_id,
         return p.payload.company_id         == company_id
             && p.payload.document_version_id == document_version_id;
     });
+    co_return Result<void>{};
+}
+
+drogon::Task<Result<void>>
+NullVectorStore::set_payload(std::string_view                company_id,
+                             const std::vector<std::string>& point_ids,
+                             const PayloadPatch&              patch)
+{
+    for (const auto& id : point_ids) {
+        auto it = std::find_if(_points.begin(), _points.end(),
+                               [&id](const UpsertPoint& p) { return p.id == id; });
+        if (it == _points.end())
+            continue;   // unknown point id: no-op, mirrors Qdrant merge semantics
+        // Overwrite exactly the ACL-relevant keys; the vector and content-side
+        // keys (chunk_id, section, etc.) are untouched.
+        it->payload.company_id        = std::string(company_id);
+        it->payload.access_scope_ids  = patch.access_scope_ids;
+        it->payload.owner_org_unit_id = patch.owner_org_unit_id;
+        it->payload.sensitivity_label = patch.sensitivity_label;
+        it->payload.lifecycle_status  = patch.lifecycle_status;
+        it->payload.acl_version       = patch.acl_version;
+        it->payload.payload_schema_version = patch.payload_schema_version;
+    }
     co_return Result<void>{};
 }
 
