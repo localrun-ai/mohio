@@ -372,6 +372,31 @@ TEST_CASE("PollingFallback: promotes stuck pending (no payload) versions to 'err
     CHECK(std::string(v[0]["error_msg"].c_str()).find("stuck pending") != std::string::npos);
 }
 
+TEST_CASE("PollingFallback::run: shutdown during the inter-sweep sleep exits within a chunk",
+          "[integration][iter1]")
+{
+    if (!db_available()) SKIP("DATABASE_URL not set");
+    auto db = wikore::Db::get();
+    seed_iter1_fixtures(db);
+
+    std::atomic<bool> stop{false};
+    wikore::scheduler::PollingFallback::Options opts;
+    // A long interval: with a non-cancellable sleep, run() would block ~1h after
+    // the first sweep. The on_sleep_armed hook flips shutdown exactly while the
+    // coroutine is suspended in the sleep, so the chunked loop must observe it
+    // and return within one 50ms chunk.
+    opts.interval       = std::chrono::hours(1);
+    opts.sleep_chunk    = std::chrono::milliseconds(50);
+    opts.on_sleep_armed = [&] { stop.store(true); };
+    wikore::scheduler::PollingFallback poll(db, [&] { return stop.load(); }, opts);
+
+    const auto t0 = std::chrono::steady_clock::now();
+    drogon::sync_wait(poll.run());
+    const auto elapsed = std::chrono::steady_clock::now() - t0;
+    // Must be far below the 1h interval -- proves the sleep is cancellable.
+    CHECK(elapsed < std::chrono::seconds(5));
+}
+
 TEST_CASE("IngestWorker: malformed JSON payload is discarded without dispatch",
           "[integration][iter1]")
 {
